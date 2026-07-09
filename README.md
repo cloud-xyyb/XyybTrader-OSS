@@ -130,7 +130,7 @@ XyybTrader 支持 **HFT**、**CTA**（beta）、**SEL**（beta）三类策略，
 
 ```bash
 # 1. 依赖
-sudo apt-get install -y build-essential cmake ninja-build libcurl4-openssl-dev libssl-dev libboost-dev
+sudo apt-get install -y build-essential cmake ninja-build libcurl4-openssl-dev libssl-dev libboost-dev libboost-system-dev
 # Apache Arrow / Parquet（必需，先加官方 apt 源: https://arrow.apache.org/install/）
 wget "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
 sudo apt-get install -y ./apache-arrow-apt-source-latest-*.deb && sudo apt-get update
