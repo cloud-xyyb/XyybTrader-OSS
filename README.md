@@ -1,6 +1,7 @@
 # XyybTrader
 
 <p align="center">
+    <a href="https://github.com/cloud-xyyb/XyybTrader-OSS/actions/workflows/build.yml"><img src="https://github.com/cloud-xyyb/XyybTrader-OSS/actions/workflows/build.yml/badge.svg"/></a>
     <img src="https://img.shields.io/badge/language-C%2B%2B17-blue.svg"/>
     <img src="https://img.shields.io/badge/platform-linux-yellow.svg"/>
     <img src="https://img.shields.io/badge/license-MIT-orange.svg"/>
