@@ -1,0 +1,56 @@
+#pragma once
+
+#include <cstdint>
+#include <string_view>
+
+#include "api/IHftEngineObserver.h"
+#include "xt_backtest/reporter/XtBacktestReporter.h"
+#include "xt_core/order/XtTradeRecord.h"
+
+/// @brief HFT 回测 gateway-side 的订单生命周期报告 observer。
+///
+/// XtBacktestReporterObserver把订单提交和订单状态更新转发给 `XtBacktestReporter`
+/// 成交事件由 `XtBacktestReporterFillObserver` 处理。
+/// `reporter` 为 non-owning，可为空；为空时丢弃所有报告事件。
+class XtBacktestReporterObserver final : public xt_runtime::IHftEngineObserver {
+public:
+
+    explicit XtBacktestReporterObserver(XtBacktestReporter* r) : reporter_(r) {}
+
+    void on_order_update(const XtOrderExecUpdate& u) override {
+        if (reporter_) reporter_->on_order_update(u);
+    }
+
+    void on_order_submit(int64_t ts,
+                         uint64_t id,
+                         const char* code,
+                         bool is_buy,
+                         int64_t price_fp,
+                         int64_t qty_fp,
+                         std::string_view tag,
+                         bool is_close,
+                         bool is_today) override {
+        if (reporter_) {
+            reporter_->on_order_submit(ts, id, code, is_buy, price_fp, qty_fp,
+                                       tag, is_close, is_today);
+        }
+    }
+
+private:
+    XtBacktestReporter* reporter_;
+};
+
+/// @brief HFT 回测 engine-side 的成交报告 observer。
+///
+/// Runner 将本 observer 注册到 engine；`on_trade()` 把 domain 处理后的成交转成
+/// reporter 的 fill 行。`reporter` 为 non-owning，可为空；为空时关闭 fill 上报。
+class XtBacktestReporterFillObserver final : public xt_runtime::IHftEngineObserver {
+public:
+
+    explicit XtBacktestReporterFillObserver(XtBacktestReporter* r) : reporter_(r) {}
+
+    void on_trade(const XtTradeRecord& tr) override;
+
+private:
+    XtBacktestReporter* reporter_;
+};

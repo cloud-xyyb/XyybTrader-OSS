@@ -1,0 +1,40 @@
+schema: regression-case/v1
+case: ag2212_only
+description: HFT self-golden: ag2212 单合约 5 交易日 (2022-05-27 → 2022-06-02)
+runner:
+  binary: XtBackTestRunner
+  build_command: cmake --build build --target XtBackTestRunner
+config:
+  path: configs/baselines/ag2212_only.yaml
+  sha256: e02990401e6bf5a54b823e73dd647bb634306ee8511ccbfcccc55f256767ca71
+  bytes: 2167
+strategy_so:
+  path: var/plugins/strategies/libhft_tick_revert_strategy.so
+  build_command: cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy -DXT_SRC_ROOT=$(pwd)/src && cmake --build build-strategy
+inputs:
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-27.csv
+  sha256: 0ed61d4744ac519a6255e5232f05c57132648b20f372152725e9e7083e9d1a68
+  bytes: 9985860
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-30.csv
+  sha256: 74c971899895546b32c1dadb001a40c998021fd227c20a9f838372a1e2cc8a5e
+  bytes: 10263830
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-31.csv
+  sha256: dd5090af234ba64f85431e6779bbcfcd3849fee241b73eb37d0905065a6dd0de
+  bytes: 10126094
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-01.csv
+  sha256: 581bc71e2a61f59dc869d8935b02a2d366429a2ed5f3be6fd90a746c2e720bca
+  bytes: 11039219
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-02.csv
+  sha256: 27f20bf4fbeaf5fb072410b17171072f2e2669fdf8878446a4c132eb125e3318
+  bytes: 10919150
+- path: configs/roll/ag_roll_recon.path
+  sha256: 3d15840287bd6c0a89c459c9691474d37f1f36192aab6169d184dd3f1121c3b2
+  bytes: 73
+golden:
+  output: fills.csv
+  expected: data/regression/baselines/ag2212_only/expected_fills.csv
+  sha256: 1d7ee64b3ed145d3b5b9848e021cdacc23c7791511f3bcc4df0bf4347fea94b4
+  bytes: 1180757
+  lines: 6481
+  tolerance: bit-exact
+driver: bash scripts/run_baselines.sh ag2212_only

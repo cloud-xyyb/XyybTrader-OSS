@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Binance USDT-M 永续 (demo trading / testnet) HFT live 示例配置
+# 使用: cp 本文件为 configs/live_hft_binance.yaml, API key 填 configs/secrets.yaml
+# 单进程直连模式: MD 与 TD 都在本进程内直连 Binance
+# ─────────────────────────────────────────────────────────────────────────
+queue:
+  mode: spsc
+  capacity: 65536
+  tick_high_watermark: 58982
+  tick_batch_size: 64
+  td_event_mode: mpsc
+  td_event_capacity: 65536
+  td_event_high_watermark: 58982
+  td_event_budget_per_loop: 128
+  td_backlog_warn_threshold: 58982
+  td_event_batch_size: 128
+  tick_max_wait_us: 2000
+  tick_starvation_warn_loops: 128
+  flow_event_mode: mpsc
+  flow_event_capacity: 65536
+  flow_event_high_watermark: 52428
+  flow_event_batch_size: 128
+  flow_event_budget_per_loop: 64
+
+runtime:
+  instrument:
+    symbol: BTCUSDT
+
+  session:                    # 永续 24/7
+    active_sections:
+      - start: 0
+        end: 2359
+
+  trading:
+    allow_short: true
+
+  metrics:
+    exposer_port: 9101        # Prometheus /metrics 暴露端口
+
+  params_backend:
+    type: shm
+    domain: xyybtrader_live_binance
+
+  debug:
+    tick_count: true
+    heartbeat_ms: 10000
+    report_contract_dir: ../var/live_runs/binance/report_contract
+
+  md:
+    provider: binance_u
+    md_front: wss://fstream.binancefuture.com   # testnet 行情流; 主网换 wss://fstream.binance.com
+    stale_reconnect_ms: 8000
+    user: ''
+    password: ''
+    binance:
+      base_ws_url: wss://fstream.binancefuture.com
+      base_rest_url: https://testnet.binancefuture.com
+      testnet: true
+
+  td:
+    provider: binance_u
+    td_front: https://demo-fapi.binance.com     # demo trading REST; 主网换 https://fapi.binance.com
+    user: ''
+    password: ''
+    reconnect: true
+    reconnect_interval_ms: 2000
+    account_refresh_ms: 30000
+    position_refresh_ms: 30000
+    account_snapshot_max_abs: 1.0e12
+    stale_reconnect_ms: 60000
+    binance:
+      transport: ws
+      uds_first_effective_ack: true
+      base_rest_url: https://demo-fapi.binance.com
+      base_ws_url: wss://fstream.binancefuture.com
+      base_ws_trade_url: wss://testnet.binancefuture.com/ws-fapi/v1
+      api_key: ''                # 放 configs/secrets.yaml (runtime.td.binance.api_key)
+      api_secret: ''
+      listen_key_refresh_ms: 1800000
+      testnet: true
+      recv_window_ms: 5000
+      time_sync_interval_ms: 60000
+      ws_submit_timeout_ms: 6000
+      ws_stale_drop_ms: 1500
+      ws_send_queue_cap: 256
+      ws_reconnect_min_ms: 500
+      ws_reconnect_max_ms: 30000
+
+  account:
+    cash: 5000                # demo 账户初始余额 (USDT), 按实际调整
+    mode: futures
+    margin_rate: 0.05
+    reconcile_on_stop: true
+
+  risk:
+    max_order_qty: 0.1
+    max_pos_qty: 0.5
+    min_order_notional: 50    # binance 最小名义价值约束
+
+  strategies:
+    - so: ../var/plugins/strategies/libhft_tick_revert_strategy.so
+      id: hft_tick_revert
+      symbol: BTCUSDT
+      venue: binance
+      tick_window: 10
+      qty: 0.002
+      history_ticks: 256
+      history_bars: 64
+
+  closeout:
+    enabled: false            # 永续 24/7 无收盘
+
+  recording:
+    enabled: true
+    file_path: ../var/live_runs/binance/recordings/live.jsonl
+    queue_capacity: 16384
+    rotate_bytes: 1073741824
+    rotate_interval_sec: 3600
+    event_store:
+      enabled: true
+      root_path: ../var/live_runs/binance/recordings/events

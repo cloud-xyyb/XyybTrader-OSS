@@ -1,0 +1,24 @@
+# ── 凭证：绝不入库（README/secrets.yaml.example 承诺的安全网） ──
+**/secrets.yaml
+**/secrets.local.yaml
+
+# ── 构建产物（前导 / 锚定 repo 根：无锚定的 build*/ 会吞掉 vendored 树里的
+#     builder/、buildroot/ 等源码目录——git add -A 实测踩过） ──
+/build*/
+/cmake-build-*/
+
+# ── 运行时输出 ──
+var/live_runs/
+var/ctp_flow/
+var/plugins/strategies/*.so
+*.so.sha256
+/logs/
+
+# ── 数据缓存 ──
+data/ticks/cache/
+
+# ── 编辑器/系统 ──
+.DS_Store
+.idea/
+.vscode/
+__pycache__/

@@ -1,0 +1,39 @@
+version: 1
+sdk:
+  name: CTP
+  vendor: Shanghai Futures Information Technology CTP
+  version: 6.3.15
+  owner: xyyb
+  integration_date: "2026-05-22"
+  license_notice: LICENSE.md
+  provenance: Vendored as-is from official SimNow distribution.
+abi:
+  os: linux
+  arch: x86_64
+  binary_format: ELF shared object
+  cxx_runtime: libstdc++ compatible
+files:
+  - path: linux/thostmduserapi_se.so
+    role: md_runtime
+    bytes: 4613466
+    sha256: 14e195681ce31b52ec6d7b140291206c702aa2a3793f1efe90deb75f635de6cb
+  - path: linux/thosttraderapi_se.so
+    role: td_runtime
+    bytes: 5244920
+    sha256: c7afcb7c827c3a2c92d915879c68e2c80f868a048e0cffd6cbc3bd3891e4aaf4
+  - path: ThostFtdcMdApi.h
+    role: md_header
+    bytes: 6991
+    sha256: 966501a227bee7812e34fe73d89fa62978f2e758220aacac6c41ee55d3cc2728
+  - path: ThostFtdcTraderApi.h
+    role: td_header
+    bytes: 35623
+    sha256: 5661c6a179fe7e653455f8d6e40f957ab21cd533a81ee393df4474734c44aa47
+  - path: ThostFtdcUserApiDataType.h
+    role: common_header
+    bytes: 250230
+    sha256: 2567b40d585b314dbd009ae0ff6b8f0a18f6011494a538a896a898595f160b48
+  - path: ThostFtdcUserApiStruct.h
+    role: common_header
+    bytes: 286411
+    sha256: 6c43354ed54754d650587590dae5bdbc6d763ea54fc99b62228aa41eb0616ad6

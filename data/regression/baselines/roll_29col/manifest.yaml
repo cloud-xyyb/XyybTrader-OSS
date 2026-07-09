@@ -1,0 +1,55 @@
+schema: regression-case/v1
+case: roll_29col
+description: HFT self-golden: ag2206 + ag2212 双合约 5 交易日（换月路径关闭）
+runner:
+  binary: XtBackTestRunner
+  build_command: cmake --build build --target XtBackTestRunner
+config:
+  path: configs/baselines/roll_29col.yaml
+  sha256: 10428e459a7fb67edc200221a05b15e20f11e5e991317ffc332d67c3995ec4c6
+  bytes: 2606
+strategy_so:
+  path: var/plugins/strategies/libhft_tick_revert_strategy.so
+  build_command: cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy -DXT_SRC_ROOT=$(pwd)/src && cmake --build build-strategy
+inputs:
+- path: data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-27.csv
+  sha256: 302fd5272fa8198687ffe7a832e370f0cd34247414be689084d421380c9aab3d
+  bytes: 7882307
+- path: data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-30.csv
+  sha256: 3a4cd752f069e1333ab574375d62389461fbdc1c0b9ec6c8b0c5c3c496ab43a6
+  bytes: 5569737
+- path: data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-31.csv
+  sha256: 2889d814f74c3792976987ec89cf1c130fe8b95a4fbbb52411f3c84ea0664645
+  bytes: 4144000
+- path: data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-01.csv
+  sha256: 0dbbb1bcb4a9a6583a8d563bf588149f13717f2ed858be3644b4c72ea43bfd4c
+  bytes: 1749456
+- path: data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-02.csv
+  sha256: 0857bf4312bc810fb16a9bfa008f8c9ce67d6ff270e80e3e02320295b4af70d5
+  bytes: 1836225
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-27.csv
+  sha256: 0ed61d4744ac519a6255e5232f05c57132648b20f372152725e9e7083e9d1a68
+  bytes: 9985860
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-30.csv
+  sha256: 74c971899895546b32c1dadb001a40c998021fd227c20a9f838372a1e2cc8a5e
+  bytes: 10263830
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-31.csv
+  sha256: dd5090af234ba64f85431e6779bbcfcd3849fee241b73eb37d0905065a6dd0de
+  bytes: 10126094
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-01.csv
+  sha256: 581bc71e2a61f59dc869d8935b02a2d366429a2ed5f3be6fd90a746c2e720bca
+  bytes: 11039219
+- path: data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-02.csv
+  sha256: 27f20bf4fbeaf5fb072410b17171072f2e2669fdf8878446a4c132eb125e3318
+  bytes: 10919150
+- path: configs/roll/ag_roll_recon.path
+  sha256: 3d15840287bd6c0a89c459c9691474d37f1f36192aab6169d184dd3f1121c3b2
+  bytes: 73
+golden:
+  output: fills.csv
+  expected: data/regression/baselines/roll_29col/expected_fills.csv
+  sha256: 5bd3900e57cbd1f0a909eff88a10e578a1f8575063f48a5eeb79c77699773240
+  bytes: 1044601
+  lines: 5739
+  tolerance: bit-exact
+driver: bash scripts/run_baselines.sh roll_29col

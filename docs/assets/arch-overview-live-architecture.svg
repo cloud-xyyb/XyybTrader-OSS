@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1240" width="1800" height="1240" role="img" aria-label="XyybTrader live architecture map">
+<defs>
+<marker id="arrow-md" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#1864ab" /></marker>
+<marker id="arrow-engine" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2f9e44" /></marker>
+<marker id="arrow-exec" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c92a2a" /></marker>
+<marker id="arrow-strategy" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#5f3dc4" /></marker>
+<marker id="arrow-state" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0c8599" /></marker>
+<marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e67700" /></marker>
+<marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#495057" /></marker>
+</defs>
+<style>
+text { font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: 0; }
+</style>
+<rect width="1800" height="1240" fill="#ffffff"/>
+<text x="48" y="64" font-size="50" font-weight="700" fill="#111827" text-anchor="start">
+<tspan x="48" dy="0.0">Live 架构：venue callback 到策略闭环</tspan>
+</text>
+<text x="50" y="108" font-size="27" font-weight="400" fill="#4b5563" text-anchor="start">
+<tspan x="50" dy="0.0">MD / TD 回调入队，worker 单写状态，策略只通过 Context 下单</tspan>
+</text>
+<rect x="56" y="150" width="1688" height="860" rx="12" fill="transparent" stroke="#2f9e44" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="92" y="193" font-size="34" font-weight="700" fill="#2f9e44" text-anchor="start">
+<tspan x="92" dy="0.0">live runner 进程</tspan>
+</text>
+<rect x="90" y="260" width="270" height="112" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="225.0" y="309.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="225.0" dy="0.0">Venue MD</tspan>
+</text>
+<text x="225.0" y="355.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="225.0" dy="0.0">CTP / Binance</tspan>
+</text>
+<rect x="415" y="260" width="300" height="112" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="565.0" y="309.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="565.0" dy="0.0">IMdGateway</tspan>
+</text>
+<text x="565.0" y="355.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="565.0" dy="0.0">标准化 XtRawTick</tspan>
+</text>
+<rect x="770" y="260" width="300" height="112" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="920.0" y="309.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="920.0" dy="0.0">XtHftChannels</tspan>
+</text>
+<text x="920.0" y="355.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="920.0" dy="0.0">tick / TD event 入队</tspan>
+</text>
+<rect x="1125" y="260" width="300" height="112" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="1275.0" y="309.28" font-size="30" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="1275.0" dy="0.0">XtHftEventLoop</tspan>
+</text>
+<text x="1275.0" y="355.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1275.0" dy="0.0">worker drain</tspan>
+</text>
+<rect x="1480" y="260" width="230" height="112" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="1595.0" y="309.28" font-size="30" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="1595.0" dy="0.0">XtHftEngine</tspan>
+</text>
+<text x="1595.0" y="355.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1595.0" dy="0.0">on_tick 路由</tspan>
+</text>
+<path d="M 360 316 L 415 316" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<path d="M 715 316 L 770 316" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<path d="M 1070 316 L 1125 316" fill="none" stroke="#2f9e44" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-engine)"/>
+<path d="M 1425 316 L 1480 316" fill="none" stroke="#2f9e44" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-engine)"/>
+<rect x="1050" y="500" width="660" height="124" rx="10" fill="#e5dbff" stroke="#5f3dc4" stroke-width="3"/>
+<text x="1380.0" y="555.06" font-size="31" font-weight="700" fill="#5f3dc4" text-anchor="middle">
+<tspan x="1380.0" dy="0.0">Strategy plugins / IStrategyContext</tspan>
+</text>
+<text x="1380.0" y="602.88" font-size="23" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1380.0" dy="0.0">strategy.on_tick(ctx, tick) · buy_fp / sell_fp / cancel</tspan>
+</text>
+<path d="M 1595 372 L 1595 500" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)"/>
+<rect x="720" y="720" width="360" height="112" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="900.0" y="768.89" font-size="29" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="900.0" dy="0.0">XtLiveOrderGateway</tspan>
+</text>
+<text x="900.0" y="814.27" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="900.0" dy="0.0">risk / cost / account</tspan>
+</text>
+<rect x="390" y="720" width="280" height="112" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="530.0" y="768.89" font-size="29" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="530.0" dy="0.0">ITradeGateway</tspan>
+</text>
+<text x="530.0" y="814.27" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="530.0" dy="0.0">submit / cancel</tspan>
+</text>
+<rect x="90" y="720" width="250" height="112" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="215.0" y="768.89" font-size="29" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="215.0" dy="0.0">Venue TD</tspan>
+</text>
+<text x="215.0" y="814.27" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="215.0" dy="0.0">order / trade 回报</tspan>
+</text>
+<path d="M 1380 624 L 1080 776" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<text x="1198" y="683" font-size="22" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="1198" dy="0.0">submit / cancel</tspan>
+</text>
+<path d="M 720 776 L 670 776" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<path d="M 390 776 L 340 776" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<path d="M 215 720 L 215 455 L 920 455 L 920 372" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)" stroke-dasharray="16 12"/>
+<text x="238" y="438" font-size="22" font-weight="700" fill="#5f3dc4" text-anchor="start">
+<tspan x="238" dy="0.0">TD 回报入队</tspan>
+</text>
+<rect x="260" y="875" width="1280" height="120" rx="12" fill="#f8fafc" stroke="#0c8599" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="300" y="912" font-size="28" font-weight="700" fill="#0c8599" text-anchor="start">
+<tspan x="300" dy="0.0">runner 内共享状态</tspan>
+</text>
+<rect x="440" y="925" width="240" height="62" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="560.0" y="947.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="560.0" dy="0.0">xt_runtime</tspan>
+</text>
+<text x="560.0" y="985.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="560.0" dy="0.0">行情 / 订单 view</tspan>
+</text>
+<rect x="715" y="925" width="240" height="62" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="835.0" y="947.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="835.0" dy="0.0">xt_account</tspan>
+</text>
+<text x="835.0" y="985.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="835.0" dy="0.0">账户 truth</tspan>
+</text>
+<rect x="990" y="925" width="240" height="62" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1110.0" y="947.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1110.0" dy="0.0">xt_risk</tspan>
+</text>
+<text x="1110.0" y="985.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1110.0" dy="0.0">pre-trade</tspan>
+</text>
+<rect x="1260" y="925" width="240" height="62" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1380.0" y="947.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1380.0" dy="0.0">xt_report / metrics</tspan>
+</text>
+<text x="1380.0" y="985.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1380.0" dy="0.0">冷路径观测</tspan>
+</text>
+<rect x="80" y="1060" width="1640" height="130" rx="12" fill="#f8fafc" stroke="#495057" stroke-width="2"/>
+<text x="112" y="1100" font-size="28" font-weight="700" fill="#495057" text-anchor="start">
+<tspan x="112" dy="0.0">live 不包含回测组件</tspan>
+</text>
+<text x="112" y="1142" font-size="24" font-weight="400" fill="#495057" text-anchor="start">
+<tspan x="112" dy="0.0">这张图只画实盘 runner:venue callback、worker、engine、strategy、TD gateway 和冷路径观测。</tspan>
+<tspan x="112" dy="29.8">replayer、virtual clock、match engine 放在 backtest 架构图。</tspan>
+</text>
+</svg>

@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1040" viewBox="0 0 1920 1040" role="img" aria-labelledby="title desc">
+  <title id="title">xt_ipc 跨进程行情 fan-out</title>
+  <desc id="desc">一个 MD connector 连接 venue 行情并写入 POSIX shared memory ring，多个 runner 进程通过 XtShmMdGateway 读取同一个 ring；TD、account、risk、OMS 和 safety_state 留在各自 runner 进程内。</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="18" markerHeight="14" refX="16" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 2 2 L 16 7 L 2 12" fill="none" stroke="#1864ab" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="18" markerHeight="14" refX="16" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 2 2 L 16 7 L 2 12" fill="none" stroke="#2f9e44" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfaf6; }
+      .title { font: 700 58px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #111827; }
+      .subtitle { font: 500 34px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #374151; }
+      .phase { font: 700 42px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #111827; }
+      .box-title { font: 700 48px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #111827; }
+      .box-subtitle { font: 500 34px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #374151; }
+      .small-title { font: 700 39px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #111827; }
+      .small-text { font: 500 31px Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; fill: #4b5563; }
+      .panel { fill: #ffffff; stroke: #d8d5cb; stroke-width: 2; }
+      .panel-blue { fill: #f4f9ff; stroke: #9cc5ea; }
+      .panel-green { fill: #f5fbf6; stroke: #9bd8aa; }
+      .panel-red { fill: #fff5f5; stroke: #f0aaa6; }
+      .box { fill: #ffffff; stroke-width: 3; }
+      .box-blue { stroke: #1864ab; }
+      .box-green { stroke: #2f9e44; }
+      .box-purple { stroke: #5f3dc4; }
+      .box-red { stroke: #c92a2a; }
+      .wire-blue { fill: none; stroke: #1864ab; stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-blue); }
+      .wire-green { fill: none; stroke: #2f9e44; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-green); }
+      .ring-line { stroke: #1864ab; stroke-width: 4; fill: none; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1920" height="1040"/>
+
+  <text class="title" x="88" y="86">xt_ipc 跨进程行情 fan-out</text>
+  <text class="subtitle" x="88" y="128">一次 venue MD 接入，多个独立 runner 读同一份 XtRawTick；交易状态留在各自进程内。</text>
+
+  <rect class="panel panel-blue" x="74" y="178" width="1772" height="468" rx="28"/>
+  <text class="phase" x="112" y="232">只跨进程的主线：MD 行情</text>
+
+  <rect class="box box-blue" x="112" y="306" width="290" height="142" rx="18"/>
+  <text class="box-title" x="257" y="360" text-anchor="middle">Venue MD</text>
+  <text class="box-subtitle" x="257" y="410" text-anchor="middle">CTP · Binance</text>
+
+  <rect class="box box-green" x="512" y="284" width="368" height="186" rx="18"/>
+  <text class="box-title" x="696" y="342" text-anchor="middle">MD connector</text>
+  <text class="box-subtitle" x="696" y="394" text-anchor="middle">xt_md_connector_*</text>
+  <text class="box-subtitle" x="696" y="438" text-anchor="middle">只接行情</text>
+
+  <g transform="translate(1014 262)">
+    <rect class="box box-blue" x="0" y="0" width="392" height="230" rx="22"/>
+    <text class="box-title" x="196" y="60" text-anchor="middle">POSIX shm ring</text>
+    <text class="box-subtitle" x="196" y="106" text-anchor="middle">XtRawTick 广播</text>
+    <text class="box-subtitle" x="196" y="148" text-anchor="middle">单 writer · N reader</text>
+    <line class="ring-line" x1="58" y1="174" x2="334" y2="174"/>
+    <line class="ring-line" x1="58" y1="198" x2="334" y2="198"/>
+    <circle cx="88" cy="186" r="13" fill="#1864ab"/>
+    <circle cx="144" cy="186" r="13" fill="#5f3dc4"/>
+    <circle cx="200" cy="186" r="13" fill="#2f9e44"/>
+    <circle cx="256" cy="186" r="13" fill="#1864ab"/>
+    <circle cx="312" cy="186" r="13" fill="#5f3dc4"/>
+  </g>
+
+  <rect class="box box-purple" x="1518" y="218" width="258" height="136" rx="18"/>
+  <text class="small-title" x="1647" y="268" text-anchor="middle">Runner A</text>
+  <text class="small-text" x="1647" y="312" text-anchor="middle">XtShmMdGateway</text>
+
+  <rect class="box box-purple" x="1518" y="452" width="258" height="136" rx="18"/>
+  <text class="small-title" x="1647" y="502" text-anchor="middle">Runner B</text>
+  <text class="small-text" x="1647" y="546" text-anchor="middle">XtShmMdGateway</text>
+
+  <path class="wire-blue" d="M 402 377 L 492 377"/>
+  <path class="wire-blue" d="M 880 377 L 994 377"/>
+  <path class="wire-blue" d="M 1406 350 C 1454 314 1478 286 1498 286"/>
+  <path class="wire-blue" d="M 1406 405 C 1454 444 1478 520 1498 520"/>
+
+  <rect class="panel panel-green" x="74" y="704" width="1772" height="234" rx="28"/>
+  <text class="phase" x="112" y="758">每个 runner 内部继续走原来的 live 链路</text>
+
+  <rect class="box box-green" x="150" y="806" width="308" height="88" rx="16"/>
+  <text class="small-title" x="304" y="840" text-anchor="middle">on_tick callback</text>
+  <text class="small-text" x="304" y="876" text-anchor="middle">IMdGateway</text>
+
+  <rect class="box box-green" x="558" y="806" width="288" height="88" rx="16"/>
+  <text class="small-title" x="702" y="840" text-anchor="middle">tick queue</text>
+  <text class="small-text" x="702" y="872" text-anchor="middle">runner worker 消费</text>
+
+  <rect class="box box-purple" x="946" y="806" width="288" height="88" rx="16"/>
+  <text class="small-title" x="1090" y="840" text-anchor="middle">engine / strategy</text>
+  <text class="small-text" x="1090" y="872" text-anchor="middle">on_tick 后发单</text>
+
+  <rect class="box box-red" x="1362" y="784" width="390" height="132" rx="16"/>
+  <text class="small-title" x="1557" y="826" text-anchor="middle">本进程交易状态</text>
+  <text class="small-text" x="1557" y="864" text-anchor="middle">TD / account / risk / OMS</text>
+  <text class="small-text" x="1557" y="902" text-anchor="middle">不进入 shm ring</text>
+
+  <path class="wire-green" d="M 458 850 L 538 850"/>
+  <path class="wire-green" d="M 846 850 L 926 850"/>
+  <path class="wire-green" d="M 1234 850 L 1342 850"/>
+</svg>

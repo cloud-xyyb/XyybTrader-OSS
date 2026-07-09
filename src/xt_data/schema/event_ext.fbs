@@ -1,0 +1,238 @@
+// 本 schema 覆盖 MdTick 以外的审计事件：订单意图、订单/成交回报、连接状态、
+// 策略指标、策略决策、risk reject、参数更新与 kill switch 翻转。
+//
+// 存储布局：`<root>/YYYY-MM-DD/_events/events_ext.fbs`。扩展事件按交易日合并为
+// 单文件，consumer 通过 union discriminant 分发 payload；MdTick 仍按
+// exchange/symbol 分片写入 tick.fbs。
+//
+// trading_day 由 live recorder drain 线程维护的最近 MdTick 交易日提供。
+// MdTick 尚未到达时的早期连接事件允许 trading_day=0，此时 store 必须拒绝 FBS
+// append，调用方决定是否走其它审计通道。
+//
+// Schema evolution 规则：
+//   - 允许在 table 末尾追加字段，并为既有 reader 提供默认值。
+//   - 允许在 union / enum 末尾追加成员；既有 reader 应跳过未知 discriminant。
+//   - 禁止删除字段、改字段名、改字段类型、重排字段、删除 union/enum 成员。
+//   - 禁止修改 namespace 与 file_identifier。
+// 兼容性检查由 tools/proto/check_fbs_compat.py 负责。
+//
+// 多策略元数据：
+//   - strat_id 是全局策略实例 ID，也是拆账和 demux 主键。
+//   - book_id 是 per-strategy sub-book ID；单 book 策略通常等于 strat_id。
+//   - account_id 是 venue 内账户 ID，用于跨账号隔离。
+//   - user_tag 是策略自定义标签；OrderSubmit.parent_strat 是兼容字段，
+//     consumer 应优先使用 strat_id / user_tag。
+
+include "event.fbs";
+
+namespace ct.data.schema;
+
+// ---------------------------------------------------------------------------
+// OrderSubmit — 策略下单意图送到 venue（live tap: XtLiveOrderGateway::submit）
+// ---------------------------------------------------------------------------
+table OrderSubmit {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  code:string         (required);
+  exchange_id:string;              // 可能为空（部分 tap 未设）
+  logical_id:uint64;
+  dir:string;                      // "buy" / "sell"
+  offset:string;                   // "open" / "close" / "closetoday"
+  price_fp:int64;                  // ×1e6
+  qty:int64;                       // 整数手
+  parent_strat:string;             // 兼容字段；consumer 优先使用 strat_id / user_tag
+  trigger_tick_ts:uint64;          // 触发此单的 tick ts_local_ns (0 = 非 on_tick)
+  reason:string;                   // 策略决策原因（对账 anchor）
+  // source_kind 显式默认 UNKNOWN(=0) 与 event.fbs MdTick 的「无默认」二进制等价
+  // （FlatBuffers 标量缺省即 0=UNKNOWN）；两侧 fail-unsafe 一致，消费方对 UNKNOWN
+  // 做 assert/skip。下方各 EventExt table 的 source_kind 同此约定。
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── 多策略路由元数据（调用方必须显式填充）
+  strat_id:string;                 // 全局唯一策略实例 ID — multi-strategy demux 主键
+  book_id:string;                  // per-strategy sub-book id；单 book 策略通常等于 strat_id
+  account_id:string;               // venue 内 account id
+  user_tag:string;                 // 策略自定义标签 (取代 parent_strat 的语义)
+  decision_mono_ns:uint64;         // 策略 submit() entry 时刻 (CLOCK_MONOTONIC; 0 = 未知)
+}
+
+// ---------------------------------------------------------------------------
+// TradeRtn — 成交回报（live tap: TraderCTP::OnRtnTrade / Binance UDS）
+// ---------------------------------------------------------------------------
+table TradeRtn {
+  ts_local_ns:uint64;
+  ts_exch_ns:uint64;               // 交易所时间戳（若有）
+  trade_action_date:uint32;         // YYYYMMDD；CTP 直读，binance 由 UTC transact time 派生
+  trade_action_time:uint32;         // HHMMSSmmm；CTP TradeTime 秒精度则 mmm=000
+  trading_day:uint32;
+  trade_id:uint64;
+  logical_id:uint64;               // 可连回 OrderSubmit.logical_id
+  code:string;                     // 缺失时 reader 可按 logical_id 关联 OrderSubmit
+  exchange_id:string;
+  price_fp:int64;
+  qty:int64;
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── 多策略拆账与成交审计字段
+  strat_id:string;                 // 拆账主键；缺失时 reader 可按 logical_id 回退关联订单
+  book_id:string;                  // 决策视图主键
+  account_id:string;
+  is_maker:bool = false;           // maker/taker 区分；缺省 false 表示 taker/未知
+  fee_fp:int64;                    // 成交手续费 ×1e6 (signed: 返佣 → 负值)
+  realized_pnl_fp:int64;           // 该笔实现 PnL ×1e6 (close 单才非零；open 单 = 0)
+  is_close:bool = false;           // 是否平仓单 (派生自 OrderSubmit.offset，便于 SQL where)
+  side:string;                      // "buy" / "sell"，用于无需 join 的成交侧向查询
+  route_status:string;             // routed / unmatched / operator / fallback_recovery / unknown
+}
+
+// ---------------------------------------------------------------------------
+// OrderRtn — 订单状态回报（live tap: TraderCTP::OnRtnOrder / Binance UDS）
+// ---------------------------------------------------------------------------
+table OrderRtn {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  logical_id:uint64;
+  phys_id:uint64;
+  status:string;                   // "accepted"/"partial"/"filled"/"canceled"/"rejected"
+  filled_qty:int64;
+  err_msg:string;
+  cancel_initiator:string;         // "user"/"ioc_timeout"/"auto"
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── 多策略路由元数据
+  strat_id:string;                 // 订单状态回报的策略归属，避免按 logical_id 反查
+  book_id:string;
+  account_id:string;
+}
+
+// ---------------------------------------------------------------------------
+// ConnState — 网关连接状态（live tap: ParserCTP/TraderCTP OnFront* / Binance WS）
+// ---------------------------------------------------------------------------
+table ConnState {
+  ts_local_ns:uint64;
+  trading_day:uint32;              // 可能为 0（MdTick 尚未建立当前交易日）
+  gateway:string (required);       // "td" / "md"
+  state:string;                    // "connecting" / "ready" / "lost" / "reconnect" / ...
+  err_msg:string;
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── venue routing
+  venue_id:string;                 // "binance_u" / "ctp" — 多 venue 部署区分
+}
+
+// ---------------------------------------------------------------------------
+// StrategyMetric — 策略指标（live tap: XtStrategyContext::report_metric）
+// ---------------------------------------------------------------------------
+table StrategyMetric {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  strat_id:string;
+  name:string (required);
+  value:double;                    // caller 保证 isfinite (NaN/inf skip)
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── book/account routing
+  book_id:string;
+  account_id:string;
+}
+
+// ---------------------------------------------------------------------------
+// StrategyDecision — 策略决策（信号/目标持仓 + 触发 tick ts）
+// ---------------------------------------------------------------------------
+table StrategyDecision {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  strat_id:string;
+  code:string (required);
+  signal:string;                   // "long"/"short"/"flat"
+  target_pos:int64;
+  trigger_tick_ts:uint64;
+  source_kind:SourceKind = UNKNOWN;
+
+  // ── book/account routing
+  book_id:string;
+  account_id:string;
+}
+
+// ---------------------------------------------------------------------------
+// RiskReject — 风控拒单事件（live tap: XtRiskGateway::reject_*）
+// ---------------------------------------------------------------------------
+//
+// 每次 risk gate 拒单都应落此 payload，用于按 strat_id / book_id / reason 做
+// 拆账与审计聚合；Prometheus counter 只承担实时告警，不是审计 source of truth。
+table RiskReject {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  strat_id:string;                 // 被拒的策略 (multi-strategy 拆账主键)
+  book_id:string;
+  account_id:string;
+  code:string;
+  dir:string;                      // "buy" / "sell"
+  price_fp:int64;
+  qty:int64;
+  reason:string;                   // "max_pos_qty" / "max_order_qty" / "kill_switch" / ...
+  required_margin_fp:int64;        // 触发 margin reject 时的 required (USD/CNY ×1e6)
+  available_margin_fp:int64;       // 触发 margin reject 时的 available
+  source_kind:SourceKind = UNKNOWN;
+}
+
+// ---------------------------------------------------------------------------
+// ParamUpdate — 参数热更新事件（control plane apply ack 落地）
+// ---------------------------------------------------------------------------
+//
+// 仅在参数 apply 成功后写入；value_str 是调用方序列化后的值，schema 不表达
+// 强类型。失败请求由 control-plane response/audit log 记录，不写 ParamUpdate。
+table ParamUpdate {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  actor:string;                    // panel actor (IP / user) / "system"
+  strat_id:string;                 // 空 / "_global" = 全局 risk 参数
+  key:string (required);           // e.g. "tick_window" / "risk.max_order_qty"
+  value_str:string;                // 序列化后的值 (caller 转 string，schema 不区分类型)
+  apply_mono_ns:uint64;            // 参数 apply 成功时刻（CLOCK_MONOTONIC）
+  source_kind:SourceKind = UNKNOWN;
+}
+
+// ---------------------------------------------------------------------------
+// KillSwitch — kill switch 翻转事件（control plane / risk auto-trip）
+// ---------------------------------------------------------------------------
+//
+// 记录手动或自动触发的 kill switch 状态变化。actor、state、reason 和 venue_id
+// 是事后复盘的最小因果链；当前状态查询由 control RPC 提供。
+table KillSwitch {
+  ts_local_ns:uint64;
+  trading_day:uint32;
+  actor:string;                    // panel actor / "auto:max_drawdown" / "auto:disconnect"
+  state:string (required);         // "tripped" / "resumed"
+  reason:string;                   // 触发原因详描
+  venue_id:string;                 // 哪个 venue 翻转
+  source_kind:SourceKind = UNKNOWN;
+}
+
+// ---------------------------------------------------------------------------
+// EventExt wrapper — 单文件多 payload 类型的解码入口
+// ---------------------------------------------------------------------------
+//
+// FB union 演化规则：新成员只能加在末尾，既有 reader 见到未知 discriminant skip。
+union EventExtPayload {
+  OrderSubmit,
+  TradeRtn,
+  OrderRtn,
+  ConnState,
+  StrategyMetric,
+  StrategyDecision,
+
+  // control plane + risk audit payloads；新增成员只能追加在末尾。
+  RiskReject,
+  ParamUpdate,
+  KillSwitch,
+}
+
+table EventExt {
+  payload:EventExtPayload;
+}
+
+root_type EventExt;
+
+// "XTEX" = "CT EXtended event"，与 MdTick 的 "XTEV" 区分，避免混扫。
+file_identifier "XTEX";

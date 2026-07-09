@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1240" width="1800" height="1240" role="img" aria-label="XyybTrader backtest architecture map">
+<defs>
+<marker id="arrow-md" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#1864ab" /></marker>
+<marker id="arrow-engine" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2f9e44" /></marker>
+<marker id="arrow-exec" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c92a2a" /></marker>
+<marker id="arrow-strategy" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#5f3dc4" /></marker>
+<marker id="arrow-state" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0c8599" /></marker>
+<marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e67700" /></marker>
+<marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#495057" /></marker>
+</defs>
+<style>
+text { font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: 0; }
+</style>
+<rect width="1800" height="1240" fill="#ffffff"/>
+<text x="48" y="64" font-size="50" font-weight="700" fill="#111827" text-anchor="start">
+<tspan x="48" dy="0.0">Backtest 架构：replay 到撮合回报闭环</tspan>
+</text>
+<text x="50" y="108" font-size="27" font-weight="400" fill="#4b5563" text-anchor="start">
+<tspan x="50" dy="0.0">历史数据和虚拟时钟驱动策略，本地 gateway / match engine 生成 order / fill</tspan>
+</text>
+<rect x="56" y="150" width="1688" height="860" rx="12" fill="transparent" stroke="#1864ab" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="92" y="193" font-size="34" font-weight="700" fill="#1864ab" text-anchor="start">
+<tspan x="92" dy="0.0">backtest 进程</tspan>
+</text>
+<rect x="90" y="265" width="310" height="112" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="245.0" y="314.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="245.0" dy="0.0">历史 tick / fbs</tspan>
+</text>
+<text x="245.0" y="360.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="245.0" dy="0.0">recorded market data</tspan>
+</text>
+<rect x="470" y="265" width="320" height="112" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="630.0" y="314.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="630.0" dy="0.0">XtReplayer</tspan>
+</text>
+<text x="630.0" y="360.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="630.0" dy="0.0">虚拟时钟 replay</tspan>
+</text>
+<rect x="860" y="265" width="320" height="112" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="1020.0" y="314.28" font-size="30" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="1020.0" dy="0.0">XtHftEngine</tspan>
+</text>
+<text x="1020.0" y="360.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1020.0" dy="0.0">tick / clock 分发</tspan>
+</text>
+<rect x="1250" y="265" width="430" height="112" rx="10" fill="#e5dbff" stroke="#5f3dc4" stroke-width="3"/>
+<text x="1465.0" y="314.28" font-size="30" font-weight="700" fill="#5f3dc4" text-anchor="middle">
+<tspan x="1465.0" dy="0.0">Strategy plugins / Context</tspan>
+</text>
+<text x="1465.0" y="360.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1465.0" dy="0.0">strategy.on_tick(ctx, tick)</tspan>
+</text>
+<path d="M 400 321 L 470 321" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<path d="M 790 321 L 860 321" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<path d="M 1180 321 L 1250 321" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)"/>
+<rect x="1250" y="500" width="430" height="112" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="1465.0" y="549.28" font-size="30" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="1465.0" dy="0.0">Backtest gateway</tspan>
+</text>
+<text x="1465.0" y="595.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1465.0" dy="0.0">submit / cancel 本地化</tspan>
+</text>
+<rect x="860" y="500" width="320" height="112" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="1020.0" y="549.28" font-size="30" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="1020.0" dy="0.0">HFTMatchEngine</tspan>
+</text>
+<text x="1020.0" y="595.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1020.0" dy="0.0">queue / latency / fill</tspan>
+</text>
+<rect x="470" y="500" width="320" height="112" rx="10" fill="#e5dbff" stroke="#5f3dc4" stroke-width="3"/>
+<text x="630.0" y="549.28" font-size="30" font-weight="700" fill="#5f3dc4" text-anchor="middle">
+<tspan x="630.0" dy="0.0">fill / order events</tspan>
+</text>
+<text x="630.0" y="595.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="630.0" dy="0.0">延迟可见 · 回灌 engine</tspan>
+</text>
+<path d="M 1465 377 L 1465 500" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<text x="1500" y="455" font-size="22" font-weight="700" fill="#c92a2a" text-anchor="start">
+<tspan x="1500" dy="0.0">交易意图</tspan>
+</text>
+<path d="M 1250 556 L 1180 556" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<path d="M 860 556 L 790 556" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)"/>
+<path d="M 630 500 L 630 430 L 1020 430 L 1020 377" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)" stroke-dasharray="16 12"/>
+<text x="650" y="414" font-size="22" font-weight="700" fill="#5f3dc4" text-anchor="start">
+<tspan x="650" dy="0.0">order / fill 回调</tspan>
+</text>
+<rect x="260" y="720" width="1280" height="150" rx="12" fill="#f8fafc" stroke="#0c8599" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="300" y="760" font-size="28" font-weight="700" fill="#0c8599" text-anchor="start">
+<tspan x="300" dy="0.0">回测复用的领域状态</tspan>
+</text>
+<rect x="400" y="782" width="240" height="66" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="520.0" y="806.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="520.0" dy="0.0">xt_runtime</tspan>
+</text>
+<text x="520.0" y="844.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="520.0" dy="0.0">行情 / 订单 view</tspan>
+</text>
+<rect x="670" y="782" width="240" height="66" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="790.0" y="806.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="790.0" dy="0.0">xt_account</tspan>
+</text>
+<text x="790.0" y="844.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="790.0" dy="0.0">账户 truth</tspan>
+</text>
+<rect x="940" y="782" width="240" height="66" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1060.0" y="806.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1060.0" dy="0.0">xt_risk / cost</tspan>
+</text>
+<text x="1060.0" y="844.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1060.0" dy="0.0">规则 / fee / slippage</tspan>
+</text>
+<rect x="1210" y="782" width="240" height="66" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1330.0" y="806.77" font-size="23" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1330.0" dy="0.0">xt_report / xt_data</tspan>
+</text>
+<text x="1330.0" y="844.8299999999999" font-size="20" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1330.0" dy="0.0">结果 / fbs</tspan>
+</text>
+<rect x="80" y="1060" width="1640" height="130" rx="12" fill="#f8fafc" stroke="#495057" stroke-width="2"/>
+<text x="112" y="1100" font-size="28" font-weight="700" fill="#495057" text-anchor="start">
+<tspan x="112" dy="0.0">backtest 不包含实盘 venue gateway</tspan>
+</text>
+<text x="112" y="1142" font-size="24" font-weight="400" fill="#495057" text-anchor="start">
+<tspan x="112" dy="0.0">这张图只画回测链路:历史数据、replayer、虚拟时钟、backtest gateway、match engine 和结果输出。</tspan>
+<tspan x="112" dy="29.8">CTP/Binance callback 与 TD gateway 放在 live 架构图。</tspan>
+</text>
+</svg>

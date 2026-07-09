@@ -1,0 +1,91 @@
+# Baseline: ag2206→ag2212 换月 + 跨端午节假期 20220527-20220608（8 trading days）
+# WT parity 参考：scripts/wtpy_reconciliation/outputs_bt/hft_tick_revert_ag_roll_holiday/trades.csv
+log:
+  level: info
+  console: false
+commodities:
+  ag:
+    vol_scale: 15.0
+    price_tick: 1.0
+fees:
+  ag: {open: 0, close: 0, close_today: 0, by_volume: false}
+backtest:
+  start_date: 20220527
+  end_date:   20220608
+  report_dir: /tmp/xt_baseline_holiday
+  # Phase D.2 (2026-04-28): 老 fill_latency_us / queue_ahead_ratio 迁移到 model 节
+  latency_model:
+    type: constant
+    entry_us: 0
+    response_us: 0
+  queue_model:
+    type: ratio
+    ratio: 0.0
+  queue_cancel_ratio: 0.0
+  ack_delay_ticks: 0
+  order_timeout_ticks: 0
+  error_rate: 0.0
+  volume_limit: false
+  match_delay_ticks: 2
+  session_offset_minutes: 300
+  session:
+    enabled: true
+    sections:
+      - "21:00:00-02:30:00"
+      - "09:00:00-10:15:00"
+      - "10:30:00-11:30:00"
+      - "13:30:00-15:00:00"
+  roll:
+    active: true
+    logical_symbol: "ag@main"
+    path: ${PROJECT_DIR}/configs/roll/ag_roll_recon.path
+    dispatch_parallel_ticks: false
+  fill:
+    split: false
+    min_qty: 1.0
+    max_qty: 1000.0
+    qty_tick: 1.0
+  account:
+    cash: 100000000
+  cost:
+    slippage: 0
+  risk:
+    max_order_qty: 10000
+    max_order_notional: 0
+    max_pos_qty: 10000
+    allow_short: true
+  datasource:
+    mode: tick
+    data_mode: memory
+    tick:
+      files:
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-27.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-30.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-31.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-01.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-02.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-06.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-07.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-08.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-27.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-30.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-05-31.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-01.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-02.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-06.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-07.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2212/2022-06-08.csv
+      symbols:
+        - ag2206
+        - ag2212
+      volume_mode: cumulative
+      use_bin_cache: false
+  strategies:
+    - id: hft_tick_revert
+      so: ${PROJECT_DIR}/var/plugins/strategies/libhft_tick_revert_strategy.so
+      symbol: ag2206
+      tick_window: 10
+      qty: 1
+      use_ioc: 0
+      history_ticks: 256
+      history_bars: 64

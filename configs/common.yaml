@@ -1,0 +1,19 @@
+log:
+  level: info
+  console: true
+  file: var/logs/ct.log
+  max_size: 52428800
+  max_files: 10
+  queue_size: 8192
+  threads: 1
+  modules:
+    MD: true
+    TD: true
+    RT: true
+    STRA: true
+    RISK: true
+    BT: true
+    MATCH: true
+    REPORT: true
+  throttle_ms:
+    tick: 1000

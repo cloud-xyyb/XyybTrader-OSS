@@ -1,0 +1,21 @@
+commodities:
+  IF:
+    price_tick: 0.2
+    vol_scale: 300.0
+    allow_short: true
+  AG:
+    price_tick: 1.0
+    vol_scale: 15.0
+    allow_short: true
+
+fees:
+  IF:
+    open: 0.0002
+    close: 0.0002
+    close_today: 0.0002
+    by_volume: false
+  AG:
+    open: 0.00005
+    close: 0.00005
+    close_today: 0.00005
+    by_volume: false

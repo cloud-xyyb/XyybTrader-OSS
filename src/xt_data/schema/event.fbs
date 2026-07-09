@@ -1,0 +1,117 @@
+// 本 schema 只定义行情 tick 的 FlatBuffers record。非 MdTick 事件使用
+// event_ext.fbs 的 EventExt wrapper，并落到日级 `_events/events_ext.fbs`。
+//
+// 对齐：
+//   - src/xt_core/XtTick.h            （内部统一 fp ×1e6 int64 格式）
+//   - src/xt_core/XtTickBinCodec.h V2 （price_scale = 1e6, qty_scale = 1e6）
+//   - src/xt_live/telemetry/recording/XtLiveRecorder.h::Event（live JSONL MdTick payload）
+//   - scripts/data_pipeline/MANIFEST.yaml（normalized_v2 CSV）
+//
+// 字段命名与 XtTick.h 保持一致；×1e6 定点字段全部带 `_fp` 后缀。
+// FBS event-store v1 固定 L1-L5：写方必须写 5 档，读方必须拒绝非 5 档。
+// 更深 live 盘口属于 JSONL recorder 或 control RPC snapshot，不改变本 schema。
+
+namespace ct.data.schema;
+
+// ---------------------------------------------------------------------------
+// 数据来源标识（Source kind）：UNKNOWN=0 作 fail-closed default。
+// FlatBuffers 未赋值字段读出来是 0；保留 UNKNOWN 占 0 位 + 消费方 assert
+// source_kind != UNKNOWN 强制显式，避免漏填的 sentinel-0 数据冒充 live 真数据。
+// ---------------------------------------------------------------------------
+enum SourceKind : byte {
+  UNKNOWN      = 0,  // 未设置 — 消费方必须拒绝（数据源不可信）
+  LIVE_CTP     = 1,  // XtLiveRecorder + ParserCTP 实时写入 (FBS v1 top-5 depth + 真实 settlement)
+  MIGRATED_V2  = 2,  // scripts/migrate_normalized_v2_to_fbs.py (L1 only, sentinel 0)
+  REPLAY       = 3,  // 预留：replay tool 回放 / shadow 注入
+  LIVE_BINANCE = 4,  // XtLiveRecorder + MdBinanceUGateway 实时写入（JSONL 20 档；FBS v1 top-5）
+  LIVE_XTP     = 5,  // XtLiveRecorder + ParserXTP 实时写入（XTP 源可 10 档；FBS v1 top-5）
+}
+
+// ---------------------------------------------------------------------------
+// MD_TICK — 行情 tick（market data tick）
+// ---------------------------------------------------------------------------
+table MdTick {
+  // ── 标识（Identification）────────────────────────────────────────────────
+  //
+  // trading_day 使用 CTP 语义：夜盘 tick（21:00–次日 02:30）归**次一交易日**。
+  // 此字段同时用作 LocalFsEventStore 的目录分片键：
+  // `<root>/YYYY-MM-DD/<exchange>/<symbol>/tick.fbs`。
+  // action_day 是真实发生日期（周日夜盘 tick 的 action_day = 周日，trading_day = 周一）。
+  code:string             (required);  // InstrumentID, e.g. "ag2606"
+  exchange_id:string      (required);  // "SHFE" / "DCE" / "CFFEX" / "CZCE" / "INE"
+  trading_day:uint32;                  // YYYYMMDD (CTP 语义, 夜盘归次日)
+  action_day:uint32;                   // YYYYMMDD (真实发生日期)
+  action_time:uint32;                  // HHMMSSmmm (含毫秒, 对齐 XtTick::action_time)
+
+  // ── 价量（Price / Volume, fp ×1e6；命名严格对齐 XtTick.h）────────────
+  //
+  // total_* 为源行情累计量 (cumulative counters)；单 tick 增量
+  // (XtTick::volume_fp / turnover_fp / diff_interest_fp) 不存，消费方 derive：
+  //   delta_vol = this_tick.total_volume_fp - prev_tick.total_volume_fp
+  // 不冗余存储单 tick 增量，避免累计量和增量同时存在时出现二义。
+  price_fp:int64;                      // 最新价 (对齐 XtTick::price_fp)
+  total_volume_fp:int64;               // 累计成交量 (对齐 XtTick::total_volume_fp)
+  total_turnover_fp:int64;             // 累计成交额 (对齐 XtTick::total_turnover_fp)
+  open_interest_fp:int64;              // 当前持仓量 (对齐 XtTick::open_interest_fp)
+
+  // ── 日内聚合（Intraday aggregation, fp ×1e6）──────────────────────────
+  //
+  // close_fp / average_fp 来自 normalized_v2 CSV 整日扫描后回填；live CTP
+  // 每 tick 不直接给 close（收盘前为 0）；字段供离线转换和回放保持信息完整性。
+  open_fp:int64;
+  high_fp:int64;
+  low_fp:int64;
+  close_fp:int64;
+  average_fp:int64;
+
+  // ── 结算（Settlement, fp ×1e6）──────────────────────────────────────
+  //
+  // normalized_v2 全部 sentinel 0（MANIFEST 已声明）。消费方判断：
+  //   source_kind == MIGRATED_V2 或 has_settlement == false 时不得依赖。
+  pre_settle_fp:int64;                 // 对齐 XtTick::pre_settle_fp
+  pre_close_fp:int64;                  // 对齐 XtTick::pre_close_fp
+  pre_interest_fp:int64;               // 前持仓量 (对齐 XtTick::pre_interest_fp)
+  settle_fp:int64;                     // 对齐 XtTick::settle_fp
+  upper_limit_fp:int64;                // 对齐 XtTick::upper_limit_fp
+  lower_limit_fp:int64;                // 对齐 XtTick::lower_limit_fp
+
+  // ── Depth L1–L5（fp ×1e6）──────────────────────────────────────────
+  //
+  // FlatBuffers vector 为可变长度，schema 层不强制 size。
+  // 写方必须保证 `size() == 5`（不足档位用 0 补齐）。
+  // 读方（XtFbsTickReader 等）必须校验 `size() == 5`，否则拒绝。
+  // 字段名单数形式对齐 XtTick::bid_price_fp[DEPTH] / ask_price_fp[DEPTH] / bid_qty_fp[DEPTH]。
+  bid_price_fp:[int64];                // [0] = best bid, 档位越深数值越低
+  ask_price_fp:[int64];                // [0] = best ask, 档位越深数值越高
+  bid_qty_fp:[int64];                  // 对应档位挂单量
+  ask_qty_fp:[int64];
+
+  // ── Live 本机时间戳 ────────────────────────────────────────────────────
+  //
+  // LIVE_CTP: 本机 CLOCK_REALTIME 接收 ns。
+  // MIGRATED_V2 / REPLAY: 填 0（离线来源不提供接收时间戳）。
+  ts_local_ns:uint64 = 0;
+
+  // ── Tick 分类（对齐 XtTick::kind / TickKind）──────────────────────────
+  //
+  //   0 = Normal   (session 内正常 tick)
+  //   1 = Preopen  (集合竞价 tick, backtest XtMarketDataSource 设置)
+  // LIVE_CTP 写入时 always 0（CTP 推 tick 已在 session 内）。
+  tick_kind:ubyte = 0;
+
+  // ── 数据完整性位（Data completeness）─────────────────────────────────
+  //
+  // source_kind / depth_levels_real 无 default，写方必须显式赋值；
+  // 未赋值的读方拿到 UNKNOWN / 0，应 fail-fast 拒绝此条数据。
+  // has_settlement 默认 false（保守：写方显式 true 才可信，缺省视作不可信）。
+  source_kind:SourceKind;              // explicit non-UNKNOWN source
+  depth_levels_real:ubyte;             // FBS v1 必须 == 5
+  has_settlement:bool = false;
+}
+
+root_type MdTick;
+
+// file_identifier = "XTEV" ("CT EVent")。
+// 刻意与 XtTickBinCodec V2 magic "CTTKV2\0\0" 前缀 "CTTK" 错开，
+// 避免 query / sanity 工具同时扫两种格式时产生 hit 歧义。
+file_identifier "XTEV";

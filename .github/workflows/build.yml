@@ -1,0 +1,42 @@
+# 新 repo 落点: .github/workflows/build.yml
+# 状态: 草稿——Phase B 首个快照 push 后才能真跑, 首跑失败按日志修
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-regression:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -V ca-certificates lsb-release wget \
+            build-essential cmake ninja-build libcurl4-openssl-dev libssl-dev libboost-dev
+          # Apache Arrow / Parquet 官方 apt 源 (https://arrow.apache.org/install/)
+          wget "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          sudo apt-get install -y -V ./apache-arrow-apt-source-latest-*.deb
+          sudo apt-get update
+          sudo apt-get install -y -V libarrow-dev libparquet-dev
+
+      - name: Build
+        run: |
+          # -DXT_BUILD_CONTROL_GRPC=OFF 为双保险：快照已删 grpc 块，若残留默认 ON 会拉取外网 grpc
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DXT_BUILD_CONTROL_GRPC=OFF
+          cmake --build build -j"$(nproc)"
+
+      - name: Build strategy plugin
+        run: |
+          cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy -G Ninja -DXT_SRC_ROOT="$(pwd)/src"
+          cmake --build build-strategy -j"$(nproc)"
+          mkdir -p var/plugins/strategies
+          cp build-strategy/libhft_tick_revert_strategy.so var/plugins/strategies/
+
+      - name: Regression (byte-identical gate)
+        run: bash scripts/regression_test.sh

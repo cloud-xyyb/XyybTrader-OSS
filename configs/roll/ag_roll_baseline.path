@@ -1,0 +1,4 @@
+# CT roll path for 2023 ag baseline (ag2306 → ag2312 on 20230523).
+# date,symbol,known_on
+20230515,ag2306,20230512
+20230523,ag2312,20230522

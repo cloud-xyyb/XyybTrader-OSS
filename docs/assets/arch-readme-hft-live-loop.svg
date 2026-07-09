@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1200" width="1800" height="1200" role="img" aria-label="XyybTrader HFT live strategy loop">
+<defs>
+<marker id="arrow-md" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#1864ab" /></marker>
+<marker id="arrow-engine" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2f9e44" /></marker>
+<marker id="arrow-exec" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c92a2a" /></marker>
+<marker id="arrow-strategy" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#5f3dc4" /></marker>
+<marker id="arrow-state" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0c8599" /></marker>
+<marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e67700" /></marker>
+<marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8.8" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#495057" /></marker>
+</defs>
+<style>
+text { font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: 0; }
+</style>
+<rect width="1800" height="1200" fill="#ffffff"/>
+<text x="48" y="64" font-size="50" font-weight="700" fill="#111827" text-anchor="start">
+<tspan x="48" dy="0.0">HFT 策略实盘闭环</tspan>
+</text>
+<text x="50" y="108" font-size="27" font-weight="400" fill="#4b5563" text-anchor="start">
+<tspan x="50" dy="0.0">MD callback → worker drain → strategy.on_tick → submit / cancel → TD 回报 → on_order / on_fill</tspan>
+</text>
+<rect x="56" y="150" width="1688" height="830" rx="12" fill="transparent" stroke="#2f9e44" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="92" y="193" font-size="34" font-weight="700" fill="#2f9e44" text-anchor="start">
+<tspan x="92" dy="0.0">worker 线程主路径</tspan>
+</text>
+<rect x="90" y="260" width="300" height="118" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="240.0" y="300.08" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="240.0" dy="0.0">Venue MD</tspan>
+</text>
+<text x="240.0" y="346.68" font-size="21" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="240.0" dy="0.0">CTP / Binance</tspan>
+<tspan x="240.0" dy="25.6">原始行情回调</tspan>
+</text>
+<rect x="440" y="260" width="320" height="118" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="600.0" y="312.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="600.0" dy="0.0">IMdGateway</tspan>
+</text>
+<text x="600.0" y="358.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="600.0" dy="0.0">标准化 XtRawTick</tspan>
+</text>
+<rect x="810" y="260" width="340" height="118" rx="10" fill="#d0ebff" stroke="#1864ab" stroke-width="3"/>
+<text x="980.0" y="312.28" font-size="30" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="980.0" dy="0.0">XtHftChannels</tspan>
+</text>
+<text x="980.0" y="358.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="980.0" dy="0.0">tick / TD event 入队</tspan>
+</text>
+<rect x="810" y="455" width="340" height="118" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="980.0" y="507.28" font-size="30" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="980.0" dy="0.0">XtHftEventLoop</tspan>
+</text>
+<text x="980.0" y="553.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="980.0" dy="0.0">process_ticks · worker drain</tspan>
+</text>
+<path d="M 390 319 L 440 319" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<text x="415" y="295" font-size="22" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="415" dy="0.0">raw tick</tspan>
+</text>
+<path d="M 760 319 L 810 319" fill="none" stroke="#1864ab" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-md)"/>
+<text x="785" y="295" font-size="22" font-weight="700" fill="#1864ab" text-anchor="middle">
+<tspan x="785" dy="0.0">XtRawTick</tspan>
+</text>
+<path d="M 1020 378 L 1020 455" fill="none" stroke="#2f9e44" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-engine)"/>
+<text x="1050" y="421" font-size="22" font-weight="700" fill="#2f9e44" text-anchor="start">
+<tspan x="1050" dy="0.0">tick event</tspan>
+</text>
+<rect x="1210" y="455" width="430" height="118" rx="10" fill="#d3f9d8" stroke="#2f9e44" stroke-width="3"/>
+<text x="1425.0" y="507.06" font-size="31" font-weight="700" fill="#2f9e44" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">XtHftEngine::on_tick</tspan>
+</text>
+<text x="1425.0" y="554.88" font-size="23" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">更新 runtime view · fan-out contexts</tspan>
+</text>
+<rect x="1210" y="635" width="430" height="130" rx="10" fill="#e5dbff" stroke="#5f3dc4" stroke-width="3"/>
+<text x="1425.0" y="679.03" font-size="31" font-weight="700" fill="#5f3dc4" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">Strategy plugin</tspan>
+</text>
+<text x="1425.0" y="726.85" font-size="23" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">strategy.on_tick(ctx, tick)</tspan>
+<tspan x="1425.0" dy="28.1">读状态 · 产生命令</tspan>
+</text>
+<path d="M 1150 514 L 1210 514" fill="none" stroke="#2f9e44" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-engine)"/>
+<path d="M 1425 573 L 1425 635" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)"/>
+<text x="1510" y="606" font-size="22" font-weight="700" fill="#5f3dc4" text-anchor="start">
+<tspan x="1510" dy="0.0">callbacks</tspan>
+</text>
+<rect x="1210" y="830" width="430" height="116" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="1425.0" y="881.28" font-size="30" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">IStrategyContext</tspan>
+</text>
+<text x="1425.0" y="927.88" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="1425.0" dy="0.0">buy_fp / sell_fp / cancel</tspan>
+</text>
+<rect x="760" y="830" width="360" height="116" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="940.0" y="880.89" font-size="29" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="940.0" dy="0.0">XtLiveOrderGateway</tspan>
+</text>
+<text x="940.0" y="926.27" font-size="22" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="940.0" dy="0.0">risk / cost / account · submit</tspan>
+</text>
+<rect x="330" y="830" width="330" height="136" rx="10" fill="#ffe3e3" stroke="#c92a2a" stroke-width="3"/>
+<text x="495.0" y="879.08" font-size="30" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="495.0" dy="0.0">Venue TD</tspan>
+</text>
+<text x="495.0" y="925.6800000000001" font-size="21" font-weight="400" fill="#4b5563" text-anchor="middle">
+<tspan x="495.0" dy="0.0">submit / cancel</tspan>
+<tspan x="495.0" dy="25.6">order / trade 回报</tspan>
+</text>
+<path d="M 1425 765 L 1425 830" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<text x="1460" y="805" font-size="22" font-weight="700" fill="#c92a2a" text-anchor="start">
+<tspan x="1460" dy="0.0">交易意图</tspan>
+</text>
+<path d="M 1210 888 L 1120 888" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<path d="M 760 888 L 660 888" fill="none" stroke="#c92a2a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-exec)"/>
+<text x="710" y="814" font-size="22" font-weight="700" fill="#c92a2a" text-anchor="middle">
+<tspan x="710" dy="0.0">submit / cancel</tspan>
+</text>
+<path d="M 330 898 L 190 898 L 190 430 L 940 430 L 940 378" fill="none" stroke="#5f3dc4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-strategy)" stroke-dasharray="16 12"/>
+<text x="214" y="412" font-size="22" font-weight="700" fill="#5f3dc4" text-anchor="start">
+<tspan x="214" dy="0.0">TD 回报入队</tspan>
+</text>
+<rect x="300" y="1010" width="1320" height="130" rx="12" fill="#f8fafc" stroke="#0c8599" stroke-width="2" stroke-dasharray="16 10"/>
+<text x="335" y="1050" font-size="28" font-weight="700" fill="#0c8599" text-anchor="start">
+<tspan x="335" dy="0.0">策略可读 / 下单必经的共享状态域</tspan>
+</text>
+<rect x="585" y="1070" width="210" height="54" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="690.0" y="1106.36" font-size="24" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="690.0" dy="0.0">runtime view</tspan>
+</text>
+<rect x="835" y="1070" width="210" height="54" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="940.0" y="1106.36" font-size="24" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="940.0" dy="0.0">account truth</tspan>
+</text>
+<rect x="1085" y="1070" width="210" height="54" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1190.0" y="1106.36" font-size="24" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1190.0" dy="0.0">risk</tspan>
+</text>
+<rect x="1325" y="1070" width="210" height="54" rx="7" fill="#e3fafc" stroke="#0c8599" stroke-width="3"/>
+<text x="1430.0" y="1106.36" font-size="24" font-weight="700" fill="#0c8599" text-anchor="middle">
+<tspan x="1430.0" dy="0.0">order book</tspan>
+</text>
+<path d="M 940 946 L 940 1010" fill="none" stroke="#0c8599" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-state)" stroke-dasharray="16 12"/>
+<path d="M 1425 946 L 1425 1010" fill="none" stroke="#0c8599" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-state)" stroke-dasharray="16 12"/>
+</svg>

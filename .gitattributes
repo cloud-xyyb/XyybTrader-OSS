@@ -1,0 +1,8 @@
+# LF everywhere — 回归 golden 按字节比对, CRLF checkout 会破坏 bit-exact 判据
+* text=auto eol=lf
+
+*.bin binary
+*.so binary
+*.zip binary
+*.png binary
+*.jpg binary

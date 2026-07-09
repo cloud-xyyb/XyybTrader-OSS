@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────
+# CTP / SimNow HFT live 示例配置
+# 使用: cp 本文件为 configs/live_hft_ctp.yaml, 账号密码填 configs/secrets.yaml
+# 路径解析: 相对路径基于本 config 文件所在目录（configs/）
+# ─────────────────────────────────────────────────────────────────────────
+queue:
+  mode: spsc
+  capacity: 65536
+  tick_high_watermark: 58982
+  tick_batch_size: 64
+  td_event_mode: mpsc
+  td_event_capacity: 65536
+  td_event_high_watermark: 58982
+  td_event_budget_per_loop: 128
+  td_backlog_warn_threshold: 58982
+  td_event_batch_size: 128
+  tick_max_wait_us: 2000
+  tick_starvation_warn_loops: 128
+  flow_event_mode: mpsc
+  flow_event_capacity: 65536
+  flow_event_high_watermark: 52428
+  flow_event_batch_size: 128
+  flow_event_budget_per_loop: 64
+
+runtime:
+  instrument:
+    symbol: ag2612            # 按当前主力合约调整
+
+  session:                    # 白银(ag)交易时段; 夜盘跨午夜写单条 {2101, 230}
+    active_sections:
+      - start: 2101
+        end: 230
+      - start: 901
+        end: 1015
+      - start: 1031
+        end: 1130
+      - start: 1331
+        end: 1500
+
+  trading:
+    allow_short: true
+
+  metrics:
+    exposer_port: 9101        # Prometheus /metrics 暴露端口
+
+  params_backend:
+    type: shm
+    domain: xyybtrader_live_ctp
+
+  debug:
+    tick_count: true
+    heartbeat_ms: 10000
+    report_contract_dir: ../var/live_runs/ctp/report_contract
+
+  md:
+    provider: ctp
+    md_front: tcp://182.254.243.31:30011   # SimNow 7x24 仿真前置; 实盘换期货公司前置
+    broker: "9999"                          # SimNow broker id
+    user: ""                                # 建议放 configs/secrets.yaml
+    password: ""
+    flow_dir: ../var/ctp_flow/md
+
+  td:
+    provider: ctp
+    td_front: tcp://182.254.243.31:30001
+    broker: "9999"
+    user: ""
+    password: ""
+    flow_dir: ../var/ctp_flow/td
+    recovery_query_timeout_ms: 8000
+    recovery_query_max_timeouts: 6
+    account_refresh_ms: 30000
+    position_refresh_ms: 30000
+    account_snapshot_max_abs: 1.0e12
+
+  account:
+    cash: 1000000
+    mode: futures
+    margin_rate: 0.12
+    reconcile_on_stop: true
+
+  risk:
+    max_order_qty: 5.0
+    max_pos_qty: 1000.0
+
+  strategies:
+    - so: ../var/plugins/strategies/libhft_tick_revert_strategy.so
+      id: hft_tick_revert
+      tick_window: 10
+      qty: 1
+      history_ticks: 256
+      history_bars: 64
+
+  closeout:                   # 收盘强平: no_open 后禁开仓, force_flat 后强平
+    enabled: true
+    escalate_after_ms: 3000   # 被动 GTC@mark 维持 ms, 超时升级 IOC@aggressive (0=立即激进)
+    aggressive_buffer_bps: 10 # 升级激进价穿价 buffer (bps)
+    windows:
+      - no_open_hhmm: 1455
+        force_flat_hhmm: 1459
+      - no_open_hhmm: 220
+        force_flat_hhmm: 229
+    session_gate:
+      enabled: true
+
+  recording:
+    enabled: true
+    file_path: ../var/live_runs/ctp/recordings/live.jsonl
+    queue_capacity: 16384
+    rotate_bytes: 1073741824       # 1 GiB 按大小滚动 (0=禁用)
+    rotate_interval_sec: 3600      # 小时滚动兜底 (0=禁用)
+    event_store:
+      enabled: true
+      root_path: ../var/live_runs/ctp/recordings/events

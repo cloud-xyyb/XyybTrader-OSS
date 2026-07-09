@@ -1,0 +1,74 @@
+#include "xt_account/venue/AccountTruthStoreProvider.h"
+
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+#include "XtFixedPoint.h"
+#include "api/XtRunnerSignals.h"
+#include "xt_account/state/AccountStateStore.h"
+
+namespace {
+
+uint64_t wall_clock_now_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+}
+
+namespace xt_account {
+
+AccountTruth read_store_account_truth(const AccountStateStore& account_store,
+                                      XtRunnerSignals& signals,
+                                      xt_core::TimezonePolicy trading_day_policy,
+                                      bool fill_store_per_symbol) {
+    AccountTruth truth;
+    truth.ts_ns = wall_clock_now_ns();
+    const auto account = account_store.snapshot_account();
+    truth.wallet_balance_fp = account.cash;
+    truth.unrealized_pnl_fp = account.unrealized_pnl;
+    truth.fees_today_fp = account.fees;
+
+    int64_t position_value_fp = 0;
+    const auto tracked_codes = account_store.snapshot_tracked_codes();
+    truth.runtime_per_symbol_marks_fp.reserve(tracked_codes.size());
+    for (const auto& code : tracked_codes) {
+        if (code.empty()) continue;
+        const auto pos = account_store.snapshot_position(code);
+        position_value_fp += xt_fp::mul(pos.qty, pos.mark_price);
+
+        truth.runtime_per_symbol_marks_fp.emplace_back(code, pos.mark_price);
+
+        if (fill_store_per_symbol && (pos.qty != 0 || pos.unrealized_pnl != 0)) {
+            PerSymbolTruth row{};
+            row.symbol = code;
+            row.qty_fp = pos.qty;
+            row.avg_price_fp = pos.avg_price;
+            row.mark_price_fp = pos.mark_price;
+            row.unrealized_pnl_fp = pos.unrealized_pnl;
+            truth.per_symbol.push_back(std::move(row));
+        }
+    }
+    truth.position_value_fp = position_value_fp;
+
+    int64_t trading_day = signals.last_tick_date.load(std::memory_order_acquire);
+    if (trading_day <= 0) {
+        const int64_t epoch_ms = static_cast<int64_t>(truth.ts_ns / 1'000'000ULL);
+        trading_day = static_cast<int64_t>(
+            xt_core::derive_trading_day(epoch_ms, trading_day_policy));
+    }
+    truth.trading_day_id = trading_day;
+
+    const int64_t cashflow_day =
+        signals.latest_external_cashflow_trading_day.load(std::memory_order_acquire);
+    if (cashflow_day == 0 || cashflow_day == trading_day) {
+        truth.external_cashflow_today_fp =
+            signals.latest_external_cashflow_today_fp.load(std::memory_order_acquire);
+    }
+    return truth;
+}
+
+}
