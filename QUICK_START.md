@@ -5,7 +5,7 @@
 分两部分：
 
 - **引擎**（本仓，C++）—— 回测器 `XtBackTestRunner` 与实盘 runner `XtRunner`，源码随仓，自己编译。
-- **Backtest Viewer**（`xt-viewer.exe`）—— 本机跑的图形回测工作台，单文件分发，不随本仓开源。
+- **Backtest Viewer**（`xt-viewer`）—— 本机跑的图形回测工作台，单文件分发，不随本仓开源。
   它不是必需品：只用命令行也能跑回测（见 [README](./README.md) 的「快速开始」）；
   viewer 的价值在于**数据入库、配置生成、报告解读**这三段体验。
 
@@ -30,12 +30,13 @@ viewer 则跑在 Windows 侧——这是最常见的组合，§3 会讲两侧路
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build \
+sudo apt-get install -y build-essential cmake ninja-build wget time \
     libcurl4-openssl-dev libssl-dev libboost-dev libboost-system-dev
+# ↑ time 供 viewer 采引擎运行指标（峰值内存等）；缺它 viewer 仍能跑，指标降级并提示
 
 # Apache Arrow / Parquet（必需，先加官方 apt 源: https://arrow.apache.org/install/）
-wget "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-sudo apt-get install -y ./apache-arrow-apt-source-latest-*.deb && sudo apt-get update
+wget -P /tmp "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+sudo apt-get install -y /tmp/apache-arrow-apt-source-latest-*.deb && sudo apt-get update
 sudo apt-get install -y libarrow-dev libparquet-dev
 ```
 
@@ -44,7 +45,7 @@ sudo apt-get install -y libarrow-dev libparquet-dev
 在仓库根目录：
 
 ```bash
-cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DXT_BUILD_CONTROL_GRPC=OFF
+cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ```
 
@@ -92,21 +93,28 @@ bash scripts/regression_test.sh
 
 ## 2. 启动 Backtest Viewer
 
-1. 解压分发 zip：
+1. 从本仓 GitHub Releases 下载对应平台的 zip（旁边的 `.sha256` 可选校验：
+   `sha256sum -c <zip名>.sha256`），解压后是扁平布局：
 
    ```
-   bin/xt-viewer.exe     回测查看器（UI + 后端全内嵌，单文件）
-   bin/xt-panel.exe      实盘交易面板（本文不涉及）
-   fixtures/             配置模板
+   xt-viewer               回测查看器（UI + 后端全内嵌，单文件；Windows 后补版为 xt-viewer.exe）
+   README.txt              运行说明
+   SHA256SUMS              包内文件清单校验值
+   compatibility.json      绑定的引擎/viewer 源码版本
+   provenance.json / sbom.cyclonedx.json / licenses/    构建溯源与许可证
    ```
 
-2. **双击 `bin\xt-viewer.exe`**，它会自己拉起浏览器指向 `http://localhost:8770`
-   （设 `XT_VIEWER_NO_BROWSER=1` 可禁用自动开浏览器）。
+2. 运行后它会自己拉起浏览器指向 `http://localhost:8770`
+   （设 `XT_VIEWER_NO_BROWSER=1` 可禁用自动开浏览器）：
+
+   - **Linux / WSL2**：`./xt-viewer`（WSL 内跑时用 Windows 浏览器开 localhost 即可）；
+   - **macOS**：未签名，首次运行需 Gatekeeper「右键 → 打开」放行；
+   - 首次启动是单文件自解压，慢几秒到十几秒属正常。
 
 3. 端口被占用时按优先级覆盖：`--port` > 环境变量 `XT_VIEWER_PORT` > `PORT` > `8770`。
 
    ```
-   xt-viewer.exe --port 8899
+   ./xt-viewer --port 8899
    ```
 
 **分发包不含任何回测结果**——第一次打开列表是空的，属正常。
@@ -161,7 +169,10 @@ bash scripts/regression_test.sh
 
 ## 4. 数据入库（第一个数据集）
 
-「入库」= 把原始 tick 数据转成引擎直读的 `normalized_v2` 布局。
+「入库」= 把原始 tick 数据转成引擎直读的 `normalized_v2` 布局：按
+`<交易所>/<品种>/<合约>/<YYYY-MM-DD>.csv` 归树、每交易日一个文件（例如
+`SHFE/ag/ag2206/2022-05-27.csv`；列口径见 [docs/data_format.md](./docs/data_format.md)，
+仓内 `tools/convert_ticks.py` 产的就是这个布局）。
 
 左侧竖排导航两个入口：`Workbench`（工作台）/ `Experiments`（实验）。
 在 `Workbench` 的数据源节点进 **`Data station`（数据站）**。
@@ -179,6 +190,13 @@ bash scripts/regression_test.sh
 填绝对目录（可点浏览按钮选择）→ `Add to list`（加入列表）→ `Scan`（扫描）。
 
 > 落在 `Data root` 下的成品数据集会**自动发现**，不必重复登记；只有不在数据根下的才需要手动登记。
+
+> **零数据起步**：本仓自带的 `data/regression/sample_ticks`（ag2206/ag2212 各 8 个交易日）
+> 就是现成的 normalized_v2 形布局 —— 选 `Ingested data dir` 把它登记进来，即可不准备任何
+> 自有数据先把 ⑥ 步全流程走通（样本只有 8 日，只作冒烟，研究结论以 ≥30 交易日为准）。
+>
+> ⚠️ `configs/baselines/*.yaml` 是回归脚本专用（含 `${PROJECT_DIR}` 占位符，由
+> `run_baselines.sh` 展开），**不要**把它登记成 config 发现目录直接喂 viewer 跑。
 
 ### 4.2 入库（ZIP 源才需要）
 

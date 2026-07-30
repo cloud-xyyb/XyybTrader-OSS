@@ -178,15 +178,16 @@ repo 带五个能直接参考的插件：`hft_tick_revert` 是最小可用的 ti
 > Backtest Viewer 会自动经 `wsl` 调起这里构建出的二进制。
 
 ```bash
-# 依赖
-sudo apt-get install -y build-essential cmake ninja-build libcurl4-openssl-dev libssl-dev libboost-dev libboost-system-dev
+# 依赖（time 供 Backtest Viewer 采引擎运行指标，只跑命令行可不装）
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build wget time libcurl4-openssl-dev libssl-dev libboost-dev libboost-system-dev
 # Apache Arrow / Parquet（需要官方 apt 源: https://arrow.apache.org/install/）
-wget "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-sudo apt-get install -y ./apache-arrow-apt-source-latest-*.deb && sudo apt-get update
+wget -P /tmp "https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+sudo apt-get install -y /tmp/apache-arrow-apt-source-latest-*.deb && sudo apt-get update
 sudo apt-get install -y libarrow-dev libparquet-dev
 
 # 构建主体（回测器 + 实盘 runner）
-cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DXT_BUILD_CONTROL_GRPC=OFF
+cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 # 构建策略插件（独立编译为 .so）
@@ -197,8 +198,7 @@ mkdir -p var/plugins/strategies && cp build-strategy/libhft_tick_revert_strategy
 (cd var/plugins/strategies && sha256sum libhft_tick_revert_strategy.so | awk '{print $1}' > libhft_tick_revert_strategy.so.sha256)
 ```
 
-> 本步 `-DXT_BUILD_CONTROL_GRPC=OFF` 的产物跑回测与实盘 runner 足够；控制面 gRPC
-> 供 Live Panel 使用，Panel 未随本仓发布，保持 OFF 即可。
+> 本步产物跑回测与实盘 runner 都够用；Live Panel 控制面未随本仓发布，无需额外构建选项。
 
 **2. 第一个回测**
 
