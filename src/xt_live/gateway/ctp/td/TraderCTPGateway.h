@@ -56,6 +56,17 @@ public:
         return ctp_.is_local_terminal(local_id);
     }
 
+    [[nodiscard]] bool lookup_terminal(uint64_t local_id,
+                                       XtOrderTerminalRecord& out) const override {
+        return ctp_.lookup_terminal(local_id, out);
+    }
+
+    [[nodiscard]] bool collect_open_delivery_ids(std::vector<uint64_t>& out) const override {
+        const auto ids = ctp_.exec_ledger().open_ids();
+        out.insert(out.end(), ids.begin(), ids.end());
+        return true;
+    }
+
     bool is_recovering() const override { return ctp_.is_recovering(); }
 
     uint32_t trading_day() const override { return ctp_.trading_day(); }

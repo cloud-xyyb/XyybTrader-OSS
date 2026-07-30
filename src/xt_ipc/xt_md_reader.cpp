@@ -22,7 +22,7 @@
 #include "xt_ipc/XtShmRing.h"
 
 namespace {
-using Ring = xt_ipc::XtShmRing<XtRawTick>;
+using Ring = xt_ipc::XtShmRing<xt_ipc::XtMdWireSlot>;
 
 struct ReaderOptions {
     std::string ring_name = "/xt_md_shadow";
@@ -93,7 +93,7 @@ MappedRing attach_ring(const ReaderOptions& opt) {
     }
 
     const auto* ctrl = reinterpret_cast<const xt_ipc::RingControlBlock*>(base);
-    if (const char* err = xt_ipc::validate_ring(ctrl, mapped, Ring::kSlotStride)) {
+    if (const char* err = xt_ipc::validate_ring(ctrl, mapped, Ring::kSlotStride, Ring::kElementSize)) {
         std::fprintf(stderr, "xt_md_reader: ring 校验失败（fail-closed）: %s\n", err);
         munmap(base, mapped);
         return {};
@@ -124,9 +124,10 @@ int run_reader(const ReaderOptions& opt, const MappedRing& mapping) {
     bool ordered = true, verify_ok = true;
     double last = -1.0, first = -1.0;
     const auto t0 = std::chrono::steady_clock::now();
-    XtRawTick out{};
+    xt_ipc::XtMdWireSlot slot{};
     for (;;) {
-        if (rd.next(out)) {
+        if (rd.next(slot)) {
+            const XtRawTick& out = slot.tick;
             const uint64_t idx = rd.cursor() - 1;
             if (received == 0) first = out.price;
             if (received > 0 && !(out.price > last)) ordered = false;

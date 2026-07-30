@@ -13,10 +13,16 @@
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace xt_account_store_drops {
 std::atomic<uint64_t>& cross_thread_write() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& snapshot_publish_skipped() {
     static std::atomic<uint64_t> counter{0};
     return counter;
 }
@@ -27,8 +33,23 @@ namespace xt_account {
 namespace {
 
 using PositionPool = xt_util::sync::XtSnapshotPool<PositionSnapshot, kMaxSymbols * 4>;
-using RiskPool = xt_util::sync::XtSnapshotPool<RiskSnapshot, kMaxSymbols * 4>;
 using FullPool = xt_util::sync::XtSnapshotPool<FullSnapshot, 64>;
+
+/// @brief 批次发布抑制 RAII；异常路径也保证复位（apply 链可抛）。
+///
+/// 析构硬置 false 而不恢复旧值：抑制闩只服务 on_position_snapshot 的单层批次，
+/// 嵌套会让「批尾统一发布一次」失去唯一收敛点，构造期直接拒绝。
+struct PublishSuppressScope {
+    explicit PublishSuppressScope(bool& flag) noexcept : flag_(flag) {
+        assert(!flag_ && "PublishSuppressScope must not nest");
+        flag_ = true;
+    }
+    ~PublishSuppressScope() { flag_ = false; }
+    PublishSuppressScope(const PublishSuppressScope&) = delete;
+    PublishSuppressScope& operator=(const PublishSuppressScope&) = delete;
+
+    bool& flag_;
+};
 
 template <typename Pool>
 auto acquire_after_reclaim_scan(Pool& pool, xt_util::sync::HazardDomain& domain) noexcept
@@ -46,14 +67,20 @@ void release_position_snapshot(void* ctx, const void* ptr) noexcept {
         static_cast<const PositionSnapshot*>(ptr)));
 }
 
-void release_risk_snapshot(void* ctx, const void* ptr) noexcept {
-    static_cast<RiskPool*>(ctx)->release(const_cast<RiskSnapshot*>(
-        static_cast<const RiskSnapshot*>(ptr)));
-}
-
 void release_full_snapshot(void* ctx, const void* ptr) noexcept {
     static_cast<FullPool*>(ctx)->release(const_cast<FullSnapshot*>(
         static_cast<const FullSnapshot*>(ptr)));
+}
+
+void note_publish_skipped(const char* what) noexcept {
+    xt_account_store_drops::snapshot_publish_skipped().fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        std::fprintf(stderr,
+                     "AccountStateStore %s snapshot pool exhausted; publish skipped "
+                     "(further skips counted, not logged)\n",
+                     what);
+    }
 }
 
 void audit_frozen_direct(int64_t frozen_cash_fp,
@@ -104,12 +131,7 @@ void audit_frozen_direct(int64_t frozen_cash_fp,
 }
 
 AccountStateStore::AccountStateStore(const AccountState::Config& cfg)
-    : account_(cfg, AccountState::CtorToken{}), mark_cache_() {
-
-    if (cfg.futures_mode && cfg.catalog == nullptr)
-        throw std::invalid_argument(
-            "AccountStateStore: futures_mode requires a non-null commodity catalog (vol_scale source)");
-}
+    : account_(cfg), mark_cache_() {}
 
 void AccountStateStore::apply(const XtAccountEvent& ev) {
     guard_worker_thread_();
@@ -127,34 +149,38 @@ void AccountStateStore::on_position_snapshot(
     bool is_recovery,
     const XtCommodityCatalog& catalog) {
     guard_worker_thread_();
-    if (is_recovery) {
+    {
 
-        apply(XtAccountEvent::reset());
-    }
-    for (const auto& p : positions) {
-        if (p.code.empty()) continue;
-        const XtCommodityInfo* cinfo = catalog.find(p.code.c_str());
-        const double vol_scale =
-            (cinfo && std::isfinite(cinfo->vol_scale) && cinfo->vol_scale > 0.0)
-                ? cinfo->vol_scale : 1.0;
+        PublishSuppressScope suppress(suppress_partial_publish_);
+        if (is_recovery) {
 
-        apply(XtAccountEvent::set_position(
-            p.code.c_str(),
-            xt_fp::to_fp(p.long_qty),  xt_fp::to_fp(p.long_avg  / vol_scale),
-            xt_fp::to_fp(p.short_qty), xt_fp::to_fp(p.short_avg / vol_scale),
-            xt_fp::to_fp(0.0),
-            xt_fp::to_fp(p.long_today), xt_fp::to_fp(p.short_today),
-            xt_fp::to_fp(p.long_frozen), xt_fp::to_fp(p.short_frozen),
-            static_cast<int64_t>(p.broker_frozen_last_update_ms)));
-    }
-    if (is_recovery) {
+            apply(XtAccountEvent::reset());
+        }
+        for (const auto& p : positions) {
+            if (p.code.empty()) continue;
+            const XtCommodityInfo* cinfo = catalog.find(p.code.c_str());
+            const double vol_scale =
+                (cinfo && std::isfinite(cinfo->vol_scale) && cinfo->vol_scale > 0.0)
+                    ? cinfo->vol_scale : 1.0;
 
-        set_closeable_known(true);
+            apply(XtAccountEvent::set_position(
+                p.code.c_str(),
+                xt_fp::to_fp(p.long_qty),  xt_fp::to_fp(p.long_avg  / vol_scale),
+                xt_fp::to_fp(p.short_qty), xt_fp::to_fp(p.short_avg / vol_scale),
+                xt_fp::to_fp(0.0),
+                xt_fp::to_fp(p.long_today), xt_fp::to_fp(p.short_today),
+                xt_fp::to_fp(p.long_frozen), xt_fp::to_fp(p.short_frozen),
+                static_cast<int64_t>(p.broker_frozen_last_update_ms)));
+        }
     }
     if (current_.load(std::memory_order_acquire)) {
 
         publish_all_snapshots_();
         hp_domain_.try_scan_if_due();
+    }
+    if (is_recovery) {
+
+        set_closeable_known(true);
     }
 }
 
@@ -165,6 +191,7 @@ void AccountStateStore::bind_worker_thread() noexcept {
 void AccountStateStore::bind_worker_thread(std::thread::id tid) noexcept {
 
     worker_tid_ = tid;
+    worker_quiescent_.store(false, std::memory_order_release);
     worker_bound_.store(true, std::memory_order_release);
 }
 
@@ -185,52 +212,80 @@ void AccountStateStore::unbind_worker_thread() noexcept {
 
     worker_bound_.store(false, std::memory_order_release);
     write_first_touch_tid_.store(std::thread::id{}, std::memory_order_release);
+    worker_quiescent_.store(false, std::memory_order_release);
 }
 
-void AccountStateStore::register_symbol(std::string_view code) {
-    assert(!symbols_frozen_.load(std::memory_order_acquire));
-    if (code.empty() || symbols_frozen_.load(std::memory_order_acquire)) {
+void AccountStateStore::enter_quiescent() noexcept {
+    worker_quiescent_.store(true, std::memory_order_release);
+}
+
+bool AccountStateStore::insert_symbol_sorted_(std::string_view code) {
+    const auto it = std::lower_bound(symbols_sorted_.begin(), symbols_sorted_.end(), code,
+                                     [](const std::string& lhs, std::string_view rhs) {
+                                         return std::string_view(lhs) < rhs;
+                                     });
+    if (it != symbols_sorted_.end() && std::string_view(*it) == code) {
+        return false;
+    }
+    symbols_sorted_.emplace(it, code);
+    return true;
+}
+
+void AccountStateStore::register_symbol_(std::string_view code) {
+
+    if (symbols_frozen_.load(std::memory_order_acquire)) {
+        throw std::logic_error(
+            "AccountStateStore::register_symbol_: symbol set already frozen, code=" +
+            std::string(code));
+    }
+    if (code.empty()) {
         return;
     }
-    symbols_sorted_.emplace_back(code);
-    std::sort(symbols_sorted_.begin(), symbols_sorted_.end());
-    symbols_sorted_.erase(std::unique(symbols_sorted_.begin(), symbols_sorted_.end()), symbols_sorted_.end());
-    assert(symbols_sorted_.size() <= kMaxSymbols);
+
+    if (symbols_sorted_.size() >= kMaxSymbols && !is_in_universe_(code)) {
+        throw std::invalid_argument(
+            "AccountStateStore::register_symbol_: symbol count would exceed kMaxSymbols " +
+            std::to_string(kMaxSymbols) + ", code=" + std::string(code));
+    }
+    insert_symbol_sorted_(code);
 
     mark_cache_.pre_warm_one(code);
 }
 
-void AccountStateStore::freeze_symbols() noexcept {
+void AccountStateStore::freeze_symbols_() {
 
     if (symbols_frozen_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     mark_cache_.freeze();
+
     if (symbols_sorted_.size() > kMaxSymbols) {
-        std::fprintf(stderr, "AccountStateStore freeze_symbols overflow: %zu > %zu\n",
-                     symbols_sorted_.size(), kMaxSymbols);
-        symbols_sorted_.resize(kMaxSymbols);
+        throw std::invalid_argument(
+            "AccountStateStore::freeze_symbols_: symbol count " +
+            std::to_string(symbols_sorted_.size()) + " exceeds kMaxSymbols " +
+            std::to_string(kMaxSymbols));
     }
 
     auto* fresh = acquire_after_reclaim_scan(full_pool_, hp_domain_);
     if (!fresh) {
-        std::fprintf(stderr, "AccountStateStore full snapshot pool exhausted during freeze\n");
-        return;
+
+        throw std::logic_error(
+            "AccountStateStore::freeze_symbols_: full snapshot pool exhausted at gen-0");
     }
-    fresh->generation = 0;
     fresh->account = build_account_snapshot_();
-    fresh->tracked_codes = symbols_sorted_;
+
+    fresh->universe = &symbols_sorted_;
     fresh->reset_slots();
 
-    for (std::size_t i = 0; i < fresh->tracked_codes.size(); ++i) {
-        const auto& code = fresh->tracked_codes[i];
+    for (std::size_t i = 0; i < symbols_sorted_.size(); ++i) {
+        const auto& code = symbols_sorted_[i];
         if (auto* pos = acquire_after_reclaim_scan(position_pool_, hp_domain_)) {
             *pos = build_position_snapshot_(code);
             fresh->position_slots[i].store(pos, std::memory_order_release);
-        }
-        if (auto* risk = acquire_after_reclaim_scan(risk_pool_, hp_domain_)) {
-            *risk = build_risk_snapshot_(code);
-            fresh->risk_slots[i].store(risk, std::memory_order_release);
+        } else {
+
+            publish_dirty_ = true;
+            note_publish_skipped("position");
         }
     }
 
@@ -296,29 +351,60 @@ PositionSnapshot AccountStateStore::snapshot_position(std::string_view code) con
     return out;
 }
 
-RiskSnapshot AccountStateStore::snapshot_risk(std::string_view code) const noexcept {
+AccountStateStore::AccountPositionFrame
+AccountStateStore::snapshot_account_and_position(std::string_view code) const noexcept {
+    AccountPositionFrame out;
     for (;;) {
         auto guard = hp_domain_.protect(current_);
         if (!guard) {
-            return build_risk_snapshot_(code);
+            out.account = build_account_snapshot_();
+            out.position = build_position_snapshot_(code);
+            break;
         }
         const auto idx = guard->find_symbol_idx(code);
         if (idx == kInvalidSymbolIndex) {
-            return symbols_frozen_.load(std::memory_order_acquire) ? RiskSnapshot{}
-                                                                   : build_risk_snapshot_(code);
+            if (symbols_frozen_.load(std::memory_order_acquire)) {
+
+                out.account = guard->account;
+                out.position = PositionSnapshot{};
+            } else {
+                out.account = build_account_snapshot_();
+                out.position = build_position_snapshot_(code);
+            }
+            break;
         }
 
-        auto rguard = hp_domain_.protect(guard->risk_slots[idx]);
+        auto pguard = hp_domain_.protect(guard->position_slots[idx]);
         if (current_.load(std::memory_order_acquire) != guard.get()) {
             continue;
         }
-        return rguard ? *rguard : RiskSnapshot{};
+        out.account = guard->account;
+        out.position = pguard ? *pguard : PositionSnapshot{};
+        break;
     }
+
+    out.position.closeable_known = closeable_known_.load(std::memory_order_acquire);
+    return out;
 }
 
 std::vector<std::string> AccountStateStore::snapshot_tracked_codes() const {
     auto guard = hp_domain_.protect(current_);
-    return guard ? guard->tracked_codes : mark_cache_.tracked_codes_sorted();
+
+    if (guard && guard->universe) return *guard->universe;
+    return symbols_sorted_;
+}
+
+std::size_t AccountStateStore::quarantined_symbol_count() const noexcept {
+    return quarantined_count_.load(std::memory_order_acquire);
+}
+
+uint64_t AccountStateStore::quarantined_overflow_count() const noexcept {
+    return quarantined_overflow_.load(std::memory_order_relaxed);
+}
+
+std::vector<std::string> AccountStateStore::snapshot_quarantined_codes() const {
+    std::lock_guard<std::mutex> lk(quarantine_mu_);
+    return quarantined_codes_;
 }
 
 void AccountStateStore::frozen_audit_report(account_audit::XtFrozenAuditReport& out) const {
@@ -353,6 +439,8 @@ void AccountStateStore::frozen_audit_from_snapshot(account_audit::XtFrozenAuditR
 
 void AccountStateStore::guard_worker_thread_() const noexcept {
     const std::thread::id self = std::this_thread::get_id();
+
+    if (worker_quiescent_.load(std::memory_order_acquire)) return;
     if (worker_bound_.load(std::memory_order_acquire)) {
         if (self == worker_tid_) return;
     } else {
@@ -383,19 +471,23 @@ void AccountStateStore::on_cross_thread_write_() const noexcept {
 }
 
 void AccountStateStore::publish_partial_(const XtAccountEvent& ev) noexcept {
+    if (suppress_partial_publish_) {
+
+        return;
+    }
+    if (publish_dirty_) {
+
+        publish_all_snapshots_();
+        return;
+    }
     using T = XtAccountEvent::Type;
     switch (ev.type) {
     case T::Invalid:
         break;
     case T::TradeEx:
     case T::SetPosition:
-        publish_account_snapshot_();
-        publish_position_for_(ev.code ? std::string_view(ev.code) : std::string_view{});
-        publish_risk_for_(ev.code ? std::string_view(ev.code) : std::string_view{});
-        break;
     case T::MarketTick:
-        publish_account_snapshot_();
-        publish_position_for_(ev.code ? std::string_view(ev.code) : std::string_view{});
+        publish_event_snapshot_(ev.code ? std::string_view(ev.code) : std::string_view{});
         break;
     case T::Reset:
     case T::SessionBegin:
@@ -403,9 +495,6 @@ void AccountStateStore::publish_partial_(const XtAccountEvent& ev) noexcept {
         break;
     case T::OrderAccepted:
     case T::OrderExecUpdate:
-    case T::OrderFilled:
-    case T::OrderCanceled:
-    case T::OrderRejected:
     case T::SetCash:
     case T::DailySettlement:
     case T::CashTransfer:
@@ -415,11 +504,49 @@ void AccountStateStore::publish_partial_(const XtAccountEvent& ev) noexcept {
 }
 
 void AccountStateStore::publish_all_snapshots_() noexcept {
-    publish_account_snapshot_();
-    for (const auto& code : symbols_sorted_) {
-        publish_position_for_(code);
-        publish_risk_for_(code);
+    const auto* old = current_.load(std::memory_order_acquire);
+    if (!old) {
+        return;
     }
+    auto* fresh = acquire_after_reclaim_scan(full_pool_, hp_domain_);
+    if (!fresh) {
+        publish_dirty_ = true;
+        note_publish_skipped("full");
+        return;
+    }
+    fresh->account = build_account_snapshot_();
+    fresh->universe = old->universe;
+    fresh->reset_slots();
+    const std::size_t n =
+        std::min(fresh->universe ? fresh->universe->size() : std::size_t{0}, kMaxSymbols);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        auto* pos = acquire_after_reclaim_scan(position_pool_, hp_domain_);
+        if (!pos) {
+            publish_dirty_ = true;
+            note_publish_skipped("position");
+            for (std::size_t j = 0; j < i; ++j) {
+                position_pool_.release(const_cast<PositionSnapshot*>(
+                    fresh->position_slots[j].load(std::memory_order_relaxed)));
+            }
+            full_pool_.release(fresh);
+            return;
+        }
+        *pos = build_position_snapshot_((*fresh->universe)[i]);
+        fresh->position_slots[i].store(pos, std::memory_order_relaxed);
+    }
+    const auto* retired = current_.exchange(fresh, std::memory_order_acq_rel);
+    if (retired) {
+
+        for (std::size_t i = 0; i < n; ++i) {
+            if (const auto* p = retired->position_slots[i].load(std::memory_order_acquire)) {
+                hp_domain_.retire_raw(p, &position_pool_, release_position_snapshot);
+            }
+        }
+        hp_domain_.retire_raw(retired, &full_pool_, release_full_snapshot);
+    }
+
+    publish_dirty_ = false;
 }
 
 void AccountStateStore::publish_account_snapshot_() noexcept {
@@ -429,18 +556,16 @@ void AccountStateStore::publish_account_snapshot_() noexcept {
     }
     auto* fresh = acquire_after_reclaim_scan(full_pool_, hp_domain_);
     if (!fresh) {
-        std::fprintf(stderr, "AccountStateStore full snapshot pool exhausted\n");
+        note_publish_skipped("full");
         return;
     }
-    fresh->generation = next_generation_++;
     fresh->account = build_account_snapshot_();
-    fresh->tracked_codes = old->tracked_codes;
+    fresh->universe = old->universe;
     fresh->reset_slots();
-    for (std::size_t i = 0; i < fresh->tracked_codes.size() && i < kMaxSymbols; ++i) {
+    const std::size_t n = fresh->universe ? fresh->universe->size() : 0;
+    for (std::size_t i = 0; i < n && i < kMaxSymbols; ++i) {
         fresh->position_slots[i].store(old->position_slots[i].load(std::memory_order_acquire),
-                                       std::memory_order_release);
-        fresh->risk_slots[i].store(old->risk_slots[i].load(std::memory_order_acquire),
-                                   std::memory_order_release);
+                                       std::memory_order_relaxed);
     }
     const auto* retired = current_.exchange(fresh, std::memory_order_acq_rel);
     if (retired) {
@@ -448,51 +573,50 @@ void AccountStateStore::publish_account_snapshot_() noexcept {
     }
 }
 
-void AccountStateStore::publish_position_for_(std::string_view code) noexcept {
-    if (code.empty()) {
+void AccountStateStore::publish_event_snapshot_(std::string_view code) noexcept {
+    const auto* old = current_.load(std::memory_order_acquire);
+    if (!old) {
         return;
     }
-    const auto* full = current_.load(std::memory_order_acquire);
-    if (!full) {
-        return;
-    }
-    const auto idx = full->find_symbol_idx(code);
-    if (idx == kInvalidSymbolIndex) {
-        return;
-    }
-    auto* fresh = acquire_after_reclaim_scan(position_pool_, hp_domain_);
+    auto* fresh = acquire_after_reclaim_scan(full_pool_, hp_domain_);
     if (!fresh) {
-        std::fprintf(stderr, "AccountStateStore position snapshot pool exhausted\n");
+        publish_dirty_ = true;
+        note_publish_skipped("full");
         return;
     }
-    *fresh = build_position_snapshot_(code);
-    const auto* old = full->position_slots[idx].exchange(fresh, std::memory_order_acq_rel);
-    if (old) {
-        hp_domain_.retire_raw(old, &position_pool_, release_position_snapshot);
+    fresh->account = build_account_snapshot_();
+    fresh->universe = old->universe;
+    fresh->reset_slots();
+    const std::size_t n =
+        std::min(fresh->universe ? fresh->universe->size() : std::size_t{0}, kMaxSymbols);
+    for (std::size_t i = 0; i < n; ++i) {
+        fresh->position_slots[i].store(old->position_slots[i].load(std::memory_order_acquire),
+                                       std::memory_order_relaxed);
     }
-}
 
-void AccountStateStore::publish_risk_for_(std::string_view code) noexcept {
-    if (code.empty()) {
-        return;
+    const PositionSnapshot* replaced = nullptr;
+    if (!code.empty()) {
+        const auto idx = fresh->find_symbol_idx(code);
+        if (idx != kInvalidSymbolIndex) {
+            auto* pos = acquire_after_reclaim_scan(position_pool_, hp_domain_);
+            if (!pos) {
+
+                publish_dirty_ = true;
+                note_publish_skipped("position");
+                full_pool_.release(fresh);
+                return;
+            }
+            *pos = build_position_snapshot_(code);
+            replaced = fresh->position_slots[idx].exchange(pos, std::memory_order_relaxed);
+        }
     }
-    const auto* full = current_.load(std::memory_order_acquire);
-    if (!full) {
-        return;
+    const auto* retired = current_.exchange(fresh, std::memory_order_acq_rel);
+    if (retired) {
+        hp_domain_.retire_raw(retired, &full_pool_, release_full_snapshot);
     }
-    const auto idx = full->find_symbol_idx(code);
-    if (idx == kInvalidSymbolIndex) {
-        return;
-    }
-    auto* fresh = acquire_after_reclaim_scan(risk_pool_, hp_domain_);
-    if (!fresh) {
-        std::fprintf(stderr, "AccountStateStore risk snapshot pool exhausted\n");
-        return;
-    }
-    *fresh = build_risk_snapshot_(code);
-    const auto* old = full->risk_slots[idx].exchange(fresh, std::memory_order_acq_rel);
-    if (old) {
-        hp_domain_.retire_raw(old, &risk_pool_, release_risk_snapshot);
+    if (replaced) {
+
+        hp_domain_.retire_raw(replaced, &position_pool_, release_position_snapshot);
     }
 }
 
@@ -503,7 +627,7 @@ AccountSnapshot AccountStateStore::build_account_snapshot_() const noexcept {
     out.available_cash = account_.available_cash();
     int64_t total_unrealized = 0;
     int64_t total_market_value = 0;
-    for (const auto& code : mark_cache_.tracked_codes_sorted()) {
+    for (const auto& code : symbols_sorted_) {
         if (code.empty()) continue;
         const auto mark_input = make_mark_input(code.c_str());
         total_unrealized += xt_account::position_unrealized(mark_input);
@@ -550,27 +674,6 @@ AccountStateStore::build_position_snapshot_(std::string_view code) const noexcep
     return out;
 }
 
-RiskSnapshot
-AccountStateStore::build_risk_snapshot_(std::string_view code) const noexcept {
-    const auto pos = build_position_snapshot_(code);
-    const auto account = build_account_snapshot_();
-
-    RiskSnapshot out;
-    out.cash_available_fp = account.available_cash;
-    out.equity_fp = account.equity;
-
-    out.process_net_pnl_fp = account.realized_pnl - account.fees + account.unrealized_pnl;
-    out.position_qty_fp = pos.qty;
-    out.available_close_qty_fp = pos.available_sell_total_qty;
-    out.yesterday_long_qty_fp =
-        std::max<int64_t>(0, pos.available_sell_total_qty - pos.available_sell_today_qty);
-    out.today_pnl_fp = 0;
-    out.limit_up_fp = 0;
-    out.limit_down_fp = 0;
-
-    return out;
-}
-
 xt_account::XtPositionMarkInput AccountStateStore::make_mark_input(const char* code) const {
     return make_mark_input(code, account_.position_readout(code));
 }
@@ -600,21 +703,61 @@ void AccountStateStore::on_event_before_apply(const XtAccountEvent& ev) {
 
         return;
     case XtAccountEvent::Type::MarketTick:
-        mark_cache_.on_market_tick(ev.code, ev.payload.tick.price);
+        note_symbol_if_open_(ev.code,
+                             mark_cache_.on_market_tick(ev.code, ev.payload.tick.price));
         return;
     case XtAccountEvent::Type::SetPosition:
-        mark_cache_.on_set_position(ev.code, ev.payload.set_position.last_price);
+        note_symbol_if_open_(
+            ev.code, mark_cache_.on_set_position(ev.code, ev.payload.set_position.last_price));
+        quarantine_if_unknown_(ev.code, "SetPosition");
         return;
     case XtAccountEvent::Type::TradeEx:
-        mark_cache_.on_trade(ev.code);
+        note_symbol_if_open_(ev.code, mark_cache_.on_trade(ev.code));
+        quarantine_if_unknown_(ev.code, "TradeEx");
         return;
     default:
         return;
     }
 }
 
-std::unique_ptr<AccountStateStore> make_account_state_store(const AccountState::Config& cfg) {
-    return std::make_unique<AccountStateStore>(cfg);
+bool AccountStateStore::is_in_universe_(std::string_view code) const noexcept {
+    const auto it = std::lower_bound(symbols_sorted_.begin(), symbols_sorted_.end(), code,
+                                     [](const std::string& lhs, std::string_view rhs) {
+                                         return std::string_view(lhs) < rhs;
+                                     });
+    return it != symbols_sorted_.end() && std::string_view(*it) == code;
+}
+
+void AccountStateStore::quarantine_if_unknown_(const char* code, const char* event_tag) {
+    if (!code || code[0] == '\0') return;
+    if (!symbols_frozen_.load(std::memory_order_acquire)) return;
+
+    const std::string_view sv(code);
+    if (is_in_universe_(sv)) return;
+
+    std::lock_guard<std::mutex> lk(quarantine_mu_);
+    for (const auto& known : quarantined_codes_) {
+        if (known == sv) return;
+    }
+    if (quarantined_codes_.size() >= kMaxQuarantinedCodes) {
+        quarantined_overflow_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    quarantined_codes_.emplace_back(sv);
+    quarantined_count_.store(quarantined_codes_.size(), std::memory_order_release);
+    std::fprintf(stderr,
+                 "[xt_account][error] symbol '%s' outside frozen universe (event=%s); "
+                 "accounted at account level but invisible per-symbol "
+                 "(repeats for this code suppressed)\n",
+                 code, event_tag);
+}
+
+void AccountStateStore::note_symbol_if_open_(const char* code, bool tracked) {
+
+    if (!tracked || symbols_frozen_.load(std::memory_order_acquire)) {
+        return;
+    }
+    insert_symbol_sorted_(code);
 }
 
 }

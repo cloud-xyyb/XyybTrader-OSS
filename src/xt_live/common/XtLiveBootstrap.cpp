@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -26,7 +27,7 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
     account_cfg.t1_enabled   = rc.t1_enabled;
     account_cfg.futures_mode = rc.futures_mode;
     account_cfg.catalog      = &catalog;
-    account_store = xt_account::make_account_state_store(account_cfg);
+    account_store = std::make_unique<xt_account::AccountStateStore>(account_cfg);
     account_view = std::make_unique<xt_account::AccountStoreView>(*account_store);
 
     std::string backend_err;
@@ -114,7 +115,11 @@ void XtLiveBootstrap::shutdown_recorder() noexcept {
         recorder->set_event_store(nullptr);
         recorder->stop();
     }
-    if (event_store) event_store->flush();
+    if (event_store && !event_store->flush()) {
+
+        XtLogger::warn_m("RT", "fbs event store flush reported persistence failure on shutdown "
+                               "(tail events may not be durable)");
+    }
 }
 
 bool seed_param_domain(const std::vector<std::pair<std::string, std::string>>& param_seed_values,

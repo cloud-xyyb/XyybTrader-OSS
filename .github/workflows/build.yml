@@ -1,5 +1,4 @@
-# 新 repo 落点: .github/workflows/build.yml
-# 状态: 草稿——Phase B 首个快照 push 后才能真跑, 首跑失败按日志修
+# CI: build + regression (ubuntu-22.04)
 name: build
 
 on:

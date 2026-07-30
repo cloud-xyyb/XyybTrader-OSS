@@ -292,6 +292,7 @@ bool XtStraLoader::load(const char* path) {
     abi_ = reinterpret_cast<AbiFn>(GetProcAddress(h, "xt_abi_version"));
     order_exec_size_ = reinterpret_cast<LayoutFn>(GetProcAddress(h, "xt_sizeof_CtOrderExecUpdate"));
     order_exec_align_ = reinterpret_cast<LayoutFn>(GetProcAddress(h, "xt_alignof_CtOrderExecUpdate"));
+    tick_size_ = reinterpret_cast<LayoutFn>(GetProcAddress(h, "xt_sizeof_XtTick"));
 #else
 
     void* h = dlopen(dlopen_path, RTLD_NOW | RTLD_LOCAL);
@@ -305,6 +306,7 @@ bool XtStraLoader::load(const char* path) {
     abi_ = reinterpret_cast<AbiFn>(dlsym(h, "xt_abi_version"));
     order_exec_size_ = reinterpret_cast<LayoutFn>(dlsym(h, "xt_sizeof_CtOrderExecUpdate"));
     order_exec_align_ = reinterpret_cast<LayoutFn>(dlsym(h, "xt_alignof_CtOrderExecUpdate"));
+    tick_size_ = reinterpret_cast<LayoutFn>(dlsym(h, "xt_sizeof_XtTick"));
 #endif
 
     if (!create_ || !destroy_) {
@@ -319,6 +321,11 @@ bool XtStraLoader::load(const char* path) {
     }
     if (!order_exec_size_ || !order_exec_align_) {
         err_ = "missing XtOrderExecUpdate layout ABI symbols; rebuild strategy plugin";
+        unload();
+        return false;
+    }
+    if (!tick_size_) {
+        err_ = "missing xt_sizeof_XtTick layout ABI symbol; rebuild strategy plugin";
         unload();
         return false;
     }
@@ -339,6 +346,14 @@ bool XtStraLoader::load(const char* path) {
                " align " + std::to_string(plugin_order_exec_align) +
                " host=size " + std::to_string(XT_ABI_SIZEOF_CT_ORDER_EXEC_UPDATE) +
                " align " + std::to_string(XT_ABI_ALIGNOF_CT_ORDER_EXEC_UPDATE);
+        unload();
+        return false;
+    }
+    const uint64_t plugin_tick_size = tick_size_();
+    if (plugin_tick_size != XT_ABI_SIZEOF_CT_TICK) {
+        err_ = "strategy ABI mismatch: XtTick plugin=size " +
+               std::to_string(plugin_tick_size) +
+               " host=size " + std::to_string(XT_ABI_SIZEOF_CT_TICK);
         unload();
         return false;
     }
@@ -363,6 +378,7 @@ void XtStraLoader::unload() {
     abi_ = nullptr;
     order_exec_size_ = nullptr;
     order_exec_align_ = nullptr;
+    tick_size_ = nullptr;
 }
 
 XtStraLoader::~XtStraLoader() { unload(); }

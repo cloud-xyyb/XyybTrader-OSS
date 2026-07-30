@@ -74,6 +74,7 @@ private:
     AbiFn abi_ = nullptr;
     LayoutFn order_exec_size_ = nullptr;
     LayoutFn order_exec_align_ = nullptr;
+    LayoutFn tick_size_ = nullptr;
     std::string err_;
     SecurityConfig security_;
 };

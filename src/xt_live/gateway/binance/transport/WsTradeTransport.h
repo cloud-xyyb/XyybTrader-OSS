@@ -47,6 +47,8 @@ public:
 
     Health health() const override;
 
+    uint64_t submit_exec_unknown_count() const;
+
     void inject_test_message(std::string_view payload);
 
     void inject_test_connect();

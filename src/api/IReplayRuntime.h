@@ -24,7 +24,8 @@ public:
     virtual void on_order_detail(const XtOrderDetail& od) = 0;
     virtual void on_transaction(const XtTransaction& tr) = 0;
 
-    virtual void on_clock(uint32_t  , uint32_t  ) {}
+    virtual void on_clock(uint32_t  , uint32_t  ,
+                          uint32_t  ) {}
 
     [[nodiscard]] virtual size_t active_orders() const = 0;
 };

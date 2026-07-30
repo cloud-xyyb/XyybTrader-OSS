@@ -15,6 +15,7 @@
 #include "xt_metrics/XtMetricRegistry.h"
 #endif
 
+#include <algorithm>
 #include <cstdio>
 
 namespace {
@@ -47,6 +48,10 @@ void TraderCTP::reset_query_ctrl_for_rearm_(QueryKind kind) {
 
     auto& q = qry_[qry_idx(kind)];
     q.inflight.store(false, std::memory_order_release);
+
+    q.active_request_id.store(kQueryRequestIdInvalidated, std::memory_order_release);
+
+    query_session_gen_.fetch_add(1, std::memory_order_acq_rel);
     q.dirty.store(false, std::memory_order_release);
     q.next_allowed_ms.store(0, std::memory_order_release);
     q.backoff_level.store(0, std::memory_order_release);
@@ -179,13 +184,18 @@ void TraderCTP::enter_recovery_pipeline(bool settlement_confirmed) {
     clear_recovery_query_timeout_states();
     reset_query_control_states();
 
-    state_.on_recovery_begin();
-
     {
         std::lock_guard<std::mutex> lk(recovery_alive_mu_);
         recovery_alive_orders_.clear();
         recovery_alive_routing_.clear();
     }
+
+    {
+        std::lock_guard<std::mutex> lk(recovery_staged_pos_mu_);
+        recovery_staged_positions_.clear();
+        recovery_staged_pos_valid_ = false;
+    }
+    recovery_position_anchor_us_.store(0, std::memory_order_release);
     recovery_skipped_foreign_ = 0;
 
     if (recovery_.recovery_enabled()) {
@@ -218,12 +228,14 @@ void TraderCTP::rebuild_alive_inflight_and_emit(bool is_cold_start) {
             const bool is_close = (a.close_offset != XtOffset::Open);
             const bool is_today = (a.close_offset == XtOffset::CloseToday);
             const double price = order_exec_from_fp(a.price_fp);
+
             state_.register_order(a.local_id, ref_buf, a.code.c_str(),
                                   a.is_buy, price, a.total_qty_fp,
                                     "",
                                   is_close, is_today,
                                     0,
-                                    0);
+                                    0,
+                                    a.filled_qty_fp);
         }
 
         const auto rit = routing.find(a.local_id);
@@ -256,25 +268,68 @@ void TraderCTP::rebuild_alive_inflight_and_emit(bool is_cold_start) {
         std::move(orders), is_cold_start, "ctp", callbacks_.on_reverse_sync_batch);
     readiness_gate_.satisfy(xt_live::gateway::TdReadinessStage::ReverseSync,
                             "ctp recovery alive-order batch emitted");
-    flush_recovery_pending_terminals_();
+
 }
 
-void TraderCTP::flush_recovery_window_trades_() {
-    std::vector<BufferedWindowTrade> pending;
+void TraderCTP::stage_recovery_positions_(std::vector<PositionSnapshot> out) {
+
+    recovery_position_anchor_us_.store(wall_now_epoch_us_(), std::memory_order_release);
+    std::lock_guard<std::mutex> lk(recovery_staged_pos_mu_);
+    recovery_staged_positions_ = std::move(out);
+    recovery_staged_pos_valid_ = true;
+}
+
+void TraderCTP::emit_staged_recovery_positions_(bool is_cold_start) {
+    std::vector<PositionSnapshot> out;
+    bool valid = false;
+    {
+        std::lock_guard<std::mutex> lk(recovery_staged_pos_mu_);
+        valid = recovery_staged_pos_valid_;
+        out.swap(recovery_staged_positions_);
+        recovery_staged_pos_valid_ = false;
+    }
+    if (!valid) return;
+
+    if (callbacks_.on_recovery_position) {
+        callbacks_.on_recovery_position(out, is_cold_start);
+    } else if (callbacks_.on_position) {
+        callbacks_.on_position(out);
+    }
+}
+
+void TraderCTP::reopen_recovery_window_gate_and_drain_() {
+
+    std::vector<XtTradeRecord> residual;
+    {
+        std::lock_guard<std::mutex> lk(recovery_window_mu_);
+        recovery_window_gate_closed_ = false;
+        residual.swap(recovery_window_trades_);
+    }
+    if (!callbacks_.on_trade) return;
+
+    for (auto& tr : residual) callbacks_.on_trade(tr, XtLatencyEligibility::kIneligible);
+}
+
+void TraderCTP::emit_recovery_finish_sequence_(bool is_cold_start) {
+
+    std::vector<XtTradeRecord> pending;
     uint64_t overflow = 0;
     {
         std::lock_guard<std::mutex> lk(recovery_window_mu_);
         pending.swap(recovery_window_trades_);
         overflow = recovery_window_overflow_;
         recovery_window_overflow_ = 0;
-
-        recovery_window_gate_closed_ = false;
     }
-    const bool reverse_sync_ok =
-        readiness_gate_.report().stage(xt_live::gateway::TdReadinessStage::ReverseSync)
-            .status == xt_live::gateway::TdReadinessStatus::Satisfied;
-    if (!reverse_sync_ok) {
+    if (!callbacks_.on_reverse_sync_batch) {
 
+        emit_staged_recovery_positions_(is_cold_start);
+        rebuild_alive_inflight_and_emit(is_cold_start);
+        {
+            std::lock_guard<std::mutex> lk(recovery_window_mu_);
+            recovery_window_gate_closed_ = false;
+
+            recovery_window_trades_.clear();
+        }
         if (!pending.empty() || overflow > 0) {
             XtLogger::error_m("TD",
                 "event=recovery_window_trades_dropped reason=reverse_sync_not_ready "
@@ -283,40 +338,56 @@ void TraderCTP::flush_recovery_window_trades_() {
         }
         return;
     }
-    const uint32_t fence = recovery_position_snap_seq_.load(std::memory_order_relaxed);
-    size_t flushed = 0;
-    size_t dropped_prefence = 0;
-    for (auto& e : pending) {
 
-        if (e.pos_snap_seq < fence) {
-            ++dropped_prefence;
-            continue;
-        }
-        if (callbacks_.on_trade) {
-            callbacks_.on_trade(e.tr);
-            ++flushed;
+    const int64_t anchor =
+        recovery_position_anchor_us_.load(std::memory_order_acquire);
+    std::vector<XtTradeRecord> pre;
+    std::vector<XtTradeRecord> post;
+    pre.reserve(pending.size());
+    for (auto& tr : pending) {
+        const auto fill_us = static_cast<int64_t>(tr.fill_ts_us);
+        if (anchor > 0 && fill_us > anchor + kFillSealMarginUs) {
+            post.push_back(std::move(tr));
+        } else {
+            pre.push_back(std::move(tr));
         }
     }
-    if (flushed > 0 || dropped_prefence > 0 || overflow > 0) {
+
+    std::stable_sort(pre.begin(), pre.end(),
+                     [](const XtTradeRecord& a, const XtTradeRecord& b) {
+                         return a.fill_ts_us < b.fill_ts_us;
+                     });
+
+    if (callbacks_.on_trade) {
+        for (auto& tr : pre) callbacks_.on_trade(tr, XtLatencyEligibility::kIneligible);
+    }
+    emit_staged_recovery_positions_(is_cold_start);
+    rebuild_alive_inflight_and_emit(is_cold_start);
+    if (callbacks_.on_trade) {
+        for (auto& tr : post) callbacks_.on_trade(tr, XtLatencyEligibility::kIneligible);
+    }
+    reopen_recovery_window_gate_and_drain_();
+    flush_recovery_pending_terminals_();
+    if (!pre.empty() || !post.empty() || overflow > 0) {
         XtLogger::info_m("TD",
-            "event=recovery_window_trades_flush flushed={} dropped_prefence={} "
-            "dropped_overflow={}",
-            flushed, dropped_prefence, overflow);
+            "event=recovery_window_trades_flush pre={} post={} dropped_overflow={}",
+            pre.size(), post.size(), overflow);
     }
 }
 
 void TraderCTP::flush_recovery_pending_terminals_() {
-    std::unordered_map<uint64_t, XtOrderExecUpdate> pending;
+    std::unordered_map<uint64_t, RecoveryPendingTerminal> pending;
     {
         std::lock_guard<std::mutex> lk(recovery_term_mu_);
         pending.swap(recovery_pending_terminals_);
     }
     if (pending.empty()) return;
-    for (auto& [lid, upd] : pending) {
+    for (auto& [lid, entry] : pending) {
 
         XtLogger::warn_m("TD",
                          "event=td_recovery_terminal_flush local_id={} status={}",
-                         lid, static_cast<int>(upd.status));
-        if (callbacks_.on_order_update) callbacks_.on_order_update(upd);
+                         lid, static_cast<int>(entry.upd.status));
+        if (callbacks_.on_order_update)
+            callbacks_.on_order_update(entry.upd, entry.elig);
     }
 }

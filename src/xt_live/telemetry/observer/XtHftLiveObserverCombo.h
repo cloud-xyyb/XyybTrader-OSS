@@ -32,7 +32,8 @@ public:
         : latency_(latency), signals_(signals),
           trade_q_(trade_q), order_q_(order_q) {}
 
-    void on_trade(const XtTradeRecord& tr) override {
+    void on_trade(const XtTradeRecord& tr, XtLatencyEligibility elig,
+                  uint64_t logical_order_id) override {
         if (signals_) {
             signals_->trade_fill_cnt.fetch_add(1, std::memory_order_relaxed);
 
@@ -40,13 +41,17 @@ public:
                 static_cast<uint64_t>(XtSteadyClock::steady_now_ms()),
                 std::memory_order_release);
         }
-        if (latency_) latency_->on_trade(tr);
+
+        if (latency_ && elig == XtLatencyEligibility::kEligible) {
+
+            latency_->on_trade(tr, logical_order_id);
+        }
 
         if (trade_q_) trade_q_->push(tr);
     }
 
-    void on_order_update(const XtOrderExecUpdate& upd) override {
-        if (latency_) latency_->on_order_update(upd);
+    void on_order_update(const XtOrderExecUpdate& upd, XtLatencyEligibility elig) override {
+        if (latency_ && elig == XtLatencyEligibility::kEligible) latency_->on_order_update(upd);
         if (order_q_) order_q_->push(upd);
     }
 

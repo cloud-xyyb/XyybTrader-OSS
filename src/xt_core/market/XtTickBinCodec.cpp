@@ -1,13 +1,14 @@
 #include "XtTickBinCodec.h"
 
 #include <array>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <type_traits>
 
 namespace {
 
-constexpr std::array<char, 8> kTickBinMagic = {'C', 'T', 'T', 'K', 'V', '3', '\0', '\0'};
+constexpr std::array<char, 8> kTickBinMagic = {'C', 'T', 'T', 'K', 'V', '4', '\0', '\0'};
 constexpr uint16_t kTickBinVersion = xt_tick_bin::kTickBinCodecVersion;
 
 #pragma pack(push, 1)
@@ -33,10 +34,17 @@ static_assert(std::is_trivially_copyable_v<XtRawTick>,
               "XtRawTick must stay trivially_copyable for memcpy codec");
 static_assert(std::is_trivially_copyable_v<XtTick>,
               "XtTick must stay trivially_copyable for memcpy codec");
-static_assert(sizeof(XtRawTick) == 512,
+static_assert(sizeof(XtRawTick) == 832,
               "XtRawTick layout changed — only bump this if intentionally changing cache format");
-static_assert(sizeof(XtTick) == 512,
+static_assert(sizeof(XtTick) == 832,
               "XtTick layout changed — only bump this if intentionally changing cache format");
+
+static_assert(sizeof(XtTickBinRecordV2) == sizeof(XtRawTick) + sizeof(XtTick),
+              "DualV2 record must stay padding-free for the byte-buffer read path");
+static_assert(offsetof(XtTickBinRecordV2, raw) == 0,
+              "DualV2 record must start with the raw tick");
+static_assert(offsetof(XtTickBinRecordV2, core) == sizeof(XtRawTick),
+              "DualV2 core tick must directly follow the raw tick");
 
 XtTickBinHeaderV2 make_v2_header() {
     XtTickBinHeaderV2 h{};
@@ -125,12 +133,15 @@ bool read_next_tick(std::istream& in,
                     XtRawTick& raw_out,
                     XtTick* core_out) {
     if (fmt != XtTickBinFormat::DualV2) return false;
-    XtTickBinRecordV2 rec{};
-    if (!in.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
+
+    unsigned char buf[sizeof(XtTickBinRecordV2)];
+    if (!in.read(reinterpret_cast<char*>(buf), sizeof(buf))) {
         return false;
     }
-    raw_out = rec.raw;
-    if (core_out) *core_out = rec.core;
+    std::memcpy(&raw_out, buf + offsetof(XtTickBinRecordV2, raw), sizeof(XtRawTick));
+    if (core_out) {
+        std::memcpy(core_out, buf + offsetof(XtTickBinRecordV2, core), sizeof(XtTick));
+    }
     return true;
 }
 

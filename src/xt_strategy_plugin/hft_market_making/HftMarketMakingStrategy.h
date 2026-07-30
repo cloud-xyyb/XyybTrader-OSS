@@ -114,15 +114,30 @@ public:
             if (delta_ms < quote_throttle_ms_) return;
         }
 
+        int64_t buy_leaves_fp = 0, sell_leaves_fp = 0;
+        {
+            XtOrderExecUpdate open_buf[64];
+            const size_t n_open = ctx->get_open_orders(symbol_.c_str(), open_buf, 64);
+            for (size_t i = 0; i < n_open; ++i) {
+                if (open_buf[i].leaves_fp <= 0) continue;
+                (open_buf[i].is_buy ? buy_leaves_fp : sell_leaves_fp)
+                    += open_buf[i].leaves_fp;
+            }
+        }
+
         const double net_pos    = order_exec_from_fp(
-            positions_.logical_fp() + ctx->projected_inflight_fp(symbol_.c_str()));
+            positions_.logical_fp() + buy_leaves_fp - sell_leaves_fp);
         const double diff       = net_pos - inventory_target_;
         int bid_skew = 0, ask_skew = 0;
         if      (diff >  qty_) bid_skew = 2;
         else if (diff < -qty_) ask_skew = 2;
 
-        const bool block_long   = (net_pos >=  max_position_);
-        const bool block_short  = (net_pos <= -max_position_);
+        const double worst_long  = order_exec_from_fp(
+            positions_.logical_fp() + buy_leaves_fp);
+        const double worst_short = order_exec_from_fp(
+            positions_.logical_fp() - sell_leaves_fp);
+        const bool block_long   = (worst_long  >=  max_position_);
+        const bool block_short  = (worst_short <= -max_position_);
 
         const int64_t target_bid_px = best_bid - static_cast<int64_t>(bid_offset_ticks_ + bid_skew) * tick_size_fp_;
         const int64_t target_ask_px = best_ask + static_cast<int64_t>(ask_offset_ticks_ + ask_skew) * tick_size_fp_;
@@ -137,6 +152,9 @@ public:
 
         for (const auto oid : in_flight_oids_) ctx->cancel(oid);
         in_flight_oids_.clear();
+
+        last_bid_px_ = 0;
+        last_ask_px_ = 0;
 
         const int64_t qty_fp = order_exec_to_fp(qty_);
         char reason_buf[64];

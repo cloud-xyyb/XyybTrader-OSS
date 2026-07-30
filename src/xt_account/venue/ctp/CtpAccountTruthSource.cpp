@@ -28,6 +28,5 @@ void CtpAccountTruthSource::update_broker_overlay(const BrokerVenueTruth& bt) {
 
     std::lock_guard<std::mutex> lock(mu_);
     overlay_available_fp_ = bt.available_balance_fp;
-    overlay_maint_fp_ = bt.maint_margin_fp;
     overlay_total_fp_ = bt.total_margin_balance_fp;
 }

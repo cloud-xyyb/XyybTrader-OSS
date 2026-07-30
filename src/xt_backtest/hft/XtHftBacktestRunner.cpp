@@ -15,7 +15,6 @@
 #include "xt_strategy_engine/IStrategyExecSink.h"
 #include "xt_strategy_engine/XtStrategyContext.h"
 #include "xt_runtime/order/IdentityOrderIdTranslator.h"
-#include "xt_backtest/hft/XtHftBacktestExtConfig.h"
 #include "xt_backtest/hft/XtHftBacktestDriver.h"
 #include "xt_strategy_engine/view/XtRuntimeView.h"
 #include "xt_runtime/market/XtRuntimeMarketCache.h"
@@ -47,6 +46,8 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 
 using xt_bt::emit_progress;
 using xt_runtime::XtRuntimeMarketCache;
@@ -64,6 +65,8 @@ struct BtMeta {
     std::vector<std::string> strategy_ids;
     uint32_t start_date = 0;
     uint32_t end_date = 0;
+    int64_t clock_resolution_ns = 0;
+
 };
 
 using BtStrategyInstance = xt_strategy_engine::StrategyInstance;
@@ -174,7 +177,7 @@ void build_account_domain(const XtHftBacktestConfig& cfg,
     acfg.futures_mode = true;
     acfg.t1_enabled   = (cfg.engine_cfg.t1_mode == XtHftBacktestEngineCfg::T1Mode::Enabled);
     acfg.catalog      = &c.catalog;
-    c.account_store   = xt_account::make_account_state_store(acfg);
+    c.account_store   = std::make_unique<xt_account::AccountStateStore>(acfg);
 
     params.account    = c.account_store.get();
     params.catalog    = &c.catalog;
@@ -211,44 +214,57 @@ void build_runtime_view(BtComponents& c) {
     c.runtime_view = std::make_unique<xt_strategy_engine::XtRuntimeView>(comp);
 }
 
-XtHftEngine::Config make_engine_config(const BtMeta& meta,
-                                       const XtHftBacktestConfig& cfg,
-                                       BtComponents& c) {
-    XtHftEngine::Config eng_cfg;
-    eng_cfg.gateway                  = &c.gw;
-    eng_cfg.view                     = c.runtime_view.get();
-    eng_cfg.session                  = cfg.session_cfg;
-    eng_cfg.roll                     = cfg.roll_cfg;
-    eng_cfg.strategy_id              = meta.strategy_id;
-    eng_cfg.history_ticks            = cfg.engine_cfg.history_ticks;
-    eng_cfg.history_bars             = cfg.engine_cfg.history_bars;
-    eng_cfg.init_config              = &cfg.strategy_init_cfg;
-    eng_cfg.account_store            = c.account_store.get();
-    eng_cfg.order_book               = &c.order_book;
-    eng_cfg.catalog                  = &c.catalog;
-    eng_cfg.order_id_translator      = &c.order_id_translator;
-    eng_cfg.conditional_orders_enabled = cfg.engine_cfg.conditional_orders_enabled;
-
-    eng_cfg.strict_unmatched_routing = true;
-    return eng_cfg;
+XtHftEngine::ReplayExt make_replay_ext(const XtHftBacktestConfig& cfg) {
+    XtHftEngine::ReplayExt ext;
+    ext.session_offset_minutes = cfg.engine_cfg.session_offset_minutes;
+    XtBacktestTradingCalendar cal(cfg.calendar_cfg);
+    if (cfg.calendar_cfg.enabled) {
+        ext.calendar_filter = [cal](uint32_t date) {
+            return date != 0 && cal.is_trading_day(date);
+        };
+    }
+    ext.next_trading_day = [cal](uint32_t date) {
+        return cal.next_trading_day(date);
+    };
+    return ext;
 }
 
-bool build_strategy_contexts(const XtHftBacktestConfig& cfg,
-                             BtComponents& c,
-                             XtHftEngine::Config& eng_cfg,
-                             std::string& err) {
+XtHftEngine::Dependencies make_engine_deps(BtComponents& c) {
+    XtHftEngine::Dependencies deps;
+    deps.gateway             = &c.gw;
+    deps.view                = c.runtime_view.get();
+    deps.account_store       = c.account_store.get();
+    deps.order_book          = &c.order_book;
+    deps.catalog             = &c.catalog;
+    deps.order_id_translator = &c.order_id_translator;
+
+    return deps;
+}
+
+XtHftEngine::Options make_engine_options(const XtHftBacktestConfig& cfg, bool is_multi) {
+    XtHftEngine::Options opts;
+    opts.session = cfg.session_cfg;
+    opts.roll    = cfg.roll_cfg;
+    opts.conditional_orders_enabled = cfg.engine_cfg.conditional_orders_enabled;
+    opts.replay  = make_replay_ext(cfg);
+
+    opts.unmatched_routing = is_multi
+        ? XtHftEngine::UnmatchedRoutingPolicy::FailFast
+        : XtHftEngine::UnmatchedRoutingPolicy::WarnAndDrop;
+    return opts;
+}
+
+std::vector<std::unique_ptr<XtStrategyContext>> build_strategy_contexts(
+    const XtHftBacktestConfig& cfg, BtComponents& c) {
 
     const std::size_t n = c.strategies.size();
     const bool is_multi = (n > 1);
-    XtStrategyBase* primary = c.strategies[0].plugin->get();
 
-    c.engine = std::make_unique<XtHftEngine>( primary, eng_cfg);
-
-    c.engine->reserve_contexts(n);
+    std::vector<std::unique_ptr<XtStrategyContext>> contexts;
+    contexts.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
-        XtStrategyBase* stra_i = c.strategies[i].plugin->get();
         XtStrategyContext::Config ctx_cfg;
-        ctx_cfg.strategy     = stra_i;
+        ctx_cfg.strategy     = c.strategies[i].plugin->get();
         ctx_cfg.exec_gateway = &c.gw;
         ctx_cfg.runtime_view = c.runtime_view.get();
         ctx_cfg.strategy_id  = c.strategies[i].id;
@@ -259,26 +275,26 @@ bool build_strategy_contexts(const XtHftBacktestConfig& cfg,
         ctx_cfg.init_config  = (i < cfg.strategies.size())
                                    ? &cfg.strategies[i].init_cfg
                                    : &cfg.strategy_init_cfg;
-        auto owned_ctx = std::make_unique<XtStrategyContext>(ctx_cfg);
-        c.engine->add_context(std::move(owned_ctx));
+        contexts.push_back(std::make_unique<XtStrategyContext>(ctx_cfg));
         XtLogger::info_m("BT", "context[{}] added strategy={}", i, c.strategies[i].id);
     }
+    return contexts;
+}
 
+void collect_exec_sink_view(BtComponents& c,
+                            const std::vector<std::unique_ptr<XtStrategyContext>>& contexts) {
     c.exec_sink_ptrs.clear();
-    c.exec_sink_ptrs.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        auto* ctx = c.engine->context(i);
+    c.exec_sink_ptrs.reserve(contexts.size());
+    for (const auto& ctx : contexts) {
         c.exec_sink_ptrs.push_back(
-            ctx ? static_cast<xt_strategy_engine::IStrategyExecSink*>(ctx) : nullptr);
+            ctx ? static_cast<xt_strategy_engine::IStrategyExecSink*>(ctx.get()) : nullptr);
     }
-    auto* fallback = c.exec_sink_ptrs.empty() ? nullptr : c.exec_sink_ptrs[0];
+}
 
-    try {
-        c.engine->set_exec_sinks(fallback, c.exec_sink_ptrs);
-    } catch (const std::exception& e) {
-        XtLogger::error_m("BT", "engine exec sink assembly failed: {}", e.what());
-        return false;
-    }
+bool verify_assembly_alignment(const XtHftBacktestConfig& cfg,
+                               BtComponents& c,
+                               std::string& err) {
+    const std::size_t n = c.engine->context_count();
 
     std::vector<std::string> cfg_ids;
     cfg_ids.reserve(cfg.strategies.size());
@@ -295,7 +311,7 @@ bool build_strategy_contexts(const XtHftBacktestConfig& cfg,
         err = "multi-assembly alignment failed: " + rep.error;
         return false;
     }
-    if (is_multi) {
+    if (n > 1) {
         XtLogger::info_m(
             "BT",
             "multi-strategy backtest: {} strategies (same-symbol groups are rejected by config parser)",
@@ -304,29 +320,7 @@ bool build_strategy_contexts(const XtHftBacktestConfig& cfg,
     return true;
 }
 
-void configure_backtest_ext(const XtHftBacktestConfig& cfg, BtComponents& c) {
-
-    xt_backtest::hft::XtHftBacktestExtConfig ext;
-    ext.session_offset_minutes = cfg.engine_cfg.session_offset_minutes;
-    XtBacktestTradingCalendar cal(cfg.calendar_cfg);
-    if (cfg.calendar_cfg.enabled) {
-        ext.calendar_filter = [cal](uint32_t date) {
-            return date != 0 && cal.is_trading_day(date);
-        };
-    }
-    ext.next_trading_day = [cal](uint32_t date) {
-        return cal.next_trading_day(date);
-    };
-    c.engine->configure_backtest_ext(ext);
-}
-
-bool try_build_engine(const BtMeta& meta,
-                      const XtHftBacktestConfig& cfg,
-                      BtComponents& c,
-                      std::string& err) {
-    assert(!c.strategies.empty()
-           && "engine ctor: c.strategies vector must have >=1 element by now");
-
+void build_engine_domain(const XtHftBacktestConfig& cfg, BtComponents& c) {
     auto params = make_gateway_params(cfg);
     build_account_domain(cfg, c, params);
     c.gw.init(std::move(params));
@@ -335,9 +329,37 @@ bool try_build_engine(const BtMeta& meta,
 
     c.gw.set_market_cache(c.market_cache.get());
 
-    auto eng_cfg = make_engine_config(meta, cfg, c);
-    if (!build_strategy_contexts(cfg, c, eng_cfg, err)) return false;
-    configure_backtest_ext(cfg, c);
+    xt_runtime::XtRuntimeMarketCacheConfig mc_cfg;
+    mc_cfg.tick_history_cap      = cfg.engine_cfg.history_ticks;
+    mc_cfg.bar_history_cap       = cfg.engine_cfg.history_bars;
+    mc_cfg.orderflow_history_cap = cfg.engine_cfg.history_ticks;
+    c.market_cache->configure(mc_cfg);
+}
+
+bool try_build_engine(const XtHftBacktestConfig& cfg,
+                      BtComponents& c,
+                      std::vector<std::unique_ptr<XtStrategyContext>> contexts,
+                      XtHftEngine::Hooks hooks,
+                      std::string& err) {
+    assert(!c.strategies.empty()
+           && "engine ctor: c.strategies vector must have >=1 element by now");
+
+    const bool is_multi = (c.strategies.size() > 1);
+
+    collect_exec_sink_view(c, contexts);
+    try {
+        c.engine = std::make_unique<XtHftEngine>(make_engine_deps(c),
+                                                 make_engine_options(cfg, is_multi),
+                                                 std::move(contexts),
+                                                 std::move(hooks));
+    } catch (const std::exception& e) {
+
+        c.exec_sink_ptrs.clear();
+        err = std::string("engine assembly failed: ") + e.what();
+        return false;
+    }
+
+    if (!verify_assembly_alignment(cfg, c, err)) return false;
 
     c.driver = std::make_unique<xt_backtest::hft::XtHftBacktestDriver>(*c.engine, c.gw);
     return true;
@@ -346,6 +368,7 @@ bool try_build_engine(const BtMeta& meta,
 bool try_build_reporter(const BtMeta& meta,
                         const XtHftBacktestConfig& cfg,
                         BtComponents& c,
+                        XtHftEngine::Hooks& hooks,
                         std::string& err) {
     std::error_code ec;
     std::filesystem::create_directories(meta.report_dir, ec);
@@ -360,7 +383,7 @@ bool try_build_reporter(const BtMeta& meta,
     }
 
     auto event_stream_sink = std::make_unique<XtEventStreamSink>(
-        cfg.event_stream_cfg, meta.base_dir, meta.report_dir);
+        cfg.event_stream_cfg,  "", meta.report_dir);
     c.reporter = std::make_unique<XtBacktestReporter>();
     if (!c.reporter->init(c.csv_sink, std::move(event_stream_sink))) {
         err = "init report failed";
@@ -379,7 +402,7 @@ bool try_build_reporter(const BtMeta& meta,
     });
 
     c.reporter_fill_observer = std::make_unique<XtBacktestReporterFillObserver>(c.reporter.get());
-    c.engine->add_observer(c.reporter_fill_observer.get());
+    hooks.observers.push_back(c.reporter_fill_observer.get());
     return true;
 }
 
@@ -411,6 +434,7 @@ bool bootstrap(XtHftBacktestConfig cfg, BtMeta& meta, BtComponents& c, std::stri
     meta.report_dir = unique_report_dir;
     meta.start_date = cfg.datasource_cfg.start_date;
     meta.end_date   = cfg.datasource_cfg.end_date;
+    meta.clock_resolution_ns = cfg.replay_cfg.clock_resolution_ns;
     XtLogger::info_m("BT", "report_dir(unique)={}", unique_report_dir);
 
     if (!try_create_strategies(cfg, meta, c, err)) return false;
@@ -430,8 +454,34 @@ bool bootstrap(XtHftBacktestConfig cfg, BtMeta& meta, BtComponents& c, std::stri
         return false;
     }
 
+    std::vector<std::unique_ptr<XtStrategyContext>> contexts;
     try {
-        if (!try_build_engine(meta, cfg, c, err)) return false;
+        build_engine_domain(cfg, c);
+        contexts = build_strategy_contexts(cfg, c);
+    } catch (const std::exception& e) {
+        err = std::string("build engine failed: ") + e.what();
+        return false;
+    } catch (...) {
+        err = "build engine failed";
+        return false;
+    }
+
+    XtHftEngine::Hooks hooks;
+
+    if (!try_build_reporter(meta, cfg, c, hooks, err)) return false;
+    if (!try_build_data_replayer(cfg, c.source, c.replayer, err)) return false;
+
+    c.excursion_tracker.init(meta.report_dir, &c.catalog);
+    hooks.mark_tick = [&c](const XtTick& t) {
+        c.excursion_tracker.on_tick(t, *c.account_store);
+    };
+    hooks.trade_excursion =
+        [&c](const XtTradeRecord& tr, int64_t bq, int64_t aq, int64_t aa, int64_t r) {
+            c.excursion_tracker.on_fill(tr, bq, aq, aa, r);
+        };
+
+    try {
+        if (!try_build_engine(cfg, c, std::move(contexts), std::move(hooks), err)) return false;
     } catch (const std::exception& e) {
         err = std::string("build engine failed: ") + e.what();
         return false;
@@ -454,20 +504,16 @@ bool bootstrap(XtHftBacktestConfig cfg, BtMeta& meta, BtComponents& c, std::stri
                      cfg.roll_cfg.logical_symbol,
                      XtEventStreamSink::Config::mode_name(cfg.event_stream_cfg.trace_mode));
 
-    if (!try_build_reporter(meta, cfg, c, err)) return false;
-    if (!try_build_data_replayer(cfg, c.source, c.replayer, err)) return false;
-
-    c.excursion_tracker.init(meta.report_dir);
-    c.engine->set_mark_tick_callback(
-        [&c](const XtTick& t) { c.excursion_tracker.on_tick(t, *c.account_store); });
-    c.engine->set_trade_excursion_callback(
-        [&c](const XtTradeRecord& tr, int64_t bq, int64_t aq, int64_t aa, int64_t r) {
-            c.excursion_tracker.on_fill(tr, bq, aq, aa, r);
-        });
-
     c.engine_cfg_snapshot = cfg.engine_cfg;
 
-    c.engine->on_init();
+    const auto start_report = c.engine->start();
+    if (!start_report.all_started) {
+        err = "backtest strategy on_init failed (" +
+              std::to_string(start_report.failures.size()) +
+              " strategy disabled fail-closed) — aborting run";
+        XtLogger::error_m("HFT_BT", "{}", err);
+        return false;
+    }
     return true;
 }
 
@@ -527,6 +573,11 @@ bool run_replay(BtComponents& c, size_t& tick_count,
     }
 
     c.driver->flush_pending(engine_cfg.eof_grace_ms);
+    if (c.source->has_io_error()) {
+        err = "market data reader reported I/O error (corrupt/unreadable input), "
+              "aborting run to avoid silent truncation";
+        return false;
+    }
     if (tick_count == 0) {
         err = "no ticks replayed, please check datasource path/range/mode";
         return false;
@@ -555,6 +606,76 @@ bool finalize(BtComponents& c, const BtMeta& meta, size_t tick_count,
     const std::string daily_path =
         (std::filesystem::path(meta.report_dir) / "daily_breakdown.json").string();
     c.reporter->write_daily_breakdown(daily_path, meta.start_date, meta.end_date);
+
+    {
+        const auto& obs = c.gw.risk_observability();
+        const std::string obs_path =
+            (std::filesystem::path(meta.report_dir) / "risk_observability.json").string();
+        std::ofstream ofs(obs_path);
+        if (ofs) {
+
+            ofs << "{\n"
+                << "  \"position_breach_count\": " << obs.position_breach_count << ",\n"
+                << "  \"peak_abs_position\": " << std::fixed << std::setprecision(6)
+                << xt_fp::from_fp(obs.peak_abs_position_fp) << ",\n"
+                << "  \"peak_live_orders\": " << obs.peak_live_orders << "\n"
+                << "}\n";
+            if (!ofs.good()) {
+                XtLogger::warn_m("BT", "risk_observability.json write failed: {}", obs_path);
+            }
+        } else {
+            XtLogger::warn_m("BT", "risk_observability.json open failed: {}", obs_path);
+        }
+    }
+
+    {
+        xt_bt::ConsumedManifest man;
+        man.files               = c.source->consumed_tick_files();
+        man.tick_source         = c.source->tick_source_name();
+        man.rows_total          = tick_count;
+        man.cache_enabled       = c.source->bin_cache_enabled();
+        man.cache_hit           = c.source->bin_cache_hit();
+        man.cache_path          = c.source->bin_cache_path();
+        man.clock_resolution_ns = meta.clock_resolution_ns;
+
+        man.delivery_stage = "pre_engine";
+        const auto& ds = c.source->drop_stats();
+        if (ds.loaded_trackable && ds.rows_loaded >= 0) {
+            man.rows_loaded            = ds.rows_loaded;
+            man.exclusions.window      = ds.window;
+            man.exclusions.session     = ds.session;
+            man.exclusions.skip_last   = ds.skip_last;
+            man.exclusions.symbol      = ds.symbol;
+            man.exclusions.bad_row     = ds.bad_row;
+
+            const int64_t classified =
+                man.exclusions.window + man.exclusions.session + man.exclusions.skip_last +
+                man.exclusions.symbol + man.exclusions.bad_row;
+            const int64_t residual =
+                ds.rows_loaded - static_cast<int64_t>(man.rows_total) - classified;
+            if (residual >= 0) {
+                man.exclusions.other = residual;
+                man.reconciled = true;
+            } else {
+                man.reconciled = false;
+            }
+        } else {
+            man.rows_loaded = -1;
+            man.reconciled = false;
+        }
+
+        const auto& ec = c.engine->engine_drop_counters();
+        man.has_post_delivery_drops = true;
+        man.post_delivery_drops.roll     = static_cast<int64_t>(ec.roll);
+        man.post_delivery_drops.session  = static_cast<int64_t>(ec.session);
+        man.post_delivery_drops.calendar = static_cast<int64_t>(ec.calendar);
+
+        const std::string man_path =
+            (std::filesystem::path(meta.report_dir) / "consumed_manifest.json").string();
+        if (!xt_bt::write_consumed_manifest(man_path, man)) {
+            XtLogger::warn_m("BT", "consumed_manifest.json write failed: {}", man_path);
+        }
+    }
 
     done_detail = "ticks=" + std::to_string(tick_count) +
                   " trades=" + std::to_string(c.reporter->trade_count()) +
@@ -598,6 +719,12 @@ int main(int argc, char** argv) {
     if (!run_replay(components, tick_count, components.engine_cfg_snapshot,
                     meta.start_date, meta.end_date, err))
         return fail("run_replay", err);
+
+    if (const uint64_t n = components.engine->strategy_callback_exception_count(); n > 0) {
+        return fail("strategy_exception",
+                    "backtest strategy callback threw " + std::to_string(n) +
+                    " exception(s) during run (swallowed by guard; run marked failed)");
+    }
 
     emit_progress(92, "report", "writing results");
     std::string done_detail;

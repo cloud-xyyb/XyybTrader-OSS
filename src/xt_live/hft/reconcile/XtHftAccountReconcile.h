@@ -8,6 +8,7 @@
 /// 只报告差异，不重放、不自动修复。
 /// pick_broker_balance() 是 broker 侧余额来源选择的纯决策，供单测。
 
+#include <cstddef>
 #include <cstdint>
 
 class ITradeGateway;
@@ -29,6 +30,19 @@ BrokerBalancePick pick_broker_balance(ITradeGateway* gw,
                                       double cached_balance,
                                       uint64_t cached_ms,
                                       uint64_t now_ms);
+
+/// @brief 「gateway 交付投影 open 集合 vs 账户订单冻结 ledger」差集观测结果
+///        （observe-only，不影响对账 PASS/FAIL；纯决策，供单测）。
+struct LedgerOpenObservation {
+    bool present = false;
+    std::size_t open_count = 0;
+
+    bool stale_frozen_suspect = false;
+};
+
+LedgerOpenObservation make_ledger_open_observation(bool supported,
+                                                   std::size_t open_count,
+                                                   double frozen_cash_by_orders);
 
 void run_account_reconcile_on_stop(const XtRunnerControlConfig& cfg,
                                     const XtHftRunnerControlContext& ctx);

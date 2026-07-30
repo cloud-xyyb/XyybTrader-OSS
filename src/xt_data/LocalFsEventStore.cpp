@@ -9,6 +9,8 @@
 #include <optional>
 #include <system_error>
 #include <utility>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -61,6 +63,18 @@ std::string make_shard_key(std::uint32_t day,
     key += '|';
     key.append(sym);
     return key;
+}
+
+std::size_t on_disk_size(std::FILE* fp) {
+    const int fd = ::fileno(fp);
+    if (fd < 0) {
+        return 0;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size < 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(st.st_size);
 }
 
 constexpr std::size_t kMaxRecordSize = 64u * 1024u;
@@ -261,7 +275,7 @@ LocalFsEventStore::LocalFsEventStore(std::string root_path)
 }
 
 LocalFsEventStore::~LocalFsEventStore() {
-    flush();
+    (void)flush();
 }
 
 std::filesystem::path
@@ -276,17 +290,19 @@ LocalFsEventStore::shard_path(std::uint32_t day,
     return p;
 }
 
-std::FILE* LocalFsEventStore::get_or_open_file(std::uint32_t day,
-                                                std::string_view exchange,
-                                                std::string_view symbol) {
+LocalFsEventStore::ShardHandle*
+LocalFsEventStore::open_shard_(const std::string& key,
+                              const std::filesystem::path& path) {
 
-    auto [it, inserted] = files_.try_emplace(
-        make_shard_key(day, exchange, symbol), nullptr);
-    if (!inserted && it->second) {
-        return it->second;
+    if (poisoned_shards_.count(key) != 0) {
+        return nullptr;
     }
 
-    const auto path = shard_path(day, exchange, symbol);
+    auto [it, inserted] = files_.try_emplace(key);
+    if (!inserted && it->second.fp) {
+        return &it->second;
+    }
+
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
@@ -298,8 +314,10 @@ std::FILE* LocalFsEventStore::get_or_open_file(std::uint32_t day,
         files_.erase(it);
         return nullptr;
     }
-    it->second = fp;
-    return fp;
+    it->second.fp = fp;
+
+    it->second.clean_size = on_disk_size(fp);
+    return &it->second;
 }
 
 std::filesystem::path LocalFsEventStore::events_ext_path(std::uint32_t day) const {
@@ -310,19 +328,41 @@ std::filesystem::path LocalFsEventStore::events_ext_path(std::uint32_t day) cons
     return p;
 }
 
-bool LocalFsEventStore::write_record_(std::FILE* fp,
-                                      const void* fbs_buf,
-                                      std::size_t fbs_size) {
+bool LocalFsEventStore::write_frame_(const std::string& key,
+                                     const std::filesystem::path& path,
+                                     ShardHandle& sh,
+                                     const void* fbs_buf, std::size_t fbs_size) {
     const std::uint32_t size_le = static_cast<std::uint32_t>(fbs_size);
     write_scratch_.resize(sizeof(std::uint32_t) + fbs_size);
     std::memcpy(write_scratch_.data(), &size_le, sizeof(std::uint32_t));
     std::memcpy(write_scratch_.data() + sizeof(std::uint32_t), fbs_buf, fbs_size);
     const std::size_t total = write_scratch_.size();
-    if (std::fwrite(write_scratch_.data(), 1, total, fp) != total) {
-        return false;
+
+    if (std::fwrite(write_scratch_.data(), 1, total, sh.fp) == total) {
+        sh.clean_size += total;
+        pending_bytes_ += total;
+        return true;
     }
-    pending_bytes_ += total;
-    return true;
+
+    const std::size_t clean = sh.clean_size;
+    close_and_drop_shard_(key);
+    bool rolled_back = false;
+    const int tfd = ::open(path.c_str(), O_WRONLY);
+    if (tfd >= 0) {
+        struct stat st{};
+        if (::fstat(tfd, &st) == 0 && st.st_size >= 0 &&
+            static_cast<std::size_t>(st.st_size) >= clean &&
+            ::ftruncate(tfd, static_cast<off_t>(clean)) == 0) {
+            rolled_back = true;
+        }
+        ::close(tfd);
+    }
+    if (rolled_back) {
+        torn_frame_rollback_count_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        poison_shard_(key);
+    }
+    return false;
 }
 
 void LocalFsEventStore::close_and_drop_shard_(const std::string& key) {
@@ -330,10 +370,20 @@ void LocalFsEventStore::close_and_drop_shard_(const std::string& key) {
     if (it == files_.end()) {
         return;
     }
-    if (it->second) {
-        std::fclose(it->second);
+    if (it->second.fp) {
+        std::fclose(it->second.fp);
     }
     files_.erase(it);
+}
+
+void LocalFsEventStore::poison_shard_(const std::string& key) {
+    if (poisoned_shards_.insert(key).second) {
+        poisoned_shard_count_.fetch_add(1, std::memory_order_relaxed);
+
+        std::fprintf(stderr,
+            "[eventstore] shard poisoned fail-closed (torn frame unrecoverable): key=%s\n",
+            key.c_str());
+    }
 }
 
 bool LocalFsEventStore::append(std::uint32_t trading_day,
@@ -351,17 +401,13 @@ bool LocalFsEventStore::append(std::uint32_t trading_day,
         return false;
     }
 
-    std::FILE* fp = get_or_open_file(trading_day, exchange, symbol);
-    if (!fp) {
+    const std::string key = make_shard_key(trading_day, exchange, symbol);
+    const std::filesystem::path path = shard_path(trading_day, exchange, symbol);
+    ShardHandle* sh = open_shard_(key, path);
+    if (!sh) {
         return false;
     }
-
-    if (!write_record_(fp, fbs_buf, fbs_size)) {
-
-        close_and_drop_shard_(make_shard_key(trading_day, exchange, symbol));
-        return false;
-    }
-    return true;
+    return write_frame_(key, path, *sh, fbs_buf, fbs_size);
 }
 
 bool LocalFsEventStore::append_event_ext(std::uint32_t trading_day,
@@ -377,30 +423,13 @@ bool LocalFsEventStore::append_event_ext(std::uint32_t trading_day,
         return false;
     }
 
-    const std::filesystem::path path = events_ext_path(trading_day);
-
     const std::string key = make_shard_key(trading_day, "_events", "_events");
-    auto [it, inserted] = files_.try_emplace(key, nullptr);
-    if (inserted || !it->second) {
-        std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
-        if (ec) {
-            files_.erase(it);
-            return false;
-        }
-        std::FILE* fp = std::fopen(path.c_str(), "ab");
-        if (!fp) {
-            files_.erase(it);
-            return false;
-        }
-        it->second = fp;
-    }
-
-    if (!write_record_(it->second, fbs_buf, fbs_size)) {
-        close_and_drop_shard_(key);
+    const std::filesystem::path path = events_ext_path(trading_day);
+    ShardHandle* sh = open_shard_(key, path);
+    if (!sh) {
         return false;
     }
-    return true;
+    return write_frame_(key, path, *sh, fbs_buf, fbs_size);
 }
 
 std::string LocalFsEventStore::rotate() {
@@ -408,8 +437,15 @@ std::string LocalFsEventStore::rotate() {
     std::error_code ec;
 
     const bool has_data = fs::exists(root_path_, ec) && !fs::is_empty(root_path_, ec);
-    flush();
+    const bool flush_ok = flush();
     if (!has_data) return {};
+    if (!flush_ok) {
+
+        rotate_fail_count_.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[eventstore] rotate skipped: flush persistence failed (root=%s)\n",
+                     root_path_.c_str());
+        return {};
+    }
 
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -423,7 +459,13 @@ std::string LocalFsEventStore::rotate() {
     } while (fs::exists(dst, ec));
 
     fs::rename(src, dst, ec);
-    if (ec) return {};
+    if (ec) {
+
+        rotate_fail_count_.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+
+    poisoned_shards_.clear();
     return dst.string();
 }
 
@@ -494,21 +536,32 @@ LocalFsEventStore::query(const QueryRange& range) {
     return std::make_unique<LocalFsIterator>(std::move(candidates));
 }
 
-void LocalFsEventStore::flush() {
-    for (auto& [key, fp] : files_) {
-        (void)key;
-        if (!fp) {
+bool LocalFsEventStore::flush() {
+    bool all_ok = true;
+    for (auto& [key, sh] : files_) {
+        if (!sh.fp) {
             continue;
         }
-        std::fflush(fp);
-        const int fd = ::fileno(fp);
-        if (fd >= 0) {
-            ::fsync(fd);
+        bool ok = (std::fflush(sh.fp) == 0);
+        const int fd = ::fileno(sh.fp);
+        if (fd >= 0 && ::fsync(fd) != 0) {
+            ok = false;
         }
-        std::fclose(fp);
+        if (!ok) {
+
+            poison_shard_(key);
+        }
+
+        if (std::fclose(sh.fp) != 0) {
+            ok = false;
+        }
+        if (!ok) {
+            all_ok = false;
+        }
     }
     files_.clear();
     pending_bytes_ = 0;
+    return all_ok;
 }
 
 }

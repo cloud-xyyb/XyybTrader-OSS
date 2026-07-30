@@ -1,12 +1,12 @@
 #include "XtHftEngine.h"
 
-#include "xt_backtest/hft/XtHftBacktestExtConfig.h"
 #include "xt_strategy_engine/XtStrategyContext.h"
 #include "xt_strategy_engine/XtStrategyBase.h"
 #include "xt_core/market/XtTickConvert.h"
 #include "xt_util/time/CtHHMM.h"
 #include "xt_core/session/XtSessionFilter.h"
 #include "xt_identity/StrategySidRegistry.h"
+#include "xt_identity/OrderAttributionStore.h"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +28,7 @@
 #include "xt_core/XtFixedPoint.h"
 #include "xt_core/order/XtOrderLifecycle.h"
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "xt_strategy_engine/IStrategyExecSink.h"
 #include "xt_util/time/XtSteadyClock.h"
@@ -40,24 +41,31 @@
 
 namespace {
 
-std::atomic<uint64_t> g_strategy_exception_total_{0};
-
 template<typename Fn>
-bool exec_guard(const char* stage, Fn&& fn) {
-    return xt_log::run_guarded("XtHftEngine", stage, g_strategy_exception_total_,
-                               std::forward<Fn>(fn));
+bool exec_guard(const char* stage, std::atomic<uint64_t>& counter, Fn&& fn) {
+    return xt_log::run_guarded("XtHftEngine", stage, counter, std::forward<Fn>(fn));
 }
 
 template<typename Fn>
 bool exec_guard_ctx(const char* stage,
                     std::size_t ctx_idx,
                     const std::string& sid,
+                    std::atomic<uint64_t>& counter,
                     Fn&& fn) noexcept {
     return xt_log::run_guarded("XtHftEngine", stage,
-                               xt_log::guard_item(ctx_idx, sid.c_str(),
-                                                  &g_strategy_exception_total_),
+                               xt_log::guard_item(ctx_idx, sid.c_str(), &counter),
                                std::forward<Fn>(fn));
 }
+
+/// @brief 最小 RAII scope guard：析构（任何退出路径）执行 fn。
+/// @note 析构 noexcept —— fn 须自吞异常（内部 try/catch）以保栈展开安全。
+template<typename Fn>
+struct ScopeGuard {
+    Fn fn;
+    ~ScopeGuard() noexcept { fn(); }
+};
+template<typename Fn>
+ScopeGuard<Fn> make_scope_guard(Fn&& fn) { return ScopeGuard<Fn>{std::forward<Fn>(fn)}; }
 
 void sync_runtime_clock(xt_strategy_engine::XtRuntimeView& view,
                         bool has_last_tick,
@@ -78,108 +86,206 @@ void sync_runtime_clock(xt_strategy_engine::XtRuntimeView& view,
 
 }
 
-XtHftEngine::XtHftEngine(XtStrategyBase* stra, const Config& cfg)
-    : stra_(stra)
-    , gateway_(cfg.gateway)
-    , runtime_view_(cfg.view) {
+XtHftEngine::XtHftEngine(Dependencies deps,
+                         Options opts,
+                         std::vector<std::unique_ptr<XtStrategyContext>> contexts,
+                         Hooks hooks)
+    : gateway_(deps.gateway)
+    , runtime_view_(deps.view) {
+    if (!gateway_ || !runtime_view_) {
+        throw std::invalid_argument(
+            "XtHftEngine: gateway and view are required dependencies");
+    }
 
-    assert(gateway_      && "XtHftEngine: gateway must not be null");
-    assert(runtime_view_ && "XtHftEngine: view must not be null");
-    init_(cfg);
+    slots_.reserve(contexts.size());
+    for (auto& ctx : contexts) {
+
+        if (ctx) ctx->ensure_sid_resolved();
+        slots_.push_back(ContextSlot{std::move(ctx), false});
+    }
+    validate_assembly_(opts, hooks);
+
+    session_ = opts.session;
+    roll_    = XtRollEngine(opts.roll);
+    unmatched_routing_          = opts.unmatched_routing;
+    conditional_orders_enabled_ = opts.conditional_orders_enabled;
+    apply_replay_ext_(opts.replay);
+
+    account_store_       = deps.account_store;
+    order_book_          = deps.order_book;
+    catalog_             = deps.catalog;
+    declared_registry_   = deps.declared_registry;
+    order_id_translator_ = deps.order_id_translator;
+
+    observers_                = std::move(hooks.observers);
+    fill_realized_cb_         = std::move(hooks.fill_realized);
+    cash_reanchor_probe_      = std::move(hooks.cash_reanchor);
+    mark_tick_cb_             = std::move(hooks.mark_tick);
+    trade_excursion_cb_       = std::move(hooks.trade_excursion);
+    on_params_extra_          = std::move(hooks.on_params_extra);
+    on_strategy_init_failure_ = std::move(hooks.on_strategy_init_failure);
+    lifecycle_.init(std::move(hooks.lifecycle));
+
+    XtLogger::set_throttle_ms("unmatched_sid_recovered", 60000);
+    XtLogger::set_throttle_ms("engine_pre_start_drop", 60000);
+}
+
+void XtHftEngine::validate_assembly_(const Options& opts, const Hooks& hooks) const {
+    auto fail = [](const std::string& why) {
+        throw std::invalid_argument("XtHftEngine assembly: " + why);
+    };
+
+    if (slots_.empty()) fail("contexts must not be empty");
+
+    for (std::size_t i = 0; i < hooks.observers.size(); ++i) {
+        const auto* obs = hooks.observers[i];
+        if (!obs) fail("hooks.observers[" + std::to_string(i) + "] is null");
+        for (std::size_t j = 0; j < i; ++j) {
+            if (hooks.observers[j] == obs) {
+                fail("hooks.observers[" + std::to_string(i) + "] duplicates index " +
+                     std::to_string(j) + " (would fan out the same observer twice)");
+            }
+        }
+    }
+
+    std::unordered_set<std::string> seen_ids;
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        const auto* ctx = slots_[i].ctx.get();
+        if (!ctx) fail("contexts[" + std::to_string(i) + "] is null");
+        const std::string& sid = ctx->strategy_id();
+        if (sid.empty()) fail("contexts[" + std::to_string(i) + "] has empty strategy_id");
+
+        if (sid[0] == '_') {
+            fail("strategy_id '" + sid +
+                 "' uses the reserved '_' namespace ({_global, _default, _manual})");
+        }
+        if (!seen_ids.insert(sid).second) {
+            fail("duplicate strategy_id '" + sid + "' (routing demux key must be unique)");
+        }
+        if (ctx->conditional_orders_enabled() != opts.conditional_orders_enabled) {
+            fail("conditional_orders switch mismatch on strategy '" + sid +
+                 "' (engine and context must share the same yaml source)");
+        }
+    }
+
+    const bool is_multi = slots_.size() > 1;
+    if (!is_multi && opts.unmatched_routing != UnmatchedRoutingPolicy::WarnAndDrop) {
+        fail("non-default unmatched routing policy requires multiple contexts "
+             "(single-context routing never reaches the unmatched branch)");
+    }
+    if (is_multi) {
+
+        for (const auto& slot : slots_) {
+            if (slot.ctx->resolved_sid_id() == xt_identity::StrategySidRegistry::kNoSidId) {
+                fail("unresolved sid on strategy '" + slot.ctx->strategy_id() +
+                     "' (register it in the global StrategySidRegistry before assembly)");
+            }
+        }
+    }
 }
 
 XtHftEngine::~XtHftEngine() = default;
 
-void XtHftEngine::on_init() {
-    assert(!contexts_.empty() && "XtHftEngine::on_init called before init_/add_context");
+XtHftEngine::StartReport XtHftEngine::start() {
 
-    for (auto& ctx : contexts_) {
-        exec_guard("strategy.on_init", [&]() { ctx->on_init(); });
+    if (started_) {
+        throw std::logic_error("XtHftEngine::start called more than once");
     }
+    started_ = true;
+
+    StartReport report;
+
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        const bool ok = exec_guard_ctx("strategy.on_init", i, slots_[i].ctx->strategy_id(),
+                                       strategy_exception_total_,
+                                       [&]() { slots_[i].ctx->on_init(); });
+        if (ok) continue;
+        report.failures.push_back(
+            StrategyStartFailure{slots_[i].ctx->resolved_sid_id(),
+                                 slots_[i].ctx->strategy_id()});
+        disable_context_(i);
+    }
+    report.all_started = report.failures.empty();
+    return report;
 }
 
-void XtHftEngine::init_(const Config& cfg) {
-    session_ = cfg.session;
-    roll_    = XtRollEngine(cfg.roll);
-
-    if (auto* vc = runtime_view_->market_cache()) {
-        xt_runtime::XtRuntimeMarketCacheConfig mc_cfg;
-        mc_cfg.tick_history_cap      = cfg.history_ticks;
-        mc_cfg.bar_history_cap       = cfg.history_bars;
-        mc_cfg.orderflow_history_cap = cfg.history_ticks;
-
-        vc->configure(mc_cfg);
-    }
-
-    account_store_       = cfg.account_store;
-    order_book_          = cfg.order_book;
-    catalog_             = cfg.catalog;
-    declared_registry_   = cfg.declared_registry;
-    kill_switch_sink_    = cfg.kill_switch_sink;
-    order_id_translator_ = cfg.order_id_translator;
-    strict_unmatched_routing_ = cfg.strict_unmatched_routing;
-    conditional_orders_enabled_ = cfg.conditional_orders_enabled;
-    on_params_extra_     = cfg.on_params_extra;
-
-    XtLogger::set_throttle_ms("unmatched_sid_recovered", 60000);
+void XtHftEngine::note_pre_start_drop_(const char* entry) noexcept {
+    pre_start_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+    XtLogger::error_mt("XtHftEngine", "engine_pre_start_drop",
+                       "runtime event '{}' arrived before start() — dropped (total={})",
+                       entry ? entry : "",
+                       static_cast<unsigned long long>(
+                           pre_start_dropped_total_.load(std::memory_order_relaxed)));
 }
 
-void XtHftEngine::configure_backtest_ext(const xt_backtest::hft::XtHftBacktestExtConfig& ext) {
+void XtHftEngine::disable_context_(std::size_t i) {
+    if (i >= slots_.size()) return;
+    if (slots_[i].disabled) return;
+    slots_[i].disabled = true;
+    strategy_init_failure_total_.fetch_add(1, std::memory_order_relaxed);
+    const std::string& name = slots_[i].ctx->strategy_id();
+    const uint32_t sid_id = slots_[i].ctx->resolved_sid_id();
+    XtLogger::critical(
+        "[ENGINE] strategy '{}' (sid_id={}) on_init 失败 — fail-closed disabled："
+        "后续所有回调 fan-out 跳过该策略；兄弟策略不受影响。若该策略有恢复持仓则无人管理，"
+        "需 operator 处置。",
+        name.c_str(), sid_id);
+    if (on_strategy_init_failure_) on_strategy_init_failure_(sid_id, name);
+}
+
+void XtHftEngine::apply_replay_ext_(const ReplayExt& ext) {
     calendar_filter_ = ext.calendar_filter;
     if (ext.session_offset_minutes > 0) {
         td_infer_.init(ext.session_offset_minutes, ext.next_trading_day);
     }
 }
 
-void XtHftEngine::set_exec_sinks(
-    xt_strategy_engine::IStrategyExecSink* fallback,
-    std::vector<xt_strategy_engine::IStrategyExecSink*> sinks) {
-
-    if (sinks.size() >= 2) {
-
-        if (sinks.size() != contexts_.size()) {
-            throw std::logic_error(
-                "XtHftEngine::set_exec_sinks: sinks/contexts size mismatch (sinks=" +
-                std::to_string(sinks.size()) + ", contexts=" +
-                std::to_string(contexts_.size()) + ")");
-        }
-        for (const auto& ctx : contexts_) {
-            if (ctx && ctx->resolved_sid_id() == xt_identity::StrategySidRegistry::kNoSidId) {
-                throw std::logic_error(
-                    "XtHftEngine::set_exec_sinks: multi exec sinks require every context sid "
-                    "registered in the global StrategySidRegistry before add_context; "
-                    "unresolved sid on strategy '" + ctx->strategy_id() + "'");
-            }
-        }
-    }
-    exec_sink_ = fallback;
-    exec_sinks_ = std::move(sinks);
-}
-
-void XtHftEngine::init_lifecycle_telemetry(LifecycleTelemetryInit init) {
-    lifecycle_.init(std::move(init));
-}
-
-void XtHftEngine::add_context(std::unique_ptr<XtStrategyContext> ctx) {
-    assert(ctx && "add_context requires non-null XtStrategyContext");
-    if (!active_ctx_) {
-        active_ctx_ = ctx.get();
-    }
-    contexts_.push_back(std::move(ctx));
-
-    contexts_.back()->ensure_sid_resolved();
-}
-
-XtStrategyContext* XtHftEngine::context(std::size_t idx) noexcept {
-    return idx < contexts_.size() ? contexts_[idx].get() : nullptr;
-}
-
 const XtStrategyContext* XtHftEngine::context(std::size_t idx) const noexcept {
-    return idx < contexts_.size() ? contexts_[idx].get() : nullptr;
+    return idx < slots_.size() ? slots_[idx].ctx.get() : nullptr;
+}
+
+bool XtHftEngine::set_strategy_control_enabled(const std::string& strategy_id, bool enabled) {
+    if (strategy_id.empty()) return false;
+    bool matched = false;
+
+    for (auto& slot : slots_) {
+        if (!slot.ctx || slot.ctx->strategy_id() != strategy_id) continue;
+        slot.ctx->set_control_enabled(enabled);
+        matched = true;
+    }
+    return matched;
+}
+
+void XtHftEngine::restore_strategy_userdata(
+    const std::function<bool(const std::string&, std::unordered_map<std::string, std::string>&)>&
+        loader) {
+    if (!loader) return;
+    for (auto& slot : slots_) {
+        if (!slot.ctx) continue;
+        std::unordered_map<std::string, std::string> kv;
+        if (loader(slot.ctx->strategy_id(), kv)) slot.ctx->restore_userdata(std::move(kv));
+    }
+}
+
+void XtHftEngine::dump_strategy_userdata(
+    const std::function<void(const std::string&, std::unordered_map<std::string, std::string>)>&
+        writer) const {
+    if (!writer) return;
+    for (const auto& slot : slots_) {
+        if (!slot.ctx) continue;
+        writer(slot.ctx->strategy_id(), slot.ctx->snapshot_userdata());
+    }
+}
+
+void XtHftEngine::drain_all_strategy_metrics(
+    std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>>& out) {
+    for (auto& slot : slots_) {
+        if (!slot.ctx) continue;
+        out.emplace_back(slot.ctx->strategy_id(), slot.ctx->drain_strategy_metrics());
+    }
 }
 
 void XtHftEngine::apply_strategy_tick_state_(const XtTick& tick) {
-    gateway_->apply_market_tick(tick.code, tick.price_fp);
     if (account_store_) {
         account_store_->apply(XtAccountEvent::market_tick(tick.code, tick.price_fp));
     }
@@ -195,15 +301,22 @@ bool XtHftEngine::prepare_cycle_(XtTick& tick) {
     if (trading_date == 0) {
         trading_date = xt_tick_convert::trading_date(tick);
     }
-    if (calendar_filter_ && !calendar_filter_(trading_date)) return false;
+    if (calendar_filter_ && !calendar_filter_(trading_date)) { ++drops_.calendar; return false; }
 
     check_roll_change_(trading_date);
 
     const XtTick& prev_snapshot = has_last_any_core_tick_ ? last_any_core_tick_ : tick;
-    if (!update_session_state_(trading_date, tick.action_time, prev_snapshot)) return false;
+
+    if (!update_session_state_(trading_date, tick.action_time, prev_snapshot)) {
+        ++drops_.session;
+        return false;
+    }
 
     update_market_state_(tick);
-    gateway_->advance_clock(xt_tick_convert::trading_date(tick), tick.action_time);
+
+    gateway_->advance_clock(tick.action_date != 0 ? tick.action_date
+                                                  : xt_tick_convert::trading_date(tick),
+                            tick.action_time, xt_tick_convert::trading_date(tick));
     apply_strategy_tick_state_(tick);
 
     if (mark_tick_cb_) mark_tick_cb_(tick);
@@ -213,12 +326,13 @@ bool XtHftEngine::prepare_cycle_(XtTick& tick) {
 void XtHftEngine::dispatch_tick_to_contexts_(const XtTick& tick,
                                              const char* stage,
                                              const char* error_message) {
-    const std::size_t ctx_n = contexts_.size();
+    const std::size_t ctx_n = slots_.size();
     bool dispatch_ok = true;
     for (std::size_t i = 0; i < ctx_n; ++i) {
+        if (is_ctx_disabled_(i)) continue;
         dispatch_ok =
-            exec_guard_ctx(stage, i, contexts_[i]->strategy_id(),
-                           [&]() { contexts_[i]->dispatch_tick(tick); }) &&
+            exec_guard_ctx(stage, i, slots_[i].ctx->strategy_id(), strategy_exception_total_,
+                           [&]() { slots_[i].ctx->dispatch_tick(tick); }) &&
             dispatch_ok;
     }
     if (!dispatch_ok) {
@@ -227,18 +341,20 @@ void XtHftEngine::dispatch_tick_to_contexts_(const XtTick& tick,
 }
 
 void XtHftEngine::check_conditional_stops_(const XtTick& tick) {
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        if (!contexts_[i]->has_armed_stops()) continue;
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (is_ctx_disabled_(i)) continue;
+        if (!slots_[i].ctx->has_armed_stops()) continue;
 
-        (void)exec_guard_ctx("strategy.check_stops", i, contexts_[i]->strategy_id(),
-                             [&]() { contexts_[i]->check_conditional_orders(tick); });
+        (void)exec_guard_ctx("strategy.check_stops", i, slots_[i].ctx->strategy_id(),
+                             strategy_exception_total_,
+                             [&]() { slots_[i].ctx->check_conditional_orders(tick); });
     }
 }
 
 void XtHftEngine::notify_stops_for_update_(const XtOrderExecUpdate& upd,
                                            uint32_t book_sid_hint) {
-    if (contexts_.size() == 1) {
-        contexts_[0]->notify_order_update_for_stops(upd);
+    if (slots_.size() == 1) {
+        if (!is_ctx_disabled_(0)) slots_[0].ctx->notify_order_update_for_stops(upd);
         return;
     }
 
@@ -246,8 +362,8 @@ void XtHftEngine::notify_stops_for_update_(const XtOrderExecUpdate& upd,
         upd.sid_id != xt_identity::StrategySidRegistry::kNoSidId ? upd.sid_id
                                                                  : book_sid_hint;
     const std::size_t idx = find_ctx_idx_by_sid_id_(effective_sid);
-    if (idx < contexts_.size()) {
-        contexts_[idx]->notify_order_update_for_stops(upd);
+    if (idx < slots_.size() && !is_ctx_disabled_(idx)) {
+        slots_[idx].ctx->notify_order_update_for_stops(upd);
     }
 }
 
@@ -260,7 +376,7 @@ void XtHftEngine::drain_order_updates_() {
 }
 
 void XtHftEngine::run_tick_cycle_(XtTick tick) {
-    assert(active_ctx_ && gateway_);
+    assert(!slots_.empty() && gateway_);
 
     if (!prepare_cycle_(tick)) return;
 
@@ -291,8 +407,9 @@ bool XtHftEngine::roll_accepts_tick_(const XtTick& tick) const {
 }
 
 void XtHftEngine::on_tick(const XtTick& tick) {
-    assert(active_ctx_ && gateway_);
-    if (!roll_accepts_tick_(tick)) return;
+    if (!started_) { note_pre_start_drop_("on_tick"); return; }
+    assert(!slots_.empty() && gateway_);
+    if (!roll_accepts_tick_(tick)) { ++drops_.roll; return; }
 
     if (xt_core::is_enabled(session_)
         && !xt_core::in_session_closed(tick.action_time, session_.sections)) {
@@ -313,10 +430,10 @@ void XtHftEngine::handle_pre_session_tick_(const XtTick& tick) {
             break;
         }
     }
-    if (!is_preopen) return;
+    if (!is_preopen) { ++drops_.session; return; }
 
     const uint32_t trading_date = infer_trading_date_(tick);
-    if (calendar_filter_ && !calendar_filter_(trading_date)) return;
+    if (calendar_filter_ && !calendar_filter_(trading_date)) { ++drops_.calendar; return; }
     check_roll_change_(trading_date);
     update_market_state_(tick);
     dispatch_tick_to_contexts_(tick,
@@ -328,9 +445,11 @@ bool XtHftEngine::update_session_state_(uint32_t session_date, uint32_t action_t
                                         const XtTick& prev_tick) {
 
     auto fan_session_end = [this](uint32_t td) {
-        for (std::size_t i = 0; i < contexts_.size(); ++i) {
-            exec_guard_ctx("strategy.on_session_end", i, contexts_[i]->strategy_id(),
-                           [&]() { contexts_[i]->on_session_end(td); });
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            if (is_ctx_disabled_(i)) continue;
+            exec_guard_ctx("strategy.on_session_end", i, slots_[i].ctx->strategy_id(),
+                           strategy_exception_total_,
+                           [&]() { slots_[i].ctx->on_session_end(td); });
         }
     };
 
@@ -375,12 +494,14 @@ bool XtHftEngine::update_session_state_(uint32_t session_date, uint32_t action_t
 void XtHftEngine::enter_new_session_(uint32_t trading_date, const XtTick& prev_tick) {
     pre_warm_snapshot_(prev_tick);
     trading_date_ = trading_date;
-    if (account_store_) account_store_->apply(XtAccountEvent::session_begin(trading_date));
+    if (account_store_) account_store_->apply(XtAccountEvent::session_begin());
     gateway_->on_session_begin(trading_date);
 
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        exec_guard_ctx("strategy.on_session_begin", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_session_begin(trading_date); });
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_session_begin", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_session_begin(trading_date); });
     }
 }
 
@@ -424,12 +545,17 @@ void XtHftEngine::check_roll_change_(uint32_t trading_date) {
         const int64_t old_price_fp = vc ? vc->last_price_fp(old_sym.c_str()) : 0;
 
         if (conditional_orders_enabled_) {
-            for (auto& c : contexts_) (void)c->clear_stops_for_code(old_sym.c_str());
+            for (std::size_t i = 0; i < slots_.size(); ++i) {
+                if (is_ctx_disabled_(i)) continue;
+                (void)slots_[i].ctx->clear_stops_for_code(old_sym.c_str());
+            }
         }
 
-        for (std::size_t i = 0; i < contexts_.size(); ++i) {
-            exec_guard_ctx("strategy.on_roll", i, contexts_[i]->strategy_id(), [&]() {
-                contexts_[i]->on_roll(old_sym.c_str(),
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            if (is_ctx_disabled_(i)) continue;
+            exec_guard_ctx("strategy.on_roll", i, slots_[i].ctx->strategy_id(),
+                           strategy_exception_total_, [&]() {
+                slots_[i].ctx->on_roll(old_sym.c_str(),
                                       result.primary_symbol.c_str(),
                                       trading_date, old_price_fp);
             });
@@ -438,64 +564,84 @@ void XtHftEngine::check_roll_change_(uint32_t trading_date) {
 }
 
 void XtHftEngine::on_order_queue(const XtOrderQueue& oq) {
-    assert(!contexts_.empty());
+    if (!started_) { note_pre_start_drop_("on_order_queue"); return; }
+    assert(!slots_.empty());
     if (auto* vc = runtime_view_->market_cache()) vc->on_order_queue(oq);
-    const std::size_t ctx_n = contexts_.size();
+    const std::size_t ctx_n = slots_.size();
     for (std::size_t i = 0; i < ctx_n; ++i) {
-        exec_guard_ctx("strategy.on_order_queue", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_order_queue(oq); });
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_order_queue", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_order_queue(oq); });
     }
 }
 
 void XtHftEngine::on_order_detail(const XtOrderDetail& od) {
-    assert(!contexts_.empty());
+    if (!started_) { note_pre_start_drop_("on_order_detail"); return; }
+    assert(!slots_.empty());
     if (auto* vc = runtime_view_->market_cache()) vc->on_order_detail(od);
-    const std::size_t ctx_n = contexts_.size();
+    const std::size_t ctx_n = slots_.size();
     for (std::size_t i = 0; i < ctx_n; ++i) {
-        exec_guard_ctx("strategy.on_order_detail", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_order_detail(od); });
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_order_detail", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_order_detail(od); });
     }
 }
 
 void XtHftEngine::on_transaction(const XtTransaction& tr) {
-    assert(!contexts_.empty());
+    if (!started_) { note_pre_start_drop_("on_transaction"); return; }
+    assert(!slots_.empty());
     if (auto* vc = runtime_view_->market_cache()) vc->on_transaction(tr);
-    const std::size_t ctx_n = contexts_.size();
+    const std::size_t ctx_n = slots_.size();
     for (std::size_t i = 0; i < ctx_n; ++i) {
-        exec_guard_ctx("strategy.on_transaction", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_transaction(tr); });
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_transaction", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_transaction(tr); });
     }
 }
 
 void XtHftEngine::on_channel_ready(const char* channel) {
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        exec_guard_ctx("strategy.on_channel_ready", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_channel_ready(channel); });
+    if (!started_) { note_pre_start_drop_("on_channel_ready"); return; }
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_channel_ready", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_channel_ready(channel); });
     }
 
     for (auto* o : observers_) o->on_channel_ready(channel);
 }
 
 void XtHftEngine::on_channel_lost(const char* channel, int reason) {
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        exec_guard_ctx("strategy.on_channel_lost", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_channel_lost(channel, reason); });
+    if (!started_) { note_pre_start_drop_("on_channel_lost"); return; }
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_channel_lost", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_channel_lost(channel, reason); });
     }
 
     for (auto* o : observers_) o->on_channel_lost(channel, reason);
 }
 
 void XtHftEngine::on_params_updated(uint64_t param_version) {
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        exec_guard_ctx("strategy.on_params_updated", i, contexts_[i]->strategy_id(),
-                       [&]() { contexts_[i]->on_params_updated(param_version); });
+    if (!started_) { note_pre_start_drop_("on_params_updated"); return; }
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (is_ctx_disabled_(i)) continue;
+        exec_guard_ctx("strategy.on_params_updated", i, slots_[i].ctx->strategy_id(),
+                       strategy_exception_total_,
+                       [&]() { slots_[i].ctx->on_params_updated(param_version); });
     }
 
     if (on_params_extra_) on_params_extra_(param_version);
 }
 
 bool XtHftEngine::on_trade(const XtTradeRecord& trade, ITradeGateway::TdState td_state,
-                           int64_t* out_realized_fp, std::string* out_effective_sid) {
+                           int64_t* out_realized_fp, std::string* out_effective_sid,
+                           XtLatencyEligibility elig) {
+    if (!started_) { note_pre_start_drop_("on_trade"); return true; }
 
     if (td_state == ITradeGateway::TdState::Recovering) return true;
 
@@ -509,6 +655,9 @@ bool XtHftEngine::on_trade(const XtTradeRecord& trade, ITradeGateway::TdState td
     if (order_book_) {
         order_book_->on_trade(tr);
         order_book_->track_code(tr.code.c_str());
+
+        if (gateway_ && order_book_->terminal_order_seen(tr.order_id))
+            gateway_->notify_order_terminal(tr.order_id);
     }
 
     const FillPositionBefore pos_before =
@@ -530,17 +679,20 @@ bool XtHftEngine::on_trade(const XtTradeRecord& trade, ITradeGateway::TdState td
 
     emit_fill_telemetry_(tr, pos_before.qty_fp, pos_before.avg_price_fp);
 
-    if (!dispatch_fill_to_strategy_(tr)) {
+    uint64_t logical_order_id = 0;
+    if (!dispatch_fill_to_strategy_(tr, &logical_order_id)) {
         return false;
     }
 
-    for (auto* o : observers_) o->on_trade(tr);
+    for (auto* o : observers_) o->on_trade(tr, elig, logical_order_id);
     return true;
 }
 
 void XtHftEngine::emit_fill_telemetry_(const XtTradeRecord& tr,
                                        int64_t pos_before_qty_fp,
                                        int64_t pos_before_avg_fp) {
+
+    if (tr.sid_id == xt_identity::StrategySidRegistry::kManualSidId) return;
 
     if (!lifecycle_.any_enabled()) return;
 
@@ -581,12 +733,16 @@ void XtHftEngine::emit_trade_excursion_(const XtTradeRecord& tr,
                         fill_realized_fp);
 }
 
-bool XtHftEngine::dispatch_fill_to_strategy_(const XtTradeRecord& tr) {
-    exec_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
+bool XtHftEngine::dispatch_fill_to_strategy_(const XtTradeRecord& tr,
+                                             uint64_t* out_logical_order_id) {
 
     uint32_t sid_id = tr.sid_id;
     if (sid_id == xt_identity::StrategySidRegistry::kNoSidId) {
         sid_id = resolve_fill_sid_id_(tr.strategy_id);
+    }
+
+    if (sid_id != xt_identity::StrategySidRegistry::kManualSidId) {
+        exec_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
     bool skip_unmatched = false;
@@ -595,7 +751,9 @@ bool XtHftEngine::dispatch_fill_to_strategy_(const XtTradeRecord& tr) {
     if (!sink) return true;
 
     XtFillEvent fe = build_strategy_fill_event_(tr);
-    return exec_guard("strategy.on_fill", [&]() {
+
+    if (out_logical_order_id) *out_logical_order_id = fe.order_id;
+    return exec_guard("strategy.on_fill", strategy_exception_total_, [&]() {
         sink->on_fill(fe);
     });
 }
@@ -614,15 +772,15 @@ bool XtHftEngine::handle_unmatched_fill_(const XtTradeRecord& tr) {
         tr.strategy_id.empty() && tr.sid_id == xt_identity::StrategySidRegistry::kNoSidId;
     (fill_no_attribution ? dropped_fill_empty_sid_count_ : dropped_fill_unknown_sid_count_)
         .fetch_add(1, std::memory_order_relaxed);
-    if (strict_unmatched_routing_) {
+    if (unmatched_routing_ != UnmatchedRoutingPolicy::WarnAndDrop) {
 
         XtLogger::error_m("XtHftEngine",
                           "on_trade: STRICT unmatched fill: sid='{}' order_id={} code={} contexts={}",
                           tr.strategy_id.c_str(),
                           static_cast<unsigned long long>(tr.order_id),
                           tr.code.c_str(),
-                          contexts_.size());
-        if (kill_switch_sink_) {
+                          slots_.size());
+        if (unmatched_routing_ == UnmatchedRoutingPolicy::DropAndAlert) {
             XtLogger::warn_m("XtHftEngine",
                              "on_trade: unattributed live fill DROPPED (sid forgotten, likely cancel/fill race); total={}; snapshot/reconcile backstops position",
                              static_cast<unsigned long long>(
@@ -653,37 +811,37 @@ XtFillEvent XtHftEngine::build_strategy_fill_event_(const XtTradeRecord& tr) con
     return fe;
 }
 
-bool XtHftEngine::on_order_update(const XtOrderExecUpdate& upd) {
+bool XtHftEngine::on_order_update(const XtOrderExecUpdate& upd, XtLatencyEligibility elig) {
+    if (!started_) { note_pre_start_drop_("on_order_update"); return true; }
     XtOrderExecUpdate applied_upd = upd;
     const bool is_terminal = order_status_is_final(upd.status);
-    const std::string stp_code = prefetch_terminal_order_code_(applied_upd, is_terminal);
 
     uint32_t stop_sid_hint = 0;
-    if (conditional_orders_enabled_ && contexts_.size() > 1 && order_book_ &&
+    if (conditional_orders_enabled_ && slots_.size() > 1 && order_book_ &&
         upd.sid_id == xt_identity::StrategySidRegistry::kNoSidId) {
         stop_sid_hint = order_book_->order_sid_id(upd.id);
     }
 
     apply_order_update_state_(applied_upd, is_terminal);
 
+    bool terminal_cleanup_done = false;
+    auto terminal_cleanup_guard = make_scope_guard([&]() noexcept {
+        if (!is_terminal || terminal_cleanup_done) return;
+        try { finish_terminal_order_update_(applied_upd); } catch (...) {}
+    });
+
     XtOrderExecUpdate strategy_upd = build_strategy_order_update_(applied_upd);
 
     if (conditional_orders_enabled_) notify_stops_for_update_(strategy_upd, stop_sid_hint);
     if (!dispatch_order_update_to_strategy_(strategy_upd)) return false;
 
-    for (auto* o : observers_) o->on_order_update(strategy_upd);
+    for (auto* o : observers_) o->on_order_update(strategy_upd, elig);
 
-    if (is_terminal) finish_terminal_order_update_(applied_upd, stp_code);
+    if (is_terminal) {
+        finish_terminal_order_update_(applied_upd);
+        terminal_cleanup_done = true;
+    }
     return true;
-}
-
-std::string XtHftEngine::prefetch_terminal_order_code_(const XtOrderExecUpdate& upd,
-                                                       bool is_terminal) {
-    if (!is_terminal || !order_book_) return {};
-
-    XtOrderExecUpdate dummy;
-    dummy.id = upd.id;
-    return order_book_->resolve_order_code_on_update(dummy);
 }
 
 void XtHftEngine::apply_order_update_state_(const XtOrderExecUpdate& applied_upd,
@@ -708,13 +866,16 @@ XtOrderExecUpdate XtHftEngine::build_strategy_order_update_(
 }
 
 bool XtHftEngine::dispatch_order_update_to_strategy_(const XtOrderExecUpdate& strategy_upd) {
-    exec_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
+
+    if (strategy_upd.sid_id != xt_identity::StrategySidRegistry::kManualSidId) {
+        exec_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
+    }
     bool order_skip_unmatched = false;
     auto* order_sink = select_routing_sink_(strategy_upd.sid_id, order_skip_unmatched);
     if (order_skip_unmatched) return handle_unmatched_order_update_(strategy_upd);
     if (!order_sink) return true;
 
-    return exec_guard("strategy.on_order", [&]() {
+    return exec_guard("strategy.on_order", strategy_exception_total_, [&]() {
         order_sink->on_order(strategy_upd);
     });
 }
@@ -729,13 +890,13 @@ bool XtHftEngine::handle_unmatched_order_update_(const XtOrderExecUpdate& strate
     const char* upd_sid_disp =
         xt_identity::StrategySidRegistry::resolve_sid_cstr_or_null(strategy_upd.sid_id);
     if (!upd_sid_disp) upd_sid_disp = "";
-    if (strict_unmatched_routing_) {
+    if (unmatched_routing_ != UnmatchedRoutingPolicy::WarnAndDrop) {
         XtLogger::error_m("XtHftEngine",
                           "on_order_update: STRICT unmatched order rtn: sid='{}' order_id={} contexts={}",
                           upd_sid_disp,
                           static_cast<unsigned long long>(strategy_upd.id),
-                          contexts_.size());
-        if (kill_switch_sink_) {
+                          slots_.size());
+        if (unmatched_routing_ == UnmatchedRoutingPolicy::DropAndAlert) {
             XtLogger::warn_m("XtHftEngine",
                              "on_order_update: unattributed live order rtn DROPPED (sid forgotten, likely cancel/fill race); total={}; reconcile backstops",
                              static_cast<unsigned long long>(
@@ -757,12 +918,17 @@ bool XtHftEngine::handle_unmatched_order_update_(const XtOrderExecUpdate& strate
     return true;
 }
 
-void XtHftEngine::finish_terminal_order_update_(const XtOrderExecUpdate& applied_upd,
-                                                const std::string& stp_code) {
-    if (order_id_translator_) order_id_translator_->cleanup_done();
-    if (!stp_code.empty()) {
-        gateway_->notify_order_terminal(stp_code.c_str(), applied_upd.is_buy);
+void XtHftEngine::finish_terminal_order_update_(const XtOrderExecUpdate& applied_upd) {
+
+    if (applied_upd.sid_id == xt_identity::StrategySidRegistry::kManualSidId) {
+        XtLogger::info_m("XtHftEngine",
+                         "panel.manual_order terminal: order_id={} status={}",
+                         static_cast<unsigned long long>(applied_upd.id),
+                         static_cast<int>(applied_upd.status));
     }
+    if (order_id_translator_) order_id_translator_->cleanup_done();
+
+    gateway_->notify_order_terminal(applied_upd.id);
     gateway_->record_order_terminal(applied_upd.status);
     gateway_->erase_order_tracking(applied_upd.id);
 }
@@ -773,6 +939,7 @@ void XtHftEngine::on_position_snapshot(
     bool is_cold_start,
     uint32_t session_gen)
 {
+    if (!started_) { note_pre_start_drop_("on_position_snapshot"); return; }
     const bool is_recovery = (td_state == ITradeGateway::TdState::Recovering);
 
     for (auto* o : observers_) o->on_position_snapshot_begin(is_recovery);
@@ -815,6 +982,7 @@ void XtHftEngine::on_reverse_sync_batch(
     const std::vector<AliveInflightOrder>& orders,
     bool is_cold_start)
 {
+    if (!started_) { note_pre_start_drop_("on_reverse_sync_batch"); return; }
 
     (void)is_cold_start;
 
@@ -825,7 +993,13 @@ void XtHftEngine::on_reverse_sync_batch(
             account_store_->snapshot_position(code),
             is_buy_to_close);
     };
-    order_book_->fillup_alive_inflight_orders_batch(orders, view_for);
+
+    std::vector<xt_runtime::order::AcceptedRearmOrder> accepted;
+    order_book_->fillup_alive_inflight_orders_batch(orders, view_for, &accepted);
+
+    if (gateway_)
+        for (const auto& a : accepted)
+            gateway_->rearm_active_order(a.code, a.id, a.is_buy, a.price_fp);
 
     last_reverse_sync_steady_ms_ =
         static_cast<int64_t>(XtSteadyClock::steady_now_ms());
@@ -834,17 +1008,41 @@ void XtHftEngine::on_reverse_sync_batch(
 size_t XtHftEngine::reap_recovered_orphans(int64_t now_ms,
                                            int64_t grace_ms,
                                            size_t max_cancels) {
-    if (!order_book_ || !gateway_ || max_cancels == 0) return 0;
+
+    if (!started_) { note_pre_start_drop_("reap_recovered_orphans"); return 0; }
+    if (!order_book_) return 0;
+
+    order_book_->sweep_stale_pre_registration();
+    if (!gateway_ || max_cancels == 0) return 0;
 
     if (last_reverse_sync_steady_ms_ == 0 ||
         now_ms - last_reverse_sync_steady_ms_ < grace_ms) {
         return 0;
     }
 
+    if (xt_identity::OrderAttributionStore::order_sid_journal_degraded()) {
+        const uint64_t suppressed =
+            orphan_reap_suppressed_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        constexpr uint64_t kLogEvery = 128;
+        if (suppressed == 1 || (suppressed % kLogEvery) == 0) {
+            XtLogger::critical(
+                "[RT] orphan reap 已切告警-only：归属 journal 持久化降级"
+                "（journal_failures={}），recovered-unowned 单保留不撤，需 operator 处置"
+                "（suppressed_sweeps={}）",
+                xt_identity::OrderAttributionStore::order_sid_journal_failure_count(),
+                suppressed);
+        }
+        return 0;
+    }
+
     std::array<uint64_t, 256> ids{};
 
+    std::vector<uint64_t> reaped;
     const size_t n = order_book_->reap_recovered_unowned(
-        ids.data(), std::min(max_cancels, ids.size()));
+        ids.data(), std::min(max_cancels, ids.size()), &reaped);
+
+    for (uint64_t id : reaped) gateway_->notify_order_terminal(id);
     if (n == 0) return 0;
 
     size_t issued = 0;
@@ -860,21 +1058,39 @@ size_t XtHftEngine::reap_recovered_orphans(int64_t now_ms,
 }
 
 size_t XtHftEngine::reconcile_lost_terminals(size_t max) {
+
+    if (!started_) { note_pre_start_drop_("reconcile_lost_terminals"); return 0; }
     if (!order_book_ || !gateway_ || max == 0) return 0;
 
-    std::array<XtOrderExecUpdate, 256> open{};
-    const size_t n = order_book_->collect_open_orders(
-        open.data(), std::min(max, open.size()));
+    std::array<XtOrderExecUpdate, xt_runtime::order::kOrderSnapshotMaxOrders> open{};
+    const size_t n = order_book_->collect_open_orders(open.data(), open.size());
     size_t healed = 0;
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n && healed < max; ++i) {
         const uint64_t id = open[i].id;
         if (id == 0) continue;
 
-        if (!gateway_->is_order_terminal(id)) continue;
+        XtOrderTerminalRecord rec{};
+        const bool has_payload = gateway_->lookup_terminal(id, rec);
+        if (!has_payload && !gateway_->is_order_terminal(id)) continue;
 
         XtOrderExecUpdate term = open[i];
-        term.status = XtOrderStatus::Canceled;
-        on_order_update(term);
+        if (has_payload) {
+            term.status = rec.status;
+            if (rec.status == XtOrderStatus::Filled) {
+                term.filled_fp = (rec.filled_fp > 0 && rec.filled_fp <= term.qty_fp)
+                                     ? rec.filled_fp
+                                     : term.qty_fp;
+                term.leaves_fp = 0;
+            } else if (rec.filled_fp >= 0) {
+                term.filled_fp = std::min<int64_t>(rec.filled_fp, term.qty_fp);
+                term.leaves_fp = std::max<int64_t>(0, term.qty_fp - term.filled_fp);
+            }
+
+        } else {
+            term.status = XtOrderStatus::Canceled;
+        }
+
+        on_order_update(term, XtLatencyEligibility::kIneligible);
         ++healed;
     }
     if (healed > 0) {
@@ -898,10 +1114,10 @@ void XtHftEngine::emit_resume_for_recovery_(
 {
 
     std::vector<xt_engine::hft::HftLifecycleTelemetry::ResumeEntry> entries;
-    if (declared_registry_ && exec_sinks_.size() == contexts_.size() && !contexts_.empty()) {
+    if (declared_registry_ && !slots_.empty()) {
 
-        for (std::size_t i = 0; i < contexts_.size(); ++i) {
-            const std::string& sid = contexts_[i]->strategy_id();
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            const std::string& sid = slots_[i].ctx->strategy_id();
             if (sid.empty()) continue;
             const auto declared = declared_registry_->declared_symbols(sid);
             for (const auto& p : positions) {
@@ -913,9 +1129,9 @@ void XtHftEngine::emit_resume_for_recovery_(
                 entries.push_back({sid, p.code, pm.qty, pm.avg_price});
             }
         }
-    } else if (!contexts_.empty()) {
+    } else if (!slots_.empty()) {
 
-        const std::string& sid = contexts_[0]->strategy_id();
+        const std::string& sid = slots_[0].ctx->strategy_id();
         if (sid.empty()) return;
         for (const auto& p : positions) {
             if (p.code.empty()) continue;
@@ -931,6 +1147,7 @@ void XtHftEngine::emit_resume_for_recovery_(
 }
 
 void XtHftEngine::on_account_snapshot(const ITradeGateway::AccountSnapshot& snap) {
+    if (!started_) { note_pre_start_drop_("on_account_snapshot"); return; }
     if (!account_store_) return;
 
     if (std::isfinite(snap.balance)) {
@@ -960,55 +1177,80 @@ void XtHftEngine::on_account_snapshot(const ITradeGateway::AccountSnapshot& snap
     const auto am = account_store_->snapshot_account();
 
     const XtAccountUpdate acct_upd{am.cash, am.equity, am.unrealized_pnl};
-    if (!exec_sinks_.empty()) {
-        for (auto* b : exec_sinks_) {
-            if (!b) continue;
-            exec_guard("strategy.on_account", [&]() { b->on_account(acct_upd); });
-        }
-    } else if (exec_sink_) {
-        exec_guard("strategy.on_account", [&]() { exec_sink_->on_account(acct_upd); });
+
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        auto* b = sink_at_(i);
+        if (!b || is_ctx_disabled_(i)) continue;
+        exec_guard("strategy.on_account",
+                   strategy_exception_total_, [&]() { b->on_account(acct_upd); });
     }
 
     for (auto* o : observers_) o->on_account_snapshot(snap, am);
 }
 
 void XtHftEngine::on_daily_settlement(const ITradeGateway::DailySettlementDelta& delta) {
+    if (!started_) { note_pre_start_drop_("on_daily_settlement"); return; }
     if (!account_store_) return;
     account_store_->apply(XtAccountEvent::daily_settlement(xt_fp::to_fp(delta.realized_delta),
                                                            xt_fp::to_fp(delta.fee)));
 }
 
 void XtHftEngine::on_cash_transfer(const ITradeGateway::CashTransferDelta& delta) {
+    if (!started_) { note_pre_start_drop_("on_cash_transfer"); return; }
     if (!account_store_) return;
     account_store_->apply(XtAccountEvent::cash_transfer(xt_fp::to_fp(delta.amount)));
 }
 
 std::size_t XtHftEngine::find_ctx_idx_by_sid_id_(uint32_t sid_id) const noexcept {
-    for (std::size_t i = 0; i < contexts_.size(); ++i) {
-        if (contexts_[i] && contexts_[i]->resolved_sid_id() == sid_id) return i;
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        if (slots_[i].ctx && slots_[i].ctx->resolved_sid_id() == sid_id) return i;
     }
-    return contexts_.size();
+    return slots_.size();
+}
+
+xt_strategy_engine::IStrategyExecSink* XtHftEngine::sink_at_(std::size_t i) const noexcept {
+    return i < slots_.size()
+        ? static_cast<xt_strategy_engine::IStrategyExecSink*>(slots_[i].ctx.get())
+        : nullptr;
 }
 
 xt_strategy_engine::IStrategyExecSink* XtHftEngine::select_routing_sink_(uint32_t sid_id,
                                                    bool& skip_unmatched) const noexcept {
     skip_unmatched = false;
-    if (exec_sinks_.empty()) return exec_sink_;
-    if (contexts_.size() <= 1) return exec_sinks_[0];
+
+    if (sid_id == xt_identity::StrategySidRegistry::kManualSidId) {
+        return nullptr;
+    }
+
+    if (slots_.size() <= 1) {
+        if (is_ctx_disabled_(0)) return nullptr;
+        return sink_at_(0);
+    }
 
     if (sid_id == xt_identity::StrategySidRegistry::kNoSidId) {
         skip_unmatched = true;
         return nullptr;
     }
     const std::size_t idx = find_ctx_idx_by_sid_id_(sid_id);
-    if (idx >= contexts_.size() || idx >= exec_sinks_.size()) {
+    if (idx >= slots_.size()) {
         skip_unmatched = true;
         return nullptr;
     }
-    return exec_sinks_[idx];
+    if (is_ctx_disabled_(idx)) return nullptr;
+    return sink_at_(idx);
 }
 
 bool XtHftEngine::recover_missing_fill_sid_(XtTradeRecord& tr) {
+
+    if (tr.sid_id != xt_identity::StrategySidRegistry::kNoSidId) {
+        if (tr.strategy_id.empty()) {
+            if (const char* s = xt_identity::StrategySidRegistry::resolve_sid_cstr_or_null(
+                    tr.sid_id)) {
+                tr.strategy_id = s;
+            }
+        }
+        return false;
+    }
     if (!tr.strategy_id.empty()) return false;
 
     std::string recovered = effective_sid_(tr.strategy_id, tr.code);
@@ -1038,9 +1280,9 @@ void XtHftEngine::record_recovered_fill_sid_(const XtTradeRecord& tr,
 std::string XtHftEngine::effective_sid_(const std::string& sid, const std::string& code) {
     if (!sid.empty()) return sid;
 
-    if (contexts_.size() == 1) return contexts_[0]->strategy_id();
+    if (slots_.size() == 1) return slots_[0].ctx->strategy_id();
 
-    if (!declared_registry_ || contexts_.size() <= 1 || code.empty()) return sid;
+    if (!declared_registry_ || slots_.size() <= 1 || code.empty()) return sid;
     if (!code_to_sid_built_) build_code_to_sid_();
     auto it = code_to_sid_.find(code);
     if (it != code_to_sid_.end() && !it->second.empty()) return it->second;
@@ -1052,9 +1294,9 @@ void XtHftEngine::build_code_to_sid_() {
     code_to_sid_.clear();
     if (!declared_registry_) { code_to_sid_built_ = true; return; }
     std::unordered_set<std::string> ambiguous;
-    for (const auto& ctx : contexts_) {
-        if (!ctx) continue;
-        const std::string& sid = ctx->strategy_id();
+    for (const auto& slot : slots_) {
+        if (!slot.ctx) continue;
+        const std::string& sid = slot.ctx->strategy_id();
         const auto declared = declared_registry_->declared_symbols(sid);
         for (const auto& code : declared) {
             auto [it, inserted] = code_to_sid_.emplace(code, sid);

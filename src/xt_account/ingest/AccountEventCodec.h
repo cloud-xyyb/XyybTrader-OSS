@@ -24,17 +24,8 @@ inline XtAccountEvent trade_event(const XtTradeRecord& tr) {
 }
 
 inline XtAccountEvent order_event(const XtOrderExecUpdate& upd) {
-    switch (upd.status) {
-    case XtOrderStatus::Filled:
-        return XtAccountEvent::order_filled(upd.id, upd.filled_fp, upd.leaves_fp);
-    case XtOrderStatus::Canceled:
-        return XtAccountEvent::order_canceled(upd.id, upd.filled_fp, upd.leaves_fp);
-    case XtOrderStatus::Rejected:
-        return XtAccountEvent::order_rejected(upd.id, upd.filled_fp, upd.leaves_fp);
-    default:
-        return XtAccountEvent::order_update(upd.id, upd.filled_fp, upd.leaves_fp,
-                                             false);
-    }
+    return XtAccountEvent::order_update(upd.id, upd.filled_fp,
+                                        order_status_is_final(upd.status));
 }
 
 }

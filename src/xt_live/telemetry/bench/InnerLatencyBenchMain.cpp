@@ -1,10 +1,15 @@
-// Inner latency benchmark：默认走完整生产路径，--mock 只测空壳 gateway id++。
-// 用法: xt_inner_latency_bench [samples] [warmup] [mid_price] [qty] [symbol] [--mock] [--per-tick]
+// Inner latency benchmark：默认走完整生产路径，--mock 只测空壳 gateway id++，
+// --queue-hop 只测 SPSC tick 队列 enqueue→dequeue 一跳（ping-pong 口径）。
+// 用法: xt_inner_latency_bench [samples] [warmup] [mid_price] [qty] [symbol] [--mock] [--queue-hop] [--per-tick]
 
 #include "XtStrategyContext.h"
 #include "XtStrategyBase.h"
+#include "xt_core/container/XtLockFreeQueue.h"
+#include "xt_core/market/XtTick.h"
 #include "xt_core/market/XtTickConvert.h"
 #include "xt_core/market/XtRawTick.h"
+
+#include <thread>
 
 #include "XtLiveOrderGateway.h"
 #include "api/ITradeGateway.h"
@@ -30,6 +35,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <string>
@@ -237,6 +243,7 @@ struct BenchComponents {
     std::unique_ptr<xt_account::AccountStoreView>          account_view;
 
     xt_runtime::order::XtOrderRuntimeBook      order_book;
+    XtLiveOrderGateway*                        gateway = nullptr;
 
     void init(double initial_cash, bool futures_mode, double margin_rate,
               const std::string& symbol, double vol_scale) {
@@ -249,7 +256,7 @@ struct BenchComponents {
         acfg.initial_cash = initial_cash;
         acfg.futures_mode = futures_mode;
         acfg.catalog      = &catalog;
-        account_store = xt_account::make_account_state_store(acfg);
+        account_store = std::make_unique<xt_account::AccountStateStore>(acfg);
         account_view  = std::make_unique<xt_account::AccountStoreView>(*account_store);
     }
 
@@ -264,16 +271,20 @@ struct BenchComponents {
         const int64_t eff_fp    = order_lifecycle::effective_remaining_fp(upd);
         account_store->apply(account_event_build::order_event(upd));
         order_book.on_order_update(upd, final_status, eff_fp);
+
+        if (final_status && gateway) {
+            gateway->notify_order_terminal(upd.id);
+            gateway->record_order_terminal(upd.status);
+            gateway->erase_order_tracking(upd.id);
+        }
     }
 
     void on_order_update_batch(const XtOrderExecUpdate* updates, size_t count) {
-        for (size_t i = 0; i < count; ++i) {
-            const XtOrderExecUpdate& upd = updates[i];
-            const bool final_status = order_status_is_final(upd.status);
-            const int64_t eff_fp    = order_lifecycle::effective_remaining_fp(upd);
-            account_store->apply(account_event_build::order_event(upd));
-            order_book.on_order_update(upd, final_status, eff_fp);
-        }
+        for (size_t i = 0; i < count; ++i) on_order_update(updates[i]);
+    }
+
+    void prune_terminal_sidecar() {
+        if (gateway) gateway->prune_terminal_strategy_ids(std::numeric_limits<int64_t>::max());
     }
 };
 
@@ -321,6 +332,7 @@ void run_ticks_totalN_drain(XtStrategyContext& ctx, XtRawTick& tick,
                     drain_buf.push_back(fill);
                 }
                 comps.on_order_update_batch(drain_buf.data(), drain_buf.size());
+                comps.prune_terminal_sidecar();
             } else {
                 for (uint64_t d = 0; d < pending_count; ++d) {
                     XtOrderExecUpdate fill{};
@@ -333,6 +345,7 @@ void run_ticks_totalN_drain(XtStrategyContext& ctx, XtRawTick& tick,
                     fill.close_offset = XtOffset::Open;
                     comps.on_order_update(fill);
                 }
+                comps.prune_terminal_sidecar();
             }
             pending_count = 0;
         }
@@ -365,6 +378,59 @@ void print_results(const char* mode, const std::string& symbol,
                 avg_ns);
     std::printf("throughput: %.0f ticks/sec\n", throughput);
     std::printf("========================================\n");
+}
+
+/// 与 XtHftEventLoop::TickEvent 同 layout 的等价 POD（TickEvent 为私有嵌套类型）。
+struct BenchTickEvent {
+    XtTick core_tick{};
+    uint64_t enqueue_ts_ns = 0;
+};
+
+void run_queue_hop_bench(uint64_t samples, uint64_t warmup) {
+    XtLockFreeQueue<BenchTickEvent> q(QueueMode::SPSC, 65536);
+    std::atomic<uint64_t> consumed{0};
+    std::atomic<bool> stop{false};
+    std::vector<uint64_t> hop_ns;
+    hop_ns.reserve(static_cast<size_t>(samples));
+
+    std::thread consumer([&] {
+        BenchTickEvent batch[256];
+        while (!stop.load(std::memory_order_relaxed)) {
+            const size_t n = q.pop_bulk(batch, 256);
+            if (n == 0) continue;
+            const uint64_t now = now_ns();
+            for (size_t i = 0; i < n; ++i) {
+                if (consumed.load(std::memory_order_relaxed) >= warmup &&
+                    now >= batch[i].enqueue_ts_ns) {
+                    hop_ns.push_back(now - batch[i].enqueue_ts_ns);
+                }
+                consumed.fetch_add(1, std::memory_order_release);
+            }
+        }
+    });
+
+    BenchTickEvent ev{};
+    const uint64_t total = samples + warmup;
+    for (uint64_t i = 0; i < total; ++i) {
+        ev.enqueue_ts_ns = now_ns();
+        while (!q.push(ev)) {}
+
+        while (consumed.load(std::memory_order_acquire) <= i) {}
+    }
+    stop.store(true, std::memory_order_relaxed);
+    consumer.join();
+
+    const BenchStats s = summarize(hop_ns);
+    std::printf("mode=queue_hop event_bytes=%zu samples=%zu warmup=%llu\n",
+                sizeof(BenchTickEvent), hop_ns.size(),
+                static_cast<unsigned long long>(warmup));
+    std::printf("hop_ns min=%llu p50=%llu p95=%llu p99=%llu p999=%llu max=%llu avg=%.1f\n",
+                static_cast<unsigned long long>(s.min_ns),
+                static_cast<unsigned long long>(s.p50_ns),
+                static_cast<unsigned long long>(s.p95_ns),
+                static_cast<unsigned long long>(s.p99_ns),
+                static_cast<unsigned long long>(s.p999_ns),
+                static_cast<unsigned long long>(s.max_ns), s.avg_ns);
 }
 
 void run_mock_bench(uint64_t samples, uint64_t warmup, double mid_price,
@@ -427,6 +493,11 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     gw_cfg.closeout_enabled = false;
     gw_cfg.session_gate_enabled = false;
     gw_cfg.bypass_risk_for_bench = bypass_risk;
+
+    if (bypass_risk) {
+        gw_cfg.stp_enabled = false;
+        gw_cfg.stp_disabled_reason = "bench L2 no-risk baseline: 纯管线口径,显式关 STP";
+    }
     gw_cfg.venue_kind = xt_core::XtVenueKind::FuturesCN;
     gw_cfg.single_threaded_submit = hft_mode;
 
@@ -446,6 +517,7 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
         comps.account_store.get(),
         nullptr, &comps.catalog,
         nullptr,  false);
+    comps.gateway = &order_gw;
 
     BenchTradeGateway mock_td;
     BenchMdGateway mock_md;
@@ -469,6 +541,8 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     auto strategy = std::make_unique<InnerBenchStrategy>(symbol, qty);
     XtStrategyContext::Config ctx_cfg;
     ctx_cfg.strategy = strategy.get();
+    ctx_cfg.strategy_id = "bench";
+
     ctx_cfg.exec_gateway = &order_gw;
     ctx_cfg.runtime_view = &runtime_view;
     XtStrategyContext ctx(ctx_cfg);
@@ -497,7 +571,11 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
         : (hft_mode ? "L3_hft" : "L3_realistic");
     print_results(mode_label,
                   symbol, samples, warmup, submit_ok, submit_fail, t1 - t0);
-    std::fprintf(stderr, "[diag] open_orders_after=%zu\n", comps.order_book.open_order_count());
+
+    std::fprintf(stderr, "[diag] open_orders_after=%zu stp_active_after=%zu sidecar_after=%zu\n",
+                 comps.order_book.open_order_count(),
+                 order_gw.stp_active_order_count(),
+                 order_gw.order_strategy_size());
 
     if (submit_fail > 0) {
         std::printf("\n[reject breakdown]\n");
@@ -520,8 +598,11 @@ int main(int argc, char** argv) {
     const bool use_mock = has_flag(argc, argv, "--mock");
     const bool no_risk = has_flag(argc, argv, "--no-risk");
     const bool hft_mode = has_flag(argc, argv, "--hft");
+    const bool queue_hop = has_flag(argc, argv, "--queue-hop");
 
-    if (use_mock) {
+    if (queue_hop) {
+        run_queue_hop_bench(samples, warmup);
+    } else if (use_mock) {
         run_mock_bench(samples, warmup, mid_price, qty, symbol);
     } else {
         run_realistic_bench(samples, warmup, mid_price, qty, symbol, no_risk, hft_mode);

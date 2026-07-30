@@ -22,9 +22,9 @@ uint64_t TraderBinanceUGateway::Impl::submit_order_inq(
     XtOffset close_offset, ExecFlags exec_flags,
     uint64_t intent_trace_id) {
 	    const StrategySid owner_sid = xt_identity::OrderAttributionStore::consume_thread_submit_strategy_sid();
-	    const uint64_t local_id = local_id_gen_.next();
+	    const uint64_t local_id = local_id_gen_->next();
 
-    if (const uint64_t pf = local_id_gen_.persist_fail_count();
+    if (const uint64_t pf = local_id_gen_->persist_fail_count();
         pf != local_id_persist_fail_seen_.load(std::memory_order_relaxed)) {
         XtLogger::warn_m("BinanceTD",
                          "local-id persist 失败 (count={}); crash 后有 id reissue 风险", pf);
@@ -105,9 +105,10 @@ bool TraderBinanceUGateway::Impl::cancel_order_inq(uint64_t local_id) {
 
 void TraderBinanceUGateway::Impl::emit_through_dedup(
     const XtOrderExecUpdate& upd,
-    EffectiveSignalDedup::Source src) {
+    EffectiveSignalDedup::Source src,
+    XtLatencyEligibility elig) {
     if (!td_cfg.uds_first_effective_ack) {
-        if (cb.on_order_update) cb.on_order_update(upd);
+        if (cb.on_order_update) cb.on_order_update(upd, elig);
         return;
     }
 
@@ -118,7 +119,7 @@ void TraderBinanceUGateway::Impl::emit_through_dedup(
             upd.id, src, upd.status, upd.filled_fp,
             upd.local_cb_us ? upd.local_cb_us : lat_now_us());
     }
-    if (should_emit && cb.on_order_update) cb.on_order_update(upd);
+    if (should_emit && cb.on_order_update) cb.on_order_update(upd, elig);
 }
 
 void TraderBinanceUGateway::Impl::on_uds_order_update(const XtOrderExecUpdate& upd) {
@@ -129,7 +130,9 @@ void TraderBinanceUGateway::Impl::on_uds_order_update(const XtOrderExecUpdate& u
 
     const auto decision = ledger_.on_uds_terminal(upd);
     if (decision.action != BinanceOrderLedger::TerminalDecision::Action::kEmit) return;
-    reconciler_.forward_order_update_gated(upd, EffectiveSignalDedup::Source::kUds);
+
+    reconciler_.forward_order_update_gated(upd, EffectiveSignalDedup::Source::kUds,
+                                           XtLatencyEligibility::kEligible);
 }
 
 void TraderBinanceUGateway::Impl::handle_rejected_ack(const TransportAck& ack,
@@ -204,13 +207,14 @@ void TraderBinanceUGateway::Impl::on_transport_ack(
             trace.t0b_us, trace.t0c_us, trace.t1_us, kLatTraceLogSampleN);
     }
 
-    if (cb.on_transport_ack && ack.local_id != 0 && trace.t1_us > 0) {
-        cb.on_transport_ack(ack.local_id, trace.t1_us);
-    } else if (cb.on_transport_ack_unavailable &&
-               ack.local_id != 0 &&
-               trace.t1_us == 0 &&
-               ack.is_transport_error()) {
-        cb.on_transport_ack_unavailable(ack.local_id, lat_now_us());
+    if (ack.req_kind == TransportAck::ReqKind::kSubmit && ack.local_id != 0) {
+        if (ack.timing_origin == TransportAck::TimingOrigin::kVenueResponse) {
+            if (cb.on_transport_ack && trace.t1_us > 0) {
+                cb.on_transport_ack(ack.local_id, trace.t1_us);
+            }
+        } else if (cb.on_transport_ack_unavailable) {
+            cb.on_transport_ack_unavailable(ack.local_id, lat_now_us());
+        }
     }
 
     auto decision = ledger_.on_ack(ack, trace.t1_us ? trace.t1_us : lat_now_us());
@@ -235,6 +239,11 @@ void TraderBinanceUGateway::Impl::on_transport_ack(
 
     XtOrderExecUpdate& upd = decision.update;
     upd.sid_id = xt_identity::OrderAttributionStore::lookup_order_strategy_sid(ack.local_id).raw();
+
+    const XtLatencyEligibility elig =
+        (ack.timing_origin == TransportAck::TimingOrigin::kVenueResponse)
+            ? XtLatencyEligibility::kEligible
+            : XtLatencyEligibility::kIneligible;
 
     switch (ack.kind) {
     case TransportAck::Kind::kRejected:
@@ -271,10 +280,10 @@ void TraderBinanceUGateway::Impl::on_transport_ack(
     }
 
     if (ack.kind == TransportAck::Kind::kTransportError_Disconnect) {
-        if (cb.on_order_update) cb.on_order_update(upd);
+        if (cb.on_order_update) cb.on_order_update(upd, elig);
         return;
     }
-    reconciler_.forward_order_update_gated(upd, EffectiveSignalDedup::Source::kAck);
+    reconciler_.forward_order_update_gated(upd, EffectiveSignalDedup::Source::kAck, elig);
 }
 
 }

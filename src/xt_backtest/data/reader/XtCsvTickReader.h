@@ -37,6 +37,20 @@ public:
 
     uint64_t out_of_order_count() const { return out_of_order_count_; }
 
+    /// @brief 逐行解析计数（consumed manifest 分类用）。
+    ///
+    /// `lines_read` = 送入 parse 的数据行总数（不含表头/空行/注释）；`symbol` /
+    /// `bad_row` = parse 返回 false 的分类计数。三者满足
+    /// `lines_read == 交付 tick 数 + symbol + bad_row`。reset() 清零。
+    struct ReadStats {
+        int64_t lines_read = 0;
+        int64_t symbol     = 0;
+        int64_t bad_row    = 0;
+    };
+    const ReadStats& read_stats() const { return read_stats_; }
+
+    const std::vector<std::vector<uint32_t>>& source_trading_days() const { return src_days_; }
+
 private:
 
     struct Reader {
@@ -45,6 +59,7 @@ private:
         XtRawTick tick;
         uint64_t key = 0;
         uint64_t seq = 0;
+        size_t path_idx = 0;
     };
 
     /// @brief 多文件 heap merge 中指向 reader 预读 tick 的排序节点。
@@ -71,12 +86,17 @@ private:
 
     void note_key_regression_(const char* path_hint, uint64_t prev_key, uint64_t key);
 
+    void note_source_day_(size_t path_idx, uint32_t trading_date);
+
     Options opts_;
     bool multi_ = false;
     bool init_done_ = false;
     uint64_t seq_ = 0;
     uint64_t last_single_key_ = 0;
     uint64_t out_of_order_count_ = 0;
+    ReadStats read_stats_;
+
+    std::vector<std::vector<uint32_t>> src_days_;
     std::unique_ptr<std::ifstream> in_;
     XtTickCsvSpec spec_;
     std::vector<Reader> readers_;

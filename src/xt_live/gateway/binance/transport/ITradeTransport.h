@@ -63,8 +63,11 @@ struct TransportAck {
 
     enum class ReqKind { kSubmit, kCancel };
 
-    Kind         kind        = Kind::kRejected;
-    ReqKind      req_kind    = ReqKind::kSubmit;
+    enum class TimingOrigin : uint8_t { kVenueResponse, kLocalFailure };
+
+    Kind         kind          = Kind::kRejected;
+    ReqKind      req_kind      = ReqKind::kSubmit;
+    TimingOrigin timing_origin = TimingOrigin::kLocalFailure;
     uint64_t     local_id    = 0;
 
     std::string  sys_id;

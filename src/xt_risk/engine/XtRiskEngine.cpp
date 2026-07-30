@@ -8,6 +8,7 @@
 #include <shared_mutex>
 
 #include "XtFixedPoint.h"
+#include "XtLogger.h"
 #include "xt_config/catalog/XtCommodityCatalog.h"
 #include "xt_cost/XtFillCostModel.h"
 #include "api/IFeeRuleProvider.h"
@@ -196,6 +197,10 @@ XtRiskEngine::AnnualLatchSnapshot XtRiskEngine::annual_latch_snapshot() const {
     return s;
 }
 
+uint64_t XtRiskEngine::per_strategy_daily_loss_baseline_missing_count() const noexcept {
+    return per_strategy_dll_baseline_missing_.load(std::memory_order_relaxed);
+}
+
 void XtRiskEngine::restore_annual_state(int year, int64_t year_start_equity_fp, bool cutoff_active,
                                         int64_t year_start_net_pnl_fp, int64_t nmf_offset_fp) {
 
@@ -374,16 +379,27 @@ std::optional<XtRiskResult> XtRiskEngine::eval_per_strategy_(const xt_core::XtOr
             "strategy " + std::to_string(eval_ctx.strategy_id) + " kill switch active");
     }
 
-    if (eval_ctx.strategy_id > 0 &&
-        !per_strategy_daily_loss_pct_fp_.empty() &&
-        snapshot.starting_balance_fp > 0) {
+    if (eval_ctx.strategy_id > 0 && !per_strategy_daily_loss_pct_fp_.empty()) {
         auto pct_it = per_strategy_daily_loss_pct_fp_.find(eval_ctx.strategy_id);
         if (pct_it != per_strategy_daily_loss_pct_fp_.end() && pct_it->second > 0) {
-            const int64_t loss_threshold_fp =
-                xt_fp::mul(pct_it->second, snapshot.starting_balance_fp);
-            if (snapshot.per_strategy_today_pnl_fp < -loss_threshold_fp) {
-                return make_reject(XtRiskReasonCode::StrategyDailyLossExceeded, XtRiskStage::CoreRule,
-                    "strategy " + std::to_string(eval_ctx.strategy_id) + " daily loss pct exceeded");
+            if (snapshot.starting_balance_fp <= 0) {
+
+                per_strategy_dll_baseline_missing_.fetch_add(1, std::memory_order_relaxed);
+                if (!per_strategy_dll_baseline_warned_.exchange(true, std::memory_order_relaxed)) {
+                    XtLogger::warn_m("RISK",
+                        "per_strategy_daily_loss_pct configured for sid={} but starting_balance_fp "
+                        "is not frozen (0): check bypassed (fail-open). Expected transiently before "
+                        "session_begin; persistent growth of "
+                        "per_strategy_daily_loss_baseline_missing_count means the rule is inert.",
+                        eval_ctx.strategy_id);
+                }
+            } else {
+                const int64_t loss_threshold_fp =
+                    xt_fp::mul(pct_it->second, snapshot.starting_balance_fp);
+                if (snapshot.per_strategy_today_pnl_fp < -loss_threshold_fp) {
+                    return make_reject(XtRiskReasonCode::StrategyDailyLossExceeded, XtRiskStage::CoreRule,
+                        "strategy " + std::to_string(eval_ctx.strategy_id) + " daily loss pct exceeded");
+                }
             }
         }
     }
@@ -394,8 +410,11 @@ std::optional<XtRiskResult> XtRiskEngine::eval_per_strategy_(const xt_core::XtOr
 std::optional<XtRiskResult> XtRiskEngine::eval_position_rules_(const xt_core::XtOrder& order,
                                                              const XtRiskSnapshot& snapshot,
                                                              const XtRiskPolicy& policy,
-                                                             const XtRiskEvalContext& eval_ctx) const {
+                                                             const XtRiskEvalContext& eval_ctx,
+                                                             const XtCommodityInfo* comm) const {
     if (!policy.enforce_position) return std::nullopt;
+
+    const bool short_allowed = cfg_.allow_short && (!comm || comm->allow_short);
 
     const int64_t new_pos_fp = projected_position_fp(order, snapshot);
 
@@ -422,7 +441,7 @@ std::optional<XtRiskResult> XtRiskEngine::eval_position_rules_(const xt_core::Xt
             return make_reject(XtRiskReasonCode::MaxPosQty, XtRiskStage::CoreRule);
         }
     }
-    if (!cfg_.allow_short && new_pos_fp < 0) {
+    if (!short_allowed && new_pos_fp < 0) {
         return make_reject(XtRiskReasonCode::ShortNotAllowed, XtRiskStage::CoreRule);
     }
 
@@ -434,7 +453,7 @@ std::optional<XtRiskResult> XtRiskEngine::eval_position_rules_(const xt_core::Xt
     if (eval_ctx.is_in_call_auction && order.tif != XtTimeInForce::GTC) {
         return make_reject(XtRiskReasonCode::InCallAuctionLimitNotAllowed, XtRiskStage::CoreRule);
     }
-    if (policy.enforce_short_t1 && !cfg_.allow_short && !order.is_buy &&
+    if (policy.enforce_short_t1 && !short_allowed && !order.is_buy &&
         order.qty_fp > snapshot.available_close_qty_fp) {
         return make_reject(XtRiskReasonCode::InsufficientAvailablePosition, XtRiskStage::CoreRule);
     }
@@ -444,10 +463,11 @@ std::optional<XtRiskResult> XtRiskEngine::eval_position_rules_(const xt_core::Xt
 XtRiskResult XtRiskEngine::eval_margin_and_pass_(const xt_core::XtOrder& order,
                                                 const XtRiskSnapshot& snapshot,
                                                 const XtRiskPolicy& policy,
-                                                int64_t notional_fp) const {
+                                                int64_t notional_fp,
+                                                const XtCommodityInfo* comm) const {
 
     if (order.is_buy && commodity_catalog_) {
-        const XtCommodityInfo* comm = commodity_catalog_->find(order.code);
+
         if (comm && comm->is_t_plus_1) {
 
             const XtFeeRule* rule = (fee_provider_ && !fee_provider_->empty_rules())
@@ -496,7 +516,12 @@ XtRiskResult XtRiskEngine::evaluate(const xt_core::XtOrder& order,
 
     if (auto r = eval_symbol_throttle_(order, snapshot, code_key, eval_ctx)) return *r;
 
-    const int64_t notional_fp = xt_fp::mul(order.price_fp, order.qty_fp);
+    const XtCommodityInfo* comm =
+        commodity_catalog_ ? commodity_catalog_->find(order.code) : nullptr;
+    const double vol_scale = (comm && std::isfinite(comm->vol_scale) && comm->vol_scale > 0.0)
+                                 ? comm->vol_scale : 1.0;
+    const int64_t notional_fp =
+        xt_fp::mul(xt_fp::mul(order.price_fp, order.qty_fp), xt_fp::to_fp(vol_scale));
     if (auto r = eval_order_limits_(order, snapshot, notional_fp)) return *r;
 
     if (order.close_offset != XtOffset::Open) {
@@ -506,6 +531,6 @@ XtRiskResult XtRiskEngine::evaluate(const xt_core::XtOrder& order,
     if (auto r = eval_open_loss_guards_(order, snapshot, policy, notional_fp)) return *r;
     if (auto r = eval_per_strategy_(order, snapshot, eval_ctx)) return *r;
 
-    if (auto r = eval_position_rules_(order, snapshot, policy, eval_ctx)) return *r;
-    return eval_margin_and_pass_(order, snapshot, policy, notional_fp);
+    if (auto r = eval_position_rules_(order, snapshot, policy, eval_ctx, comm)) return *r;
+    return eval_margin_and_pass_(order, snapshot, policy, notional_fp, comm);
 }

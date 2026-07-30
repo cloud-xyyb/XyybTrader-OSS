@@ -1,7 +1,6 @@
 #include <atomic>
 #include "xt_engine/hft/XtHftEngine.h"
 #include "xt_live/telemetry/observer/XtHftLiveObserverCombo.h"
-#include "api/IKillSwitchSink.h"
 #include "api/IHftEngineObserver.h"
 #include "xt_live/telemetry/recording/XtLiveRecorder.h"
 
@@ -42,6 +41,7 @@
 #include "XtLogger.h"
 #include "GatewayFactory.h"
 #include "api/IMdGateway.h"
+#include "xt_ipc/XtShmMdGateway.h"
 #include "xt_live/hft/runtime/XtHftChannels.h"
 #include "XtLiveConfig.h"
 #include "XtLiveOrderGateway.h"
@@ -59,6 +59,8 @@
 #include "xt_util/path/PathUtil.h"
 #include "xt_core/XtFixedPoint.h"
 #include "xt_live/hft/control/HftRunnerControl.h"
+#include "xt_live/hft/control/PanelForceExitLatch.h"
+#include "xt_live/control/ForceFlatSubmitFence.h"
 #include "xt_live/hft/reconcile/XtHftAccountReconcile.h"
 #include "xt_live/common/AccountTruthSourceFactory.h"
 #include "xt_live/common/StrategyUserdataStore.h"
@@ -84,25 +86,6 @@ using xt_runtime::XtRuntimeMarketCache;
 
 namespace {
 
-class XtRunnerSignalsKillSwitchSink final : public xt_runtime::IKillSwitchSink {
-public:
-    explicit XtRunnerSignalsKillSwitchSink(XtRunnerSignals* signals) noexcept
-        : signals_(signals) {}
-
-    void trigger_kill_switch(int  ) noexcept override {
-        if (!signals_) return;
-        signals_->kill_switch.store(true, std::memory_order_release);
-    }
-
-    bool is_kill_switch_active() const noexcept override {
-        if (!signals_) return false;
-        return signals_->kill_switch.load(std::memory_order_acquire);
-    }
-
-private:
-    XtRunnerSignals* signals_ = nullptr;
-};
-
 using HftStrategyInstance = xt_strategy_engine::StrategyInstance;
 
 struct HftEngineBootResources {
@@ -120,8 +103,6 @@ struct HftEngineBootResources {
 
 struct HftEngineSharedResources {
     XtRunnerSignals shared_state;
-
-    std::unique_ptr<XtRunnerSignalsKillSwitchSink> kill_switch_sink;
 
     std::vector<xt_strategy_engine::IStrategyExecSink*> exec_sink_ptrs;
 };
@@ -141,6 +122,7 @@ struct HftEngineRunResources {
     std::unique_ptr<ct::metrics::XtStrategyPnlBaseline>   strategy_pnl_baseline;
     std::unique_ptr<XtHftEventLoop> event_loop;
     std::unique_ptr<IAccountTruthSource> account_truth_source;
+    IAccountTruthSink* account_truth_sink = nullptr;
 
     std::unique_ptr<xt_live::control::XtHftReconcileLoop> reconcile_loop;
 
@@ -163,18 +145,16 @@ void restore_all_strategy_userdata_(HftEngineRuntime& st, const XtLiveConfig& cf
     if (!st.run.hft_engine) return;
     const std::string state_dir = xt_live::common::derive_userdata_state_dir(
         cfg.bootstrap.recording_cfg.file_path, cfg.parsed.cfg_path);
-    for (std::size_t i = 0; i < st.run.hft_engine->context_count(); ++i) {
-        auto* ctx = st.run.hft_engine->context(i);
-        if (!ctx) continue;
-        std::unordered_map<std::string, std::string> kv;
-        std::string err;
-        if (xt_live::common::read_strategy_userdata(state_dir, ctx->strategy_id(), kv, err, "RT")) {
-            ctx->restore_userdata(std::move(kv));
-        } else if (!err.empty()) {
-            XtLogger::warn_m("RT", "userdata restore skipped strategy={} ({})",
-                              ctx->strategy_id(), err);
-        }
-    }
+
+    st.run.hft_engine->restore_strategy_userdata(
+        [&](const std::string& sid, std::unordered_map<std::string, std::string>& out) {
+            std::string err;
+            if (xt_live::common::read_strategy_userdata(state_dir, sid, out, err, "RT")) return true;
+            if (!err.empty()) {
+                XtLogger::warn_m("RT", "userdata restore skipped strategy={} ({})", sid, err);
+            }
+            return false;
+        });
 }
 
 void dump_all_strategy_userdata_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
@@ -183,16 +163,13 @@ void dump_all_strategy_userdata_(HftEngineRuntime& st, const XtLiveConfig& cfg) 
         cfg.bootstrap.recording_cfg.file_path, cfg.parsed.cfg_path);
     const uint32_t trading_date =
         st.shared.shared_state.last_tick_date.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < st.run.hft_engine->context_count(); ++i) {
-        auto* ctx = st.run.hft_engine->context(i);
-        if (!ctx) continue;
-        std::string err;
-        if (!xt_live::common::write_strategy_userdata(
-                state_dir, ctx->strategy_id(), trading_date, ctx->snapshot_userdata(), err)) {
-            XtLogger::warn_m("RT", "userdata dump failed strategy={} ({})",
-                              ctx->strategy_id(), err);
-        }
-    }
+    st.run.hft_engine->dump_strategy_userdata(
+        [&](const std::string& sid, std::unordered_map<std::string, std::string> kv) {
+            std::string err;
+            if (!xt_live::common::write_strategy_userdata(state_dir, sid, trading_date, kv, err)) {
+                XtLogger::warn_m("RT", "userdata dump failed strategy={} ({})", sid, err);
+            }
+        });
 }
 
 // report sink/tracker 生命周期收口：reporter 持 sink&、Deps 持 reporter&，
@@ -257,7 +234,7 @@ bool try_build_runtime_and_params(HftEngineRuntime& st, const XtLiveConfig& cfg)
         return false;
     }
 
-    if (st.boot.base.account_store && !cfg.parsed.md_cfg.subs.empty()) {
+    if (st.boot.base.account_store) {
         st.boot.base.account_store->bind_worker_thread();
         st.boot.base.account_store->configure_symbols(cfg.parsed.md_cfg.subs);
 
@@ -308,6 +285,12 @@ static void create_order_gateway_(HftEngineRuntime& st, const XtLiveConfig& cfg)
         &st.shared.shared_state.last_position_snapshot_ms,
         cfg.bootstrap.runtime_state_cfg.enable_position_snapshot_stale_guard,
         cfg.bootstrap.runtime_state_cfg.position_snapshot_stale_ms);
+
+    st.run.order_gateway->pre_warm_risk(cfg.parsed.md_cfg.subs);
+
+    ct::metrics::XtMetricRegistry::instance().set_stp_registered_symbols(
+        xt_util::canonical_venue_label(cfg.parsed.md_provider),
+        static_cast<uint32_t>(st.run.order_gateway->stp_registered_gauge()));
 }
 
 static void apply_risk_hot_params_(XtLiveOrderGateway& gw,
@@ -375,45 +358,53 @@ static void apply_risk_hot_params_(XtLiveOrderGateway& gw,
                       new_max_daily_loss);
 }
 
-static void fill_hft_engine_cfg_(XtHftEngine::Config& engine_cfg,
-                                 HftEngineRuntime& st,
-                                 const XtLiveConfig& cfg) {
+static XtHftEngine::Dependencies make_hft_engine_deps_(HftEngineRuntime& st,
+                                                       const XtLiveConfig& cfg) {
 
-    assert(st.run.td             && "fill_hft_engine_cfg_: st.run.td 未 ready");
-    assert(st.run.order_gateway  && "fill_hft_engine_cfg_: st.run.order_gateway 未 ready");
-    assert(st.run.param_port     && "fill_hft_engine_cfg_: st.run.param_port 未 ready");
-    engine_cfg.gateway             = st.run.order_gateway.get();
-    engine_cfg.view                = st.boot.runtime_view.get();
-    engine_cfg.init_config         = &cfg.parsed.strategy_init_cfg;
-    engine_cfg.param_port          = st.run.param_port.get();
-
-    engine_cfg.strategy_id         = st.boot.strategies.empty() ? std::string{} : st.boot.strategies[0].id;
-    engine_cfg.history_ticks       = cfg.bootstrap.strategy_history_ticks;
-    engine_cfg.history_bars        = cfg.bootstrap.strategy_history_bars;
-    engine_cfg.account_store       = st.boot.base.account_store.get();
-    engine_cfg.order_book          = &st.boot.order_book;
-    engine_cfg.catalog             = &st.boot.base.catalog;
-    engine_cfg.order_id_translator = &st.run.order_gateway->logical_order_tracker();
-    engine_cfg.conditional_orders_enabled =
-        cfg.bootstrap.runtime_state_cfg.conditional_orders_enabled;
-    if (cfg.bootstrap.has_roll_cfg) engine_cfg.roll = cfg.bootstrap.roll_cfg;
+    assert(st.run.td             && "make_hft_engine_deps_: st.run.td 未 ready");
+    assert(st.run.order_gateway  && "make_hft_engine_deps_: st.run.order_gateway 未 ready");
+    XtHftEngine::Dependencies deps;
+    deps.gateway             = st.run.order_gateway.get();
+    deps.view                = st.boot.runtime_view.get();
+    deps.account_store       = st.boot.base.account_store.get();
+    deps.order_book          = &st.boot.order_book;
+    deps.catalog             = &st.boot.base.catalog;
+    deps.order_id_translator = &st.run.order_gateway->logical_order_tracker();
 
     if (cfg.parsed.portfolio_router) {
-        engine_cfg.declared_registry = st.run.declared_registry.get();
-
-        if (!st.shared.kill_switch_sink) {
-            st.shared.kill_switch_sink =
-                std::make_unique<XtRunnerSignalsKillSwitchSink>(&st.shared.shared_state);
-        }
-        engine_cfg.kill_switch_sink = st.shared.kill_switch_sink.get();
+        deps.declared_registry = st.run.declared_registry.get();
     }
+    return deps;
+}
+
+static XtHftEngine::Options make_hft_engine_options_(const HftEngineRuntime& st,
+                                                     const XtLiveConfig& cfg) {
+    XtHftEngine::Options opts;
+    if (cfg.bootstrap.has_roll_cfg) opts.roll = cfg.bootstrap.roll_cfg;
+    opts.conditional_orders_enabled =
+        cfg.bootstrap.runtime_state_cfg.conditional_orders_enabled;
+
+    if (st.boot.strategies.size() > 1) {
+        opts.unmatched_routing = cfg.parsed.portfolio_router
+            ? XtHftEngine::UnmatchedRoutingPolicy::DropAndAlert
+            : XtHftEngine::UnmatchedRoutingPolicy::FailFast;
+    }
+    return opts;
+}
+
+static void fill_hft_engine_control_hooks_(XtHftEngine::Hooks& hooks,
+                                           HftEngineRuntime& st) {
 
     auto* gw_ptr  = st.run.order_gateway.get();
     auto* port_ptr = st.run.param_port.get();
-    engine_cfg.on_params_extra = [gw_ptr, port_ptr](uint64_t  ) {
+    hooks.on_params_extra = [gw_ptr, port_ptr](uint64_t  ) {
         if (!gw_ptr || !port_ptr) return;
         apply_risk_hot_params_(*gw_ptr, *port_ptr);
     };
+
+    hooks.on_strategy_init_failure =
+        xt_live::control::make_strategy_init_failure_handler(
+            st.boot.base.risk_monitor_state.get());
 }
 
 static void fill_hft_event_loop_deps_(XtHftEventLoop::Deps& loop_deps,
@@ -447,6 +438,12 @@ static void fill_hft_event_loop_deps_(XtHftEventLoop::Deps& loop_deps,
     loop_deps.blacklist_sink        = [gw = st.run.order_gateway.get()](const char* c, const char* r) {
         gw->insert_self_match_blacklist(c, r);
     };
+
+    loop_deps.marshal_overflow_drain = [book = &st.boot.order_book]() {
+        book->drain_marshal_side_channel();
+    };
+
+    loop_deps.latency_tracker       = st.boot.base.latency_tracker.get();
 }
 
 static bool create_td_gateway_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
@@ -463,8 +460,12 @@ static bool create_td_gateway_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
     return true;
 }
 
-static void build_multi_contexts_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
+static std::vector<std::unique_ptr<XtStrategyContext>> build_multi_contexts_(
+    HftEngineRuntime& st, const XtLiveConfig& cfg) {
+    assert(st.run.param_port && "build_multi_contexts_: st.run.param_port 未 ready");
     const std::size_t n = st.boot.strategies.size();
+    std::vector<std::unique_ptr<XtStrategyContext>> contexts;
+    contexts.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         XtStrategyBase* stra_i = st.boot.strategies[i].plugin->get();
         XtStrategyContext::Config ctx_cfg;
@@ -496,47 +497,34 @@ static void build_multi_contexts_(HftEngineRuntime& st, const XtLiveConfig& cfg)
         auto owned_ctx = std::make_unique<XtStrategyContext>(ctx_cfg);
         xt_live::common::apply_initial_control_enabled(
             *owned_ctx, st.boot.base.param_domain, st.boot.strategies[i].id, "RT");
-        st.run.hft_engine->add_context(std::move(owned_ctx));
+        owned_ctx->enable_concurrent_metrics();
+        owned_ctx->set_signals(&st.shared.shared_state);
+        contexts.push_back(std::move(owned_ctx));
         XtLogger::info_m("RT", "context[{}] added strategy={}",
                          i, st.boot.strategies[i].id);
     }
+    return contexts;
 }
 
-static bool inject_context_exec_sinks_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
-    const std::size_t n = st.run.hft_engine ? st.run.hft_engine->context_count() : 0;
+static void collect_exec_sink_view_(
+    HftEngineRuntime& st,
+    const std::vector<std::unique_ptr<XtStrategyContext>>& contexts) {
     st.shared.exec_sink_ptrs.clear();
-    st.shared.exec_sink_ptrs.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        auto* ctx = st.run.hft_engine->context(i);
+    st.shared.exec_sink_ptrs.reserve(contexts.size());
+    for (const auto& ctx : contexts) {
         st.shared.exec_sink_ptrs.push_back(
-            ctx ? static_cast<xt_strategy_engine::IStrategyExecSink*>(ctx) : nullptr);
+            ctx ? static_cast<xt_strategy_engine::IStrategyExecSink*>(ctx.get()) : nullptr);
     }
-    auto* fallback = st.shared.exec_sink_ptrs.empty() ? nullptr : st.shared.exec_sink_ptrs[0];
-
-    try {
-        st.run.hft_engine->set_exec_sinks(fallback, st.shared.exec_sink_ptrs);
-    } catch (const std::exception& e) {
-        XtLogger::error_m("RT", "engine exec sink assembly failed: {}", e.what());
-        return false;
-    }
-    if (st.run.order_gateway) {
-        if (cfg.parsed.portfolio_router) {
-            st.run.order_gateway->set_exec_sinks(
-                fallback, st.shared.exec_sink_ptrs, st.run.sid_registry.get());
-        } else {
-            st.run.order_gateway->set_exec_sinks(fallback, {}, nullptr);
-        }
-    }
-    return true;
 }
 
-static void inject_signals_into_all_contexts_(HftEngineRuntime& st) {
-    const std::size_t n = st.boot.strategies.size();
-    for (std::size_t i = 0; i < n; ++i) {
-        XtStrategyContext* ctx = st.run.hft_engine->context(i);
-        assert(ctx && "multi-mode: every ctx must be added before signals injection");
-        ctx->enable_concurrent_metrics();
-        ctx->set_signals(&st.shared.shared_state);
+static void inject_gateway_exec_sinks_(HftEngineRuntime& st, const XtLiveConfig& cfg) {
+    auto* fallback = st.shared.exec_sink_ptrs.empty() ? nullptr : st.shared.exec_sink_ptrs[0];
+    if (!st.run.order_gateway) return;
+    if (cfg.parsed.portfolio_router) {
+        st.run.order_gateway->set_exec_sinks(
+            fallback, st.shared.exec_sink_ptrs, st.run.sid_registry.get());
+    } else {
+        st.run.order_gateway->set_exec_sinks(fallback, {}, nullptr);
     }
 }
 
@@ -568,32 +556,56 @@ static bool assemble_engine_and_contexts_(HftEngineRuntime& st, const XtLiveConf
            && "engine ctor: strategies vector must have >=1 element");
     const std::size_t n = st.boot.strategies.size();
     const bool is_multi = (n > 1);
-    XtStrategyBase* primary = st.boot.strategies[0].plugin->get();
 
-    XtHftEngine::Config engine_cfg;
-    fill_hft_engine_cfg_(engine_cfg, st, cfg);
+    if (is_multi && cfg.parsed.md_cfg.subs.size() <= 1) {
 
-    engine_cfg.strict_unmatched_routing = is_multi;
-    st.run.hft_engine = std::make_unique<XtHftEngine>( primary, engine_cfg);
-
-    st.run.hft_engine->reserve_contexts(n);
-
-    if (is_multi) {
-
-        if (cfg.parsed.md_cfg.subs.size() <= 1) {
-            XtLogger::warn_m("RT",
-                "multi-strategy ({} strategies) on shared instrument: NET position "
-                "fan-out may cause internal counter drift if same-symbol opposite "
-                "direction. Use different symbols per strategy. "
-                "See docs/architecture/hft_multi_strategy.md.", n);
-        }
+        XtLogger::warn_m("RT",
+            "multi-strategy ({} strategies) on shared instrument: NET position "
+            "fan-out may cause internal counter drift if same-symbol opposite "
+            "direction. Use different symbols per strategy. "
+            "See docs/architecture/hft_multi_strategy.md.", n);
     }
 
-    build_multi_contexts_(st, cfg);
-    if (!inject_context_exec_sinks_(st, cfg)) {
+    auto contexts = build_multi_contexts_(st, cfg);
+
+    XtHftEngine::Hooks hooks;
+    fill_hft_engine_control_hooks_(hooks, st);
+    st.run.hft_observer = std::make_unique<xt_live::XtHftLiveObserverCombo>(
+        st.boot.base.latency_tracker.get(),
+        &st.shared.shared_state,
+        st.run.trade_drain_q.get(),
+        st.run.order_update_drain_q.get());
+    hooks.observers.push_back(st.run.hft_observer.get());
+    if (!xt_live::hft::wire_hft_telemetry(st.run.strategy_pnl_aggr,
+                                          st.run.strategy_pnl_baseline,
+                                          st.run.fee_observer,
+                                          hooks,
+                                          cfg)) {
         return false;
     }
-    inject_signals_into_all_contexts_(st);
+
+    {
+        xt_runtime::XtRuntimeMarketCacheConfig mc_cfg;
+        mc_cfg.tick_history_cap      = cfg.bootstrap.strategy_history_ticks;
+        mc_cfg.bar_history_cap       = cfg.bootstrap.strategy_history_bars;
+        mc_cfg.orderflow_history_cap = cfg.bootstrap.strategy_history_ticks;
+        st.boot.market_cache->configure(mc_cfg);
+    }
+
+    collect_exec_sink_view_(st, contexts);
+
+    try {
+        st.run.hft_engine = std::make_unique<XtHftEngine>(make_hft_engine_deps_(st, cfg),
+                                                          make_hft_engine_options_(st, cfg),
+                                                          std::move(contexts),
+                                                          std::move(hooks));
+    } catch (const std::exception& e) {
+        st.shared.exec_sink_ptrs.clear();
+        XtLogger::error_m("RT", "engine assembly failed: {}", e.what());
+        return false;
+    }
+
+    inject_gateway_exec_sinks_(st, cfg);
 
     if (!verify_multi_assembly_alignment_(st, cfg)) {
         return false;
@@ -620,22 +632,9 @@ static bool init_all_strategy_plugins_(HftEngineRuntime& st, const XtLiveConfig&
     return false;
 }
 
-static bool start_observer_and_event_loop_(HftEngineRuntime& st,
-                                            const XtLiveConfig& cfg,
-                                            std::atomic<bool>& shutdown_flag) {
-    st.run.hft_observer = std::make_unique<xt_live::XtHftLiveObserverCombo>(
-        st.boot.base.latency_tracker.get(),
-        &st.shared.shared_state,
-        st.run.trade_drain_q.get(),
-        st.run.order_update_drain_q.get());
-    st.run.hft_engine->add_observer(st.run.hft_observer.get());
-
-    xt_live::hft::wire_hft_telemetry(st.run.strategy_pnl_aggr,
-                                     st.run.strategy_pnl_baseline,
-                                     st.run.fee_observer,
-                                     *st.run.hft_engine,
-                                     cfg);
-
+static bool start_event_loop_(HftEngineRuntime& st,
+                              const XtLiveConfig& cfg,
+                              std::atomic<bool>& shutdown_flag) {
     XtHftEventLoop::Deps loop_deps;
     fill_hft_event_loop_deps_(loop_deps, st, cfg, shutdown_flag);
     st.run.event_loop = std::make_unique<XtHftEventLoop>(cfg.bootstrap.event_loop_cfg,
@@ -733,7 +732,7 @@ bool try_init_and_start_strategy_runtime(HftEngineRuntime& st,
 
     restore_all_strategy_userdata_(st, cfg);
 
-    if (!start_observer_and_event_loop_(st, cfg, shutdown_flag))       return false;
+    if (!start_event_loop_(st, cfg, shutdown_flag))                     return false;
     start_reconcile_loop_if_supported_(st, cfg);
 
     init_success = true;
@@ -803,6 +802,9 @@ bool try_start_channels(HftEngineRuntime& st,
             });
     }
 
+    ct::metrics::XtMetricRegistry::instance().inc_risk_rejects_total(
+        xt_util::canonical_venue_label(cfg.parsed.md_provider), 0);
+
     if (st.boot.base.latency_tracker && !std::getenv("XT_DISABLE_LATENCY_METRIC_EMIT")) {
         st.boot.base.latency_tracker->set_metric_registry(
             &ct::metrics::XtMetricRegistry::instance(),
@@ -827,16 +829,26 @@ bool try_start_channels(HftEngineRuntime& st,
         if (const auto* bn = std::get_if<BinanceTdCfg>(&cfg.parsed.td_provider_cfg.extra)) {
             income_provider = binance_u::make_binance_income_provider(*bn);
         }
-        st.run.account_truth_source = make_runner_account_truth_source(
+        auto truth = make_runner_account_truth_source(
             *st.boot.base.account_store,
             st.shared.shared_state,
             cfg,
             std::move(income_provider));
+        st.run.account_truth_source = std::move(truth.source);
+        st.run.account_truth_sink = truth.sink;
     } catch (const std::exception& e) {
         XtLogger::error_m("RT", "account truth source create failed: {}", e.what());
         return cleanup_and_fail();
     }
-    st.run.channels->set_account_truth_source(st.run.account_truth_source.get());
+    st.run.channels->set_account_truth_sink(st.run.account_truth_sink);
+
+    {
+        auto* gw = st.run.order_gateway.get();
+        st.run.channels->set_stp_rearm_sink(
+            [gw](const std::vector<AliveInflightOrder>& orders, bool is_cold_start) {
+                if (gw) gw->stp_rearm_reverse_sync(orders, is_cold_start);
+            });
+    }
     st.run.channels->wire();
     return st.run.channels->start() ? true : cleanup_and_fail();
 }
@@ -851,6 +863,9 @@ void stop_runtime_threads(HftEngineRuntime& st, std::atomic<bool>& shutdown_flag
     if (st.run.order_gateway) st.run.order_gateway->stop();
     if (st.run.channels) st.run.channels->stop();
     if (st.run.event_loop) st.run.event_loop->stop();
+
+    if (st.boot.base.account_store) st.boot.base.account_store->enter_quiescent();
+    st.boot.order_book.shutdown_quiesce();
     if (st.run.order_gateway) st.run.order_gateway->clear_exec_sinks();
 }
 
@@ -858,6 +873,8 @@ int run_hft_live_with_config(XtLiveConfig& live_cfg,
                              std::atomic<bool>& shutdown_flag,
                              std::atomic<int>& shutdown_sig) {
     HftEngineRuntime st;
+
+    TrackerStopGuard latency_stop_guard{st.boot.base.latency_tracker};
     shutdown_flag.store(false, std::memory_order_release);
     shutdown_sig.store(0, std::memory_order_relaxed);
 
@@ -909,9 +926,20 @@ int run_hft_live_with_config(XtLiveConfig& live_cfg,
     control_ctx.trade_drain_q        = st.run.trade_drain_q.get();
     control_ctx.order_update_drain_q = st.run.order_update_drain_q.get();
 
+    control_ctx.frame_tail_hook =
+        [ch = st.run.channels.get(),
+         gw = st.run.order_gateway.get(),
+         venue = std::string(xt_util::canonical_venue_label(live_cfg.parsed.md_provider))]() {
+            ch->drain_td_handoff_buffer();
+            ct::metrics::XtMetricRegistry::instance().set_stp_registered_symbols(
+                venue, static_cast<uint32_t>(gw->stp_registered_gauge()));
+        };
+
     control_ctx.risk_monitor = st.boot.base.risk_monitor.get();
     control_ctx.risk_monitor_state = st.boot.base.risk_monitor_state.get();
     control_ctx.md_gateway = st.run.md.get();
+
+    control_ctx.shm_md_gateway = dynamic_cast<xt_ipc::XtShmMdGateway*>(st.run.md.get());
     control_ctx.market_cache = st.boot.market_cache.get();
     control_ctx.catalog = &st.boot.base.catalog;
     control_ctx.strategy_pnl_aggr = st.run.strategy_pnl_aggr.get();
@@ -968,6 +996,16 @@ int run_hft_live_with_config(XtLiveConfig& live_cfg,
         control_loop.configure_auto_liquidator(std::move(liq_cfg));
     }
 
+    std::unique_ptr<xt_live::control::PanelForceExitLatch> force_exit_latch;
+    if (live_cfg.bootstrap.order_gateway_cfg.closeout_force_exit_latch_enabled) {
+        force_exit_latch = std::make_unique<xt_live::control::PanelForceExitLatch>(
+            live_cfg.bootstrap.order_gateway_cfg.closeout_force_exit_latch_ttl_ms);
+        control_ctx.force_exit_latch = force_exit_latch.get();
+    }
+
+    auto force_flat_fence = std::make_unique<xt_live::control::ForceFlatSubmitFence>();
+    control_ctx.force_flat_fence = force_flat_fence.get();
+
 #ifdef XT_HAVE_CONTROL_GRPC
 
     std::optional<xt_live::control::XtRunnerPanelControl> hft_panel_control;
@@ -1005,6 +1043,15 @@ int run_hft_live_with_config(XtLiveConfig& live_cfg,
         hft_panel_ctx.runtime_shared_state = &control_ctx.runtime_shared_state;
         hft_panel_ctx.param_domain         = control_ctx.param_domain;
         hft_panel_ctx.catalog              = control_ctx.catalog;
+        hft_panel_ctx.force_exit_latch     = control_ctx.force_exit_latch;
+        hft_panel_ctx.force_flat_fence     = control_ctx.force_flat_fence;
+
+        hft_panel_ctx.attribution_router_mode = live_cfg.parsed.portfolio_router;
+
+        hft_panel_ctx.hosted_strategies.reserve(live_cfg.parsed.strategies.size());
+        for (const auto& entry : live_cfg.parsed.strategies) {
+            hft_panel_ctx.hosted_strategies.push_back(entry.factory_cfg.id);
+        }
         hft_panel_control.emplace(hft_panel_ctx);
 
         xt_live::control::HftControlBindCtx hft_ctx;
@@ -1039,6 +1086,8 @@ int run_hft_live_with_config(XtLiveConfig& live_cfg,
         XtLogger::warn_m("RT", "shutdown signal={} received", sig);
     }
     stop_runtime_threads(st, shutdown_flag);
+
+    control_loop.finalize_report();
 
     dump_all_strategy_userdata_(st, live_cfg);
 

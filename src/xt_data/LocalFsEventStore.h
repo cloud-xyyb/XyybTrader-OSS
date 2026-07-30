@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -7,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "IEventStore.h"
@@ -41,7 +43,7 @@ public:
 
     std::unique_ptr<IEventIterator> query(const QueryRange& range) override;
 
-    void flush() override;
+    bool flush() override;
 
     std::string rotate() override;
 
@@ -49,27 +51,51 @@ public:
 
     [[nodiscard]] const std::string& root() const { return root_path_; }
 
+    [[nodiscard]] std::uint64_t torn_frame_rollback_count() const {
+        return torn_frame_rollback_count_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::uint64_t poisoned_shard_count() const {
+        return poisoned_shard_count_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::uint64_t rotate_fail_count() const {
+        return rotate_fail_count_.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// @brief 单个 shard 的打开态：owning FILE* 与已确认完整 frame 的累计字节。
+    struct ShardHandle {
+        std::FILE* fp = nullptr;
+        std::size_t clean_size = 0;
+    };
 
     std::filesystem::path shard_path(std::uint32_t day,
                                      std::string_view exch,
                                      std::string_view sym) const;
 
-    std::FILE* get_or_open_file(std::uint32_t day,
-                                std::string_view exchange,
-                                std::string_view symbol);
+    ShardHandle* open_shard_(const std::string& key,
+                             const std::filesystem::path& path);
 
     std::filesystem::path events_ext_path(std::uint32_t day) const;
 
-    bool write_record_(std::FILE* fp, const void* fbs_buf, std::size_t fbs_size);
+    bool write_frame_(const std::string& key, const std::filesystem::path& path,
+                      ShardHandle& sh, const void* fbs_buf, std::size_t fbs_size);
 
     void close_and_drop_shard_(const std::string& key);
 
+    void poison_shard_(const std::string& key);
+
     std::string root_path_;
 
-    std::unordered_map<std::string, std::FILE*> files_;
+    std::unordered_map<std::string, ShardHandle> files_;
+
+    std::unordered_set<std::string> poisoned_shards_;
     std::size_t pending_bytes_ = 0;
     std::vector<std::uint8_t> write_scratch_;
+    std::atomic<std::uint64_t> torn_frame_rollback_count_{0};
+    std::atomic<std::uint64_t> poisoned_shard_count_{0};
+    std::atomic<std::uint64_t> rotate_fail_count_{0};
 };
 
 }

@@ -1,10 +1,10 @@
 # 回归基线（Regression Baselines）
 
-byte-identical 回归是本仓的行为不变量锚：4 个 HFT 场景，每个场景产出的 `fills.csv`
+byte-identical 回归是本仓的行为不变量锚：6 个 HFT 场景，每个场景产出的 `fills.csv`
 与仓内 golden **逐字节**比对，任何 drift 即失败。
 
 ```bash
-bash scripts/regression_test.sh          # 全部 4 个场景
+bash scripts/regression_test.sh          # 全部 6 个场景
 bash scripts/run_baselines.sh holiday    # 只跑一个
 ```
 
@@ -14,6 +14,8 @@ bash scripts/run_baselines.sh holiday    # 只跑一个
 | `ag2212_only` | ag2212 单合约 5 交易日 | `configs/baselines/ag2212_only.yaml` |
 | `roll_29col`  | ag2206 + ag2212 双合约 5 交易日 | `configs/baselines/roll_29col.yaml` |
 | `holiday`     | ag2206 + ag2212 跨节假日 8 交易日（含周末跳空） | `configs/baselines/holiday.yaml` |
+| `ag2206_vollimit` | 同 `ag2206_only`，但开 `volume_limit`（撮合受每 tick 成交量上限约束） | `configs/baselines/ag2206_vollimit.yaml` |
+| `ag2206_vollimit_split` | `volume_limit` 叠加 `fill.split`（成交拆单，qty=5 → 2/2/1） | `configs/baselines/ag2206_vollimit_split.yaml` |
 
 目录约定：
 

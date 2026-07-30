@@ -12,6 +12,7 @@ namespace prometheus {
 class Registry;
 class Exposer;
 class Histogram;
+class Counter;
 }
 
 namespace ct::metrics {
@@ -85,12 +86,10 @@ public:
                         std::string_view symbol,
                         std::string_view reason);
 
+    void inc_risk_rejects_total(std::string_view venue, uint64_t delta);
+
     void on_order_reject(std::string_view venue,
                          std::string_view err_code);
-
-    void inc_stage_taps_dropped(std::string_view stage,
-                                 std::string_view reason,
-                                 uint64_t count);
 
     void observe_md_event_to_recv_us(std::string_view channel,
                                       uint64_t latency_us);
@@ -298,6 +297,12 @@ public:
 
     void set_open_orders(std::string_view venue, uint32_t count);
 
+    void set_shm_md_attach_failing(std::string_view ring, uint32_t failing);
+
+    void set_shm_md_attach_fail_count(std::string_view ring, uint64_t count);
+
+    void set_stp_registered_symbols(std::string_view venue, uint32_t count);
+
     void inc_runtime_book_drop_total(std::string_view reason);
 
     void inc_unmatched_drop_total(std::string_view kind, std::string_view reason,
@@ -308,6 +313,11 @@ public:
     void inc_runtime_market_drop_total(std::string_view reason);
 
     void inc_latency_meta_miss_total(std::string_view venue);
+
+    void inc_latency_eligible_total(std::string_view stage, std::string_view strategy,
+                                    std::string_view book, std::string_view symbol);
+
+    void inc_latency_tap_dropped_total(std::string_view reason);
 
     void inc_broker_frozen_stale_total(std::string_view venue);
 
@@ -359,6 +369,8 @@ public:
     struct RuntimeKpiSnapshot {
         double md_gap_ms_p99 = 0.0;
         bool has_md_gap_ms_p99 = true;
+        double md_gap_ms_peak = 0.0;
+        bool has_md_gap_ms_peak = true;
         double md_age_ms = 0.0;
         bool has_md_age_ms = false;
         double event_drop = 0.0;
@@ -389,6 +401,10 @@ public:
     [[nodiscard]] prometheus::Histogram* get_local_submit_us_histogram(
         std::string_view strategy, std::string_view book,
         std::string_view venue, std::string_view symbol);
+
+    [[nodiscard]] prometheus::Counter* get_latency_eligible_counter(
+        std::string_view stage, std::string_view strategy,
+        std::string_view book, std::string_view symbol);
 
 private:
     XtMetricRegistry();

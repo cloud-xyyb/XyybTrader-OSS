@@ -15,6 +15,8 @@ struct BinanceTdCfg {
     std::string api_key;
     std::string api_secret;
     uint32_t listen_key_refresh_ms = 30 * 60 * 1000;
+
+    std::string local_id_instance;
     bool     testnet = true;
     int      recv_window_ms = 5000;
     uint32_t time_sync_interval_ms = 60 * 1000;

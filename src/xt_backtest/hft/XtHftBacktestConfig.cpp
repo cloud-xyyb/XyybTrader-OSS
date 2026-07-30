@@ -1,5 +1,6 @@
 #include "XtHftBacktestConfig.h"
 
+#include <cstdint>
 #include <cstdio>
 #include "xt_util/string/XtStringUtil.h"
 #include "xt_util/time/XtTimeParse.h"
@@ -189,14 +190,22 @@ void patch_tick_symbols_for_roll(const XtRollEngine::Config& roll_cfg,
     md_cfg.tick_auto_main = false;
 }
 
+bool is_negative_or_non_finite(double x) { return !std::isfinite(x) || x < 0.0; }
+
 void validate_risk_cfg(const XtRiskCfg& cfg, std::vector<std::string>& errors) {
-    if (cfg.max_order_qty < 0.0)     errors.push_back("backtest.risk.max_order_qty 不能为负");
-    if (cfg.max_order_notional < 0.0) errors.push_back("backtest.risk.max_order_notional 不能为负");
-    if (cfg.max_pos_qty < 0.0)        errors.push_back("backtest.risk.max_pos_qty 不能为负");
+    if (is_negative_or_non_finite(cfg.max_order_qty))
+        errors.push_back("backtest.risk.max_order_qty 不能为负");
+    if (is_negative_or_non_finite(cfg.max_order_notional))
+        errors.push_back("backtest.risk.max_order_notional 不能为负");
+    if (is_negative_or_non_finite(cfg.min_order_notional))
+        errors.push_back("backtest.risk.min_order_notional 不能为负");
+    if (is_negative_or_non_finite(cfg.max_pos_qty))
+        errors.push_back("backtest.risk.max_pos_qty 不能为负");
 }
 
 void validate_trade_cost_cfg(const XtTradeCostConfig& cfg, std::vector<std::string>& errors) {
-    if (cfg.slippage < 0.0) errors.push_back("backtest.cost.slippage 不能为负");
+    if (is_negative_or_non_finite(cfg.slippage))
+        errors.push_back("backtest.cost.slippage 不能为负");
 }
 
 void validate_match_engine_cfg(const XtHftMatchEngineCfg& cfg, std::vector<std::string>& errors) {
@@ -212,6 +221,13 @@ void validate_match_engine_cfg(const XtHftMatchEngineCfg& cfg, std::vector<std::
     else if (cfg.split_max_qty < cfg.split_min_qty)
         errors.push_back("backtest.fill.max_qty 必须 >= min_qty");
     if (cfg.split_qty_tick <= 0.0) errors.push_back("backtest.fill.qty_tick 必须 > 0");
+
+    if (cfg.ttl_us > 0) {
+        const __int128 ttl_ns =
+            ((static_cast<__int128>(cfg.ttl_us) + 999) / 1000) * 1'000'000;
+        if (ttl_ns > static_cast<__int128>(INT64_MAX))
+            errors.push_back("backtest.order_timeout ttl_us 过大：ceil-us→ns 越 int64 上界");
+    }
 }
 
 bool finalize_and_validate_backtest_config(XtHftBacktestConfig& cfg, std::string& err) {
@@ -428,6 +444,8 @@ XtConfigSchemaRules build_backtest_schema_rules() {
 
     add({
         "backtest.risk.max_order_qty", "backtest.risk.max_order_notional",
+
+        "backtest.risk.min_order_notional",
         "backtest.risk.max_pos_qty",   "backtest.risk.allow_short",
         "backtest.risk.enforce_long_t_plus_1",
 
@@ -437,6 +455,10 @@ XtConfigSchemaRules build_backtest_schema_rules() {
 
     add({
         "backtest.cost.slippage",
+    });
+
+    add({
+        "backtest.tick_cache.format",
     });
 
     add({
@@ -484,7 +506,6 @@ XtConfigSchemaRules build_backtest_schema_rules() {
         "backtest.roll.logical_symbol",
         "backtest.roll.path",              "backtest.roll.window_before_days",
         "backtest.roll.window_after_days", "backtest.roll.dispatch_parallel_ticks",
-        "backtest.roll.strict_no_lookahead",
     });
 
     add({
@@ -514,6 +535,8 @@ void validate_backtest_enum_fields(const YAML::Node& root, std::vector<std::stri
                         {"ratio", "prob_power1", "prob_power2"}, errors);
     validate_enum_field(root, "backtest.datasource.tick.volume_mode",
                         {"cumulative", "incremental", "inc"}, errors, nullptr, false);
+    validate_enum_field(root, "backtest.tick_cache.format",
+                        {"v2", "v3"}, errors);
     validate_enum_field(root, "backtest.datasource.mode",
                         {"tick", "bar"}, errors);
     validate_enum_field(root, "backtest.datasource.data_mode",
@@ -523,7 +546,7 @@ void validate_backtest_enum_fields(const YAML::Node& root, std::vector<std::stri
     validate_enum_field(root, "backtest.datasource.bar.simtick.format",
                         {"bin", "csv"}, errors);
     validate_enum_field(root, "backtest.trace_mode",
-                        {"off", "incident", "full"}, errors, nullptr, false);
+                        {"off", "full"}, errors, nullptr, false);
 }
 
 }

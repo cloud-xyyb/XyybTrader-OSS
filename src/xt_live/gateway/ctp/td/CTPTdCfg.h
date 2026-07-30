@@ -16,4 +16,8 @@ struct CTPTdCfg {
     int         recovery_query_max_timeouts   = 6;
     int         recovery_rearm_backoff_ms     = 5000;
     int         recovery_rearm_alert_rounds   = 10;
+    int         refresh_query_timeout_ms      = 30000;
+    int         refresh_query_wedge_rounds    = 6;
+    bool        query_generation_fence        = true;
+    bool        exec_ledger_query_fill_delivery = true;
 };

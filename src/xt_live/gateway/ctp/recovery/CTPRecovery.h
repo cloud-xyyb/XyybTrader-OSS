@@ -61,7 +61,18 @@ public:
 
     void on_login();
 
-    void on_position(const CThostFtdcInvestorPositionField* pPosition, bool bIsLast);
+    void begin_position_query(int request_id);
+
+    bool on_position(const CThostFtdcInvestorPositionField* pPosition,
+                     bool bIsLast, int request_id = 0);
+
+    bool position_query_owns(int request_id) const;
+
+    void note_stale_position_frame();
+
+    uint64_t stale_position_frame_dropped() const;
+
+    uint64_t stale_position_frame_unfenceable() const;
 
     void on_account_done(bool bIsLast);
 
@@ -111,6 +122,10 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, PositionSnapshot>  pos_cache_;
     std::unordered_map<std::string, PositionBucketAgg> pos_bucket_cache_;
+
+    int pos_query_owner_req_ = 0;
+    std::atomic<uint64_t> stale_position_frame_dropped_{0};
+    std::atomic<uint64_t> stale_position_frame_unfenceable_{0};
 
     PositionsPublisher publish_positions_;
     QueryStarter       start_position_query_;

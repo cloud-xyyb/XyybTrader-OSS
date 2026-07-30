@@ -11,6 +11,7 @@ add_library(xt_live_hft_components STATIC
     control/HftControlForceClose.cpp
     control/HftControlSafetyState.cpp
     control/HftCloseoutGate.cpp
+    control/PanelForceExitLatch.cpp
     control/PerSidLiquidator.cpp
     reconcile/XtHftReconcileLoop.cpp
     reconcile/XtHftAccountReconcile.cpp

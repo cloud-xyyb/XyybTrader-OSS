@@ -4,19 +4,6 @@
 
 namespace {
 
-constexpr void civil_from_days(int64_t z, int& y, unsigned& m, unsigned& d) noexcept {
-    z += 719468;
-    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    const unsigned doe = static_cast<unsigned>(z - era * 146097);
-    const unsigned yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    y = static_cast<int>(yoe) + static_cast<int>(era) * 400;
-    const unsigned doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const unsigned mp  = (5u * doy + 2u) / 153u;
-    d = doy - (153u * mp + 2u) / 5u + 1u;
-    m = mp + (mp < 10u ? 3u : -9u);
-    y += (m <= 2);
-}
-
 constexpr int64_t kNsPerSec = 1'000'000'000LL;
 constexpr int64_t kSecPerDay = 86400LL;
 

@@ -39,7 +39,8 @@ public:
     };
 
     struct Callbacks {
-        std::function<void(const XtRawTick&)> on_tick;
+
+        std::function<void(const XtRawTick&, uint64_t capture_ns)> on_tick;
         std::function<void(const XtOrderQueue&)> on_order_queue;
         std::function<void(const XtOrderDetail&)> on_order_detail;
         std::function<void(const XtTransaction&)> on_transaction;

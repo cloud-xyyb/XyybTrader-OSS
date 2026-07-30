@@ -23,6 +23,7 @@ struct XtMdConnectorExporter::Impl {
     prometheus::Counter* published_total = nullptr;
     prometheus::Gauge* check_health = nullptr;
     prometheus::Counter* check_health_fail_total = nullptr;
+    prometheus::Gauge* stale_watchdog_active = nullptr;
     prometheus::Gauge* uptime = nullptr;
     prometheus::Gauge* epoch = nullptr;
 };
@@ -61,7 +62,7 @@ bool XtMdConnectorExporter::start(uint16_t port,
 
         auto& fam_health = prometheus::BuildGauge()
             .Name("xt_md_connector_check_health")
-            .Help("Gateway check_health result (1=healthy, 0=stale/reconnecting)")
+            .Help("Gateway check_health result (1=healthy or offhours-suppressed, 0=stale/reconnecting)")
             .Register(*impl_->registry);
         impl_->check_health = &fam_health.Add(lbl);
 
@@ -70,6 +71,12 @@ bool XtMdConnectorExporter::start(uint16_t port,
             .Help("check_health=false occurrences (stale/reconnect proxy; rate()>0 = MD self-healing)")
             .Register(*impl_->registry);
         impl_->check_health_fail_total = &fam_health_fail.Add(lbl);
+
+        auto& fam_watchdog = prometheus::BuildGauge()
+            .Name("xt_md_connector_stale_watchdog_active")
+            .Help("stale watchdog armed (1=in expected-tick window / gate off, 0=offhours-suppressed)")
+            .Register(*impl_->registry);
+        impl_->stale_watchdog_active = &fam_watchdog.Add(lbl);
 
         auto& fam_uptime = prometheus::BuildGauge()
             .Name("xt_md_connector_uptime_seconds")
@@ -127,6 +134,11 @@ void XtMdConnectorExporter::set_check_health(bool healthy) {
     if (!impl_->running) return;
     if (impl_->check_health) impl_->check_health->Set(healthy ? 1.0 : 0.0);
     if (!healthy && impl_->check_health_fail_total) impl_->check_health_fail_total->Increment();
+}
+
+void XtMdConnectorExporter::set_stale_watchdog_active(bool active) {
+    if (!impl_->running || !impl_->stale_watchdog_active) return;
+    impl_->stale_watchdog_active->Set(active ? 1.0 : 0.0);
 }
 
 void XtMdConnectorExporter::set_uptime_seconds(double seconds) {

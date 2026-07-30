@@ -80,6 +80,8 @@ struct XtTradeRecord {
 
     int64_t sim_response_latency_ns = -1;
 
+    int64_t sim_visible_at_ns = -1;
+
     XtFillEvent to_fill_event() const {
         XtFillEvent f;
         f.order_id       = order_id;

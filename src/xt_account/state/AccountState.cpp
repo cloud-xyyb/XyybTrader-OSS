@@ -3,6 +3,7 @@
 #include "XtFixedPoint.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace {
 
@@ -21,11 +22,16 @@ inline void release_order_frozen(int64_t& frozen_cash,
 
 }
 
-AccountState::AccountState(const Config& cfg, CtorToken)
+AccountState::AccountState(const Config& cfg)
     : cash_(xt_fp::to_fp(cfg.initial_cash)),
       t1_enabled_(cfg.t1_enabled),
       futures_mode_(cfg.futures_mode),
-      catalog_(cfg.catalog) {}
+      catalog_(cfg.catalog) {
+
+    if (cfg.futures_mode && cfg.catalog == nullptr)
+        throw std::invalid_argument(
+            "AccountState: futures_mode requires a non-null commodity catalog (vol_scale source)");
+}
 
 AccountState::Position& AccountState::get_pos(const char* code) {
     if (__builtin_expect(!code || code[0] == '\0', 0)) {
@@ -42,8 +48,7 @@ const AccountState::Position* AccountState::find_pos(const char* code) const {
     return &it->second;
 }
 
-void AccountState::on_session_begin(uint32_t action_date) {
-    last_action_date_ = action_date;
+void AccountState::on_session_begin() {
 
     if (!t1_enabled_ && !futures_mode_) return;
     for (auto& kv : pos_) {
@@ -100,7 +105,7 @@ void AccountState::on_order_accepted(uint64_t order_id, int64_t required_margin,
     order_slots_[order_id] = {required_margin, 0, per_unit_margin};
 }
 
-void AccountState::on_order_update(uint64_t order_id, int64_t filled, int64_t remaining, bool is_final) {
+void AccountState::on_order_update(uint64_t order_id, int64_t filled, bool is_final) {
     if (order_id == 0) return;
     auto it = order_slots_.find(order_id);
 
@@ -116,7 +121,6 @@ void AccountState::on_order_update(uint64_t order_id, int64_t filled, int64_t re
     }
     if (!is_final) return;
 
-    (void)remaining;
     release_order_frozen(frozen_cash_, frozen_by_orders_, slot, slot.frozen);
     order_slots_.erase(it);
 }

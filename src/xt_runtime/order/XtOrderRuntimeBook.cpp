@@ -13,8 +13,9 @@
 #include "api/AliveInflightOrder.h"
 #include "xt_core/order/XtTradeRecord.h"
 #include "XtFixedPoint.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
-#include "xt_util/sync/XtAllocGuard.h"
+#include "xt_util/time/XtSteadyClock.h"
 
 #ifdef XT_HAVE_METRICS
 #include "xt_metrics/XtMetricRegistry.h"
@@ -32,7 +33,22 @@ std::atomic<uint64_t>& orphan_update_dropped() {
     return counter;
 }
 
+std::atomic<uint64_t>& orphan_trade_dropped() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
 std::atomic<uint64_t>& orphan_reap_dropped() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& fillup_terminal_resurrect_blocked() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& close_outstanding_drift_healed() {
     static std::atomic<uint64_t> counter{0};
     return counter;
 }
@@ -48,6 +64,26 @@ std::atomic<uint64_t>& cross_thread_direct_read_blocked() {
 }
 
 std::atomic<uint64_t>& tracked_codes_truncated() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& marshal_side_channel_used() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& marshal_side_channel_overflow_dropped() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& duplicate_submit_blocked() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<uint64_t>& venue_fillup_qty_sanitized() {
     static std::atomic<uint64_t> counter{0};
     return counter;
 }
@@ -73,9 +109,26 @@ void release_order_book_snapshot(void* ctx, const void* ptr) noexcept {
     auto* pool = static_cast<OrderBookSnapshotPool*>(ctx);
     pool->release(const_cast<OrderBookSnapshot*>(static_cast<const OrderBookSnapshot*>(ptr)));
 }
+
+constexpr int64_t kMaxSaneFillupQtyFp = 1'000'000'000'000'000LL;
+
+bool clamp_fillup_venue_qty(int64_t& v) noexcept {
+    if (v < 0) {
+        v = 0;
+        return true;
+    }
+    if (v > kMaxSaneFillupQtyFp) {
+        v = kMaxSaneFillupQtyFp;
+        return true;
+    }
+    return false;
+}
 }
 
-XtOrderRuntimeBook::XtOrderRuntimeBook() {
+XtOrderRuntimeBook::XtOrderRuntimeBook() : XtOrderRuntimeBook(Config{}) {}
+
+XtOrderRuntimeBook::XtOrderRuntimeBook(const Config& cfg)
+    : pre_reg_ttl_ms_(cfg.pre_registration_ttl_ms) {
     init_slot_pool();
     publish_snapshot_();
 }
@@ -92,7 +145,10 @@ XtOrderRuntimeBook::XtOrderRuntimeBook(XtOrderRuntimeBook&& other) noexcept
       order_terminal_fifo_(std::move(other.order_terminal_fifo_)),
       tracked_codes_(std::move(other.tracked_codes_)),
       instrument_registry_(std::move(other.instrument_registry_)),
-      next_generation_(other.next_generation_) {
+      next_generation_(other.next_generation_),
+      pre_reg_stash_(std::move(other.pre_reg_stash_)),
+      pre_reg_trade_stash_(std::move(other.pre_reg_trade_stash_)),
+      pre_reg_ttl_ms_(other.pre_reg_ttl_ms_) {
 
     assert(!other.marshal_bound_.load(std::memory_order_relaxed) &&
            "XtOrderRuntimeBook moved after bind_worker_marshal (marshal binding not transferred)");
@@ -115,6 +171,9 @@ XtOrderRuntimeBook& XtOrderRuntimeBook::operator=(XtOrderRuntimeBook&& other) no
         tracked_codes_ = std::move(other.tracked_codes_);
         instrument_registry_ = std::move(other.instrument_registry_);
         next_generation_ = other.next_generation_;
+        pre_reg_stash_ = std::move(other.pre_reg_stash_);
+        pre_reg_trade_stash_ = std::move(other.pre_reg_trade_stash_);
+        pre_reg_ttl_ms_ = other.pre_reg_ttl_ms_;
         publish_snapshot_();
     }
     return *this;
@@ -123,6 +182,8 @@ XtOrderRuntimeBook& XtOrderRuntimeBook::operator=(XtOrderRuntimeBook&& other) no
 void XtOrderRuntimeBook::bind_worker_marshal(std::thread::id worker_tid, WorkerPostFn post) {
     marshal_worker_tid_ = worker_tid;
     marshal_post_ = std::move(post);
+
+    marshal_quiescent_.store(false, std::memory_order_release);
 
     marshal_bound_.store(static_cast<bool>(marshal_post_), std::memory_order_release);
 }
@@ -133,16 +194,247 @@ void XtOrderRuntimeBook::unbind_worker_marshal() {
     marshal_post_ = nullptr;
     marshal_worker_tid_ = std::thread::id{};
     collect_first_touch_tid_.store(std::thread::id{}, std::memory_order_release);
+    marshal_quiescent_.store(false, std::memory_order_release);
 }
 
 bool XtOrderRuntimeBook::is_bound_worker_thread() const noexcept {
     if (!marshal_bound_.load(std::memory_order_acquire)) return true;
+    if (marshal_quiescent_.load(std::memory_order_acquire)) return true;
     return std::this_thread::get_id() == marshal_worker_tid_;
 }
 
+void XtOrderRuntimeBook::enter_quiescent() noexcept {
+    marshal_quiescent_.store(true, std::memory_order_release);
+}
+
 bool XtOrderRuntimeBook::post_to_worker(std::function<void()> fn) const {
-    if (!fn || !marshal_bound_.load(std::memory_order_acquire)) return false;
-    return marshal_post_(std::move(fn));
+    if (!fn) return false;
+
+    if (!marshal_bound_.load(std::memory_order_acquire)) return false;
+
+    if (marshal_quiescent_.load(std::memory_order_acquire)) {
+
+        try {
+            fn();
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[OrderBook][error] quiescent inline registration closure threw; "
+                         "registration may be incomplete.\n");
+        }
+        return true;
+    }
+
+    std::function<void()> retained = fn;
+    if (marshal_post_(std::move(fn))) return true;
+
+    return push_marshal_side_channel_(std::move(retained));
+}
+
+bool XtOrderRuntimeBook::push_marshal_side_channel_(std::function<void()> fn) const {
+    {
+        std::lock_guard<std::mutex> lk(marshal_side_channel_mu_);
+        if (marshal_side_channel_.size() >= kMarshalSideChannelCap) {
+
+            xt_runtime_book_drops::marshal_side_channel_overflow_dropped().fetch_add(
+                1, std::memory_order_relaxed);
+            static std::atomic<bool> overflow_warned{false};
+            if (!overflow_warned.exchange(true)) {
+                std::fprintf(stderr,
+                             "[OrderBook][CRITICAL] marshal side-channel overflow (cap=%zu) — "
+                             "order registration DROPPED; worker stuck draining? "
+                             "recovery reverse-sync will backfill on restart.\n",
+                             kMarshalSideChannelCap);
+            }
+            return false;
+        }
+        marshal_side_channel_.push_back(std::move(fn));
+        marshal_side_channel_depth_.store(marshal_side_channel_.size(),
+                                          std::memory_order_relaxed);
+    }
+    xt_runtime_book_drops::marshal_side_channel_used().fetch_add(1, std::memory_order_relaxed);
+
+    if (marshal_quiescent_.load(std::memory_order_acquire)) {
+        const_cast<XtOrderRuntimeBook*>(this)->drain_marshal_side_channel();
+    }
+    return true;
+}
+
+void XtOrderRuntimeBook::drain_marshal_side_channel() {
+    if (marshal_side_channel_depth_.load(std::memory_order_relaxed) == 0) return;
+    drain_marshal_side_channel_final_();
+}
+
+void XtOrderRuntimeBook::shutdown_quiesce() {
+
+    enter_quiescent();
+    drain_marshal_side_channel_final_();
+}
+
+void XtOrderRuntimeBook::drain_marshal_side_channel_final_() {
+    std::vector<std::function<void()>> batch;
+    {
+        std::lock_guard<std::mutex> lk(marshal_side_channel_mu_);
+        batch.swap(marshal_side_channel_);
+        marshal_side_channel_depth_.store(0, std::memory_order_relaxed);
+    }
+
+    for (auto& fn : batch) {
+        if (!fn) continue;
+        try {
+            fn();
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[OrderBook][error] side-channel registration closure threw; "
+                         "continuing drain.\n");
+        }
+    }
+}
+
+void XtOrderRuntimeBook::stash_pre_registration_update_(const XtOrderExecUpdate& upd,
+                                                        int64_t effective_remaining_fp) {
+    sweep_expired_pre_registration_();
+    if (pre_reg_stash_.size() >= kPreRegStashCap) {
+
+        xt_runtime_book_drops::orphan_update_dropped().fetch_add(1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+        ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_update");
+#endif
+        std::fprintf(stderr,
+                     "[OrderBook][error] on_order_update: pre-registration stash full (cap=%zu) — "
+                     "unknown-id non-terminal update dropped as true orphan, id=%llu "
+                     "(reverse sync missed / foreign order / userTag decode failure?).\n",
+                     kPreRegStashCap, static_cast<unsigned long long>(upd.id));
+        return;
+    }
+    PreRegStashEntry entry;
+    entry.id = upd.id;
+    entry.upd = upd;
+    entry.effective_remaining_fp = effective_remaining_fp;
+    entry.stash_ms = XtSteadyClock::steady_now_ms();
+    pre_reg_stash_.push_back(std::move(entry));
+}
+
+void XtOrderRuntimeBook::sweep_expired_pre_registration_() {
+    if (pre_reg_stash_.empty() && pre_reg_trade_stash_.empty()) return;
+    const int64_t now_ms = XtSteadyClock::steady_now_ms();
+
+    auto it = pre_reg_stash_.begin();
+    while (it != pre_reg_stash_.end()) {
+        if (now_ms - it->stash_ms >= pre_reg_ttl_ms_) {
+
+            xt_runtime_book_drops::orphan_update_dropped().fetch_add(1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+            ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_update");
+#endif
+            std::fprintf(stderr,
+                         "[OrderBook][error] pre-register race unresolved: update for order %llu "
+                         "stashed but no registration arrived within %lldms — counted as orphan.\n",
+                         static_cast<unsigned long long>(it->id),
+                         static_cast<long long>(pre_reg_ttl_ms_));
+            it = pre_reg_stash_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    auto tit = pre_reg_trade_stash_.begin();
+    while (tit != pre_reg_trade_stash_.end()) {
+        if (now_ms - tit->stash_ms >= pre_reg_ttl_ms_) {
+            xt_runtime_book_drops::orphan_trade_dropped().fetch_add(1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+            ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_trade");
+#endif
+            std::fprintf(stderr,
+                         "[OrderBook][error] pre-register race unresolved: trade for order %llu "
+                         "stashed but no registration arrived within %lldms — counted as orphan_trade.\n",
+                         static_cast<unsigned long long>(tit->id),
+                         static_cast<long long>(pre_reg_ttl_ms_));
+            tit = pre_reg_trade_stash_.erase(tit);
+        } else {
+            ++tit;
+        }
+    }
+}
+
+void XtOrderRuntimeBook::replay_pre_registration_updates_(uint64_t id) {
+    if (pre_reg_stash_.empty()) return;
+    sweep_expired_pre_registration_();
+
+    std::vector<PreRegStashEntry> matched;
+    auto it = pre_reg_stash_.begin();
+    while (it != pre_reg_stash_.end()) {
+        if (it->id == id) {
+            matched.push_back(std::move(*it));
+            it = pre_reg_stash_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& e : matched) {
+        on_order_update(e.upd,  false, e.effective_remaining_fp);
+    }
+}
+
+void XtOrderRuntimeBook::clear_pre_registration_for_id_(uint64_t id) {
+    if (pre_reg_stash_.empty()) return;
+    pre_reg_stash_.erase(
+        std::remove_if(pre_reg_stash_.begin(), pre_reg_stash_.end(),
+                       [id](const PreRegStashEntry& e) { return e.id == id; }),
+        pre_reg_stash_.end());
+}
+
+void XtOrderRuntimeBook::stash_pre_registration_trade_(uint64_t id, int64_t qty_fp,
+                                                       bool is_today) {
+    sweep_expired_pre_registration_();
+    if (pre_reg_trade_stash_.size() >= kPreRegTradeStashCap) {
+
+        xt_runtime_book_drops::orphan_trade_dropped().fetch_add(1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+        ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_trade");
+#endif
+        std::fprintf(stderr,
+                     "[OrderBook][error] on_trade: pre-registration trade stash full (cap=%zu) — "
+                     "unknown-id trade dropped as true orphan, id=%llu "
+                     "(reverse sync missed / foreign order / trade before registration timeout?).\n",
+                     kPreRegTradeStashCap, static_cast<unsigned long long>(id));
+        return;
+    }
+    PreRegTradeStashEntry entry;
+    entry.id = id;
+    entry.qty_fp = qty_fp;
+    entry.is_today = is_today;
+    entry.stash_ms = XtSteadyClock::steady_now_ms();
+    pre_reg_trade_stash_.push_back(entry);
+}
+
+void XtOrderRuntimeBook::replay_pre_registration_trades_(uint64_t id) {
+    if (pre_reg_trade_stash_.empty()) return;
+    sweep_expired_pre_registration_();
+
+    std::vector<PreRegTradeStashEntry> matched;
+    auto it = pre_reg_trade_stash_.begin();
+    while (it != pre_reg_trade_stash_.end()) {
+        if (it->id == id) {
+            matched.push_back(*it);
+            it = pre_reg_trade_stash_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& e : matched) {
+
+        OrderLifecycleSlot* atom = find_slot(id);
+        if (!atom) break;
+        apply_trade_fill_(*atom, id, e.qty_fp, e.is_today);
+    }
+}
+
+void XtOrderRuntimeBook::clear_pre_registration_trades_for_id_(uint64_t id) {
+    if (pre_reg_trade_stash_.empty()) return;
+    pre_reg_trade_stash_.erase(
+        std::remove_if(pre_reg_trade_stash_.begin(), pre_reg_trade_stash_.end(),
+                       [id](const PreRegTradeStashEntry& e) { return e.id == id; }),
+        pre_reg_trade_stash_.end());
 }
 
 void XtOrderRuntimeBook::init_slot_pool() {
@@ -203,7 +495,6 @@ void XtOrderRuntimeBook::erase_slot(uint64_t id) {
     auto it = id_to_slot_idx_.find(id);
     if (it == id_to_slot_idx_.end()) return;
 
-    xt_identity::OrderAttributionStore::forget_order_strategy_sid(id);
     free_slot_by_idx(it->second);
     id_to_slot_idx_.erase(it);
 }
@@ -278,6 +569,47 @@ void XtOrderRuntimeBook::remove_slot_close_contribution(const OrderLifecycleSlot
                                 slot.is_buy,
                                 -unfilled_today_fp(slot),
                                 -unfilled_yesterday_fp(slot));
+}
+
+size_t XtOrderRuntimeBook::reconcile_close_outstanding_from_slots_() {
+
+    std::unordered_map<CloseOutstandingKey, CloseOutstandingAgg, CloseOutstandingKeyHash> fresh;
+    for (const auto& kv : id_to_slot_idx_) {
+        const uint16_t idx = kv.second;
+        if (idx >= kMaxInflightOrders) continue;
+        const OrderLifecycleSlot& slot = slot_pool_[idx];
+        if (slot.id == 0 || !has_close_contribution(slot)) continue;
+        const int64_t today_fp = unfilled_today_fp(slot);
+        const int64_t yesterday_fp = unfilled_yesterday_fp(slot);
+        if (today_fp <= 0 && yesterday_fp <= 0) continue;
+        auto& agg = fresh[CloseOutstandingKey{slot.instrument_id, slot.is_buy}];
+        agg.today_fp += today_fp;
+        agg.yesterday_fp += yesterday_fp;
+    }
+    bool drift = (fresh.size() != close_outstanding_.size());
+    if (!drift) {
+        for (const auto& kv : fresh) {
+            auto it = close_outstanding_.find(kv.first);
+            if (it == close_outstanding_.end() ||
+                it->second.today_fp != kv.second.today_fp ||
+                it->second.yesterday_fp != kv.second.yesterday_fp) {
+                drift = true;
+                break;
+            }
+        }
+    }
+    if (!drift) return 0;
+    std::fprintf(stderr,
+                 "[xt_runtime_book] close_outstanding drift healed: entries %zu -> %zu\n",
+                 close_outstanding_.size(), fresh.size());
+    close_outstanding_ = std::move(fresh);
+    xt_runtime_book_drops::close_outstanding_drift_healed().fetch_add(
+        1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+    ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total(
+        "close_outstanding_drift");
+#endif
+    return 1;
 }
 
 OrderSnapshot
@@ -414,12 +746,25 @@ void XtOrderRuntimeBook::populate_submit_slot_(OrderLifecycleSlot& atom,
                                                int64_t qty_fp,
                                                int64_t price_fp,
                                                XtOffset close_offset,
-                                               bool is_close,
                                                StrategySid sid) {
+    if (close_offset == XtOffset::Auto) {
+
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[OrderBook][error] on_order_submitted: unresolved XtOffset::Auto "
+                         "reached the runtime book (first occurrence, id=%llu) — submit entry "
+                         "must resolve the sentinel; treating it as a close order.\n",
+                         static_cast<unsigned long long>(id));
+        }
+
+        assert(false && "XtOffset::Auto must be resolved before reaching the runtime book");
+    }
     atom.id = id;
     atom.instrument_id = iid;
     atom.is_buy = is_buy;
-    atom.is_close = is_close;
+
+    atom.is_close = (close_offset != XtOffset::Open);
     atom.close_offset = close_offset;
     atom.price_fp = price_fp;
     atom.leaves_qty_fp = qty_fp > 0 ? qty_fp : 0;
@@ -447,43 +792,67 @@ bool XtOrderRuntimeBook::should_skip_submit(uint64_t id) {
     return order_final_before_submit_.erase(id) > 0 || terminal_order_seen_(id);
 }
 
-void XtOrderRuntimeBook::on_order_submitted(uint64_t id,
-                                            const char* code,
-                                            bool is_buy,
-                                            int64_t qty_fp,
-                                            int64_t price_fp,
-                                            XtOffset close_offset,
-                                            const xt_account::CloseableView& closeable_view,
-                                            StrategySid sid) {
+XtOrderRuntimeBook::SubmitRegisterResult XtOrderRuntimeBook::on_order_submitted(
+    uint64_t id,
+    const char* code,
+    bool is_buy,
+    int64_t qty_fp,
+    int64_t price_fp,
+    XtOffset close_offset,
+    const xt_account::CloseableView& closeable_view,
+    StrategySid sid) {
+    using Outcome = SubmitRegisterResult::Outcome;
     assert(id != 0);
     if (id == 0) std::abort();
 
     if (!is_bound_worker_thread()) {
         std::string code_copy(code ? code : "");
-        if (post_to_worker([this, id, code_copy = std::move(code_copy), is_buy, qty_fp,
+        const bool posted =
+            post_to_worker([this, id, code_copy = std::move(code_copy), is_buy, qty_fp,
                             price_fp, close_offset, closeable_view, sid] {
-                on_order_submitted(id, code_copy.c_str(), is_buy, qty_fp, price_fp,
-                                   close_offset, closeable_view, sid);
-            })) {
-            return;
-        }
+                (void)on_order_submitted(id, code_copy.c_str(), is_buy, qty_fp, price_fp,
+                                         close_offset, closeable_view, sid);
+            });
+        return {posted ? Outcome::kDeferred : Outcome::kDropped, 0, 0};
+    }
+
+    if (should_skip_submit(id)) return {Outcome::kSkippedTerminal, 0, 0};
+
+    if (const OrderLifecycleSlot* live = find_slot(id)) {
+        xt_runtime_book_drops::duplicate_submit_blocked().fetch_add(
+            1, std::memory_order_relaxed);
+#ifdef XT_HAVE_METRICS
+        ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total(
+            "duplicate_submit");
+#endif
+        std::fprintf(stderr,
+                     "[OrderBook][error] on_order_submitted: duplicate id for a live slot — "
+                     "registration dropped, existing slot kept. id=%llu code=%s "
+                     "(existing: leaves_fp=%lld qty_fp=%lld filled_upd_fp=%lld "
+                     "filled_trd_fp=%lld sid_id=%u) "
+                     "(order-id generator collision / duplicate submit replay?).\n",
+                     static_cast<unsigned long long>(id), code ? code : "",
+                     static_cast<long long>(live->leaves_qty_fp),
+                     static_cast<long long>(live->qty_fp),
+                     static_cast<long long>(live->filled_upd_fp),
+                     static_cast<long long>(live->filled_trd_fp),
+                     live->sid_id);
+
+        assert(false && "duplicate on_order_submitted for a live order id");
+        return {Outcome::kBlockedDuplicate, 0, 0};
     }
 
     const XtInstrumentId iid = (code && code[0] != '\0')
                                    ? instrument_registry_.register_or_get(code)
                                    : kInvalidInstrumentId;
 
-    XtOrderRuntimeBook::OrderLifecycleSlot* old_slot = find_slot(id);
-    if (old_slot) {
-        remove_slot_close_contribution(*old_slot);
-    }
-
     const bool is_close = (close_offset != XtOffset::Open);
     bool inserted = false;
     XtOrderRuntimeBook::OrderLifecycleSlot* atom = upsert_slot(id, inserted);
-    if (!atom) return;
 
-    populate_submit_slot_(*atom, id, iid, is_buy, qty_fp, price_fp, close_offset, is_close, sid);
+    if (!atom) return {Outcome::kDropped, 0, 0};
+
+    populate_submit_slot_(*atom, id, iid, is_buy, qty_fp, price_fp, close_offset, sid);
 
     if (is_close && qty_fp > 0) {
         init_close_locks_on_submit(iid, is_buy, qty_fp, close_offset, closeable_view, *atom);
@@ -495,17 +864,29 @@ void XtOrderRuntimeBook::on_order_submitted(uint64_t id,
         tracked_codes_.insert(iid);
     }
     publish_snapshot_();
+
+    replay_pre_registration_updates_(id);
+    replay_pre_registration_trades_(id);
+
+    if (should_skip_submit(id)) return {Outcome::kSkippedTerminal, 0, 0};
+
+    const OrderLifecycleSlot* live = find_slot(id);
+    if (!live) return {Outcome::kSkippedTerminal, 0, 0};
+    return {Outcome::kRegistered,
+            std::max(live->filled_upd_fp, live->filled_trd_fp),
+            slot_leaves_from_filled(*live)};
 }
 
-void XtOrderRuntimeBook::on_order_submitted(uint64_t id,
-                                            const char* code,
-                                            bool is_buy,
-                                            int64_t qty_fp,
-                                            int64_t price_fp,
-                                            XtOffset close_offset,
-                                            const xt_account::CloseableView& closeable_view) {
-    on_order_submitted(id, code, is_buy, qty_fp, price_fp, close_offset, closeable_view,
-                       StrategySid::legacy());
+XtOrderRuntimeBook::SubmitRegisterResult XtOrderRuntimeBook::on_order_submitted(
+    uint64_t id,
+    const char* code,
+    bool is_buy,
+    int64_t qty_fp,
+    int64_t price_fp,
+    XtOffset close_offset,
+    const xt_account::CloseableView& closeable_view) {
+    return on_order_submitted(id, code, is_buy, qty_fp, price_fp, close_offset,
+                              closeable_view, StrategySid::legacy());
 }
 
 void XtOrderRuntimeBook::init_close_locks_on_submit(XtInstrumentId instrument_id,
@@ -600,41 +981,44 @@ int64_t XtOrderRuntimeBook::slot_leaves_from_filled(const OrderLifecycleSlot& s)
 
 void XtOrderRuntimeBook::on_trade(const XtTradeRecord& tr) {
 
-    XT_ALLOC_GUARD();
+    drain_marshal_side_channel();
     const int64_t tr_qty_fp = tr.qty_fp;
     if (tr.order_id == 0 || tr_qty_fp <= 0) return;
 
     XtOrderRuntimeBook::OrderLifecycleSlot* atom = find_slot(tr.order_id);
-    if (!atom) return;
+    if (!atom) {
 
-    remove_slot_close_contribution(*atom);
-    if (atom->qty_fp > 0) {
-        atom->filled_trd_fp =
-            std::min(atom->qty_fp, atom->filled_trd_fp + tr_qty_fp);
-        atom->leaves_qty_fp = slot_leaves_from_filled(*atom);
-    } else {
-
-        atom->leaves_qty_fp = std::max<int64_t>(0, atom->leaves_qty_fp - tr_qty_fp);
+        if (terminal_order_seen_(tr.order_id)) return;
+        stash_pre_registration_trade_(tr.order_id, tr_qty_fp, tr.is_today);
+        return;
     }
-    accumulate_close_fills_on_trade(*atom, tr_qty_fp, tr.is_today);
-
-    if (atom->leaves_qty_fp <= 0) {
-        remember_terminal_order_(tr.order_id);
-        erase_slot(tr.order_id);
-    } else {
-        atom->status = XtOrderStatus::PartiallyFilled;
-        add_slot_close_contribution(*atom);
-    }
-    publish_snapshot_();
+    apply_trade_fill_(*atom, tr.order_id, tr_qty_fp, tr.is_today);
 }
 
-std::string XtOrderRuntimeBook::resolve_order_code_on_update(const XtOrderExecUpdate& upd) const {
-    assert(upd.id != 0);
-    if (upd.id == 0) std::abort();
-    const XtOrderRuntimeBook::OrderLifecycleSlot* slot = find_slot(upd.id);
-    if (!slot) return "";
+void XtOrderRuntimeBook::apply_trade_fill_(OrderLifecycleSlot& atom, uint64_t id,
+                                           int64_t qty_fp, bool is_today) {
 
-    return instrument_registry_.code_of(slot->instrument_id);
+    remove_slot_close_contribution(atom);
+    if (atom.qty_fp > 0) {
+        atom.filled_trd_fp = std::min(atom.qty_fp, atom.filled_trd_fp + qty_fp);
+        atom.leaves_qty_fp = slot_leaves_from_filled(atom);
+    } else {
+
+        atom.leaves_qty_fp = std::max<int64_t>(0, atom.leaves_qty_fp - qty_fp);
+    }
+    accumulate_close_fills_on_trade(atom, qty_fp, is_today);
+
+    if (atom.leaves_qty_fp <= 0) {
+        remember_terminal_order_(id);
+
+        xt_identity::OrderAttributionStore::retire_order_strategy_sid(
+            id, XtSteadyClock::steady_now_ms());
+        erase_slot(id);
+    } else {
+        atom.status = XtOrderStatus::PartiallyFilled;
+        add_slot_close_contribution(atom);
+    }
+    publish_snapshot_();
 }
 
 XtInstrumentId XtOrderRuntimeBook::resolve_instrument_id_on_update(const XtOrderExecUpdate& upd) const {
@@ -657,10 +1041,11 @@ void XtOrderRuntimeBook::upsert_order_atom_on_update(const XtOrderExecUpdate& up
     if (upd_instrument_id != kInvalidInstrumentId) atom->instrument_id = upd_instrument_id;
     atom->is_buy = upd.is_buy;
     atom->status = upd.status;
-    atom->is_close = atom->is_close || upd.is_close();
+
     if (upd.close_offset != XtOffset::Open) {
         atom->close_offset = upd.close_offset;
     }
+    atom->is_close = (atom->close_offset != XtOffset::Open);
     if (atom->sid_id == 0 && upd.sid_id != 0) {
         atom->sid_id = upd.sid_id;
     }
@@ -690,9 +1075,14 @@ void XtOrderRuntimeBook::on_order_update(const XtOrderExecUpdate& upd,
                                          bool final_status,
                                          int64_t effective_remaining_fp) {
 
+    drain_marshal_side_channel();
+
     const bool was_locally_submitted = (upd.id != 0) && (find_slot(upd.id) != nullptr);
     if (upd.id != 0 && final_status) {
         remember_terminal_order_(upd.id);
+
+        clear_pre_registration_for_id_(upd.id);
+        clear_pre_registration_trades_for_id_(upd.id);
     }
     if (upd.id != 0 && final_status && !was_locally_submitted) {
 
@@ -706,16 +1096,8 @@ void XtOrderRuntimeBook::on_order_update(const XtOrderExecUpdate& upd,
     }
 
     if (!final_status && upd.id != 0 && !was_locally_submitted) {
-        xt_runtime_book_drops::orphan_update_dropped().fetch_add(
-            1, std::memory_order_relaxed);
-#ifdef XT_HAVE_METRICS
-        ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_update");
-#endif
-        std::fprintf(stderr,
-                     "[OrderBook][error] on_order_update: find_slot(%llu) failed and "
-                     "!final_status — reverse sync should have filled this slot. "
-                     "Possible bug: reverse sync missed / foreign order / userTag decode failure.\n",
-                     static_cast<unsigned long long>(upd.id));
+
+        stash_pre_registration_update_(upd, effective_remaining_fp);
         return;
     }
 
@@ -726,6 +1108,9 @@ void XtOrderRuntimeBook::on_order_update(const XtOrderExecUpdate& upd,
         XtOrderRuntimeBook::OrderLifecycleSlot* slot = find_slot(upd.id);
         if (slot) {
             remove_slot_close_contribution(*slot);
+
+            xt_identity::OrderAttributionStore::retire_order_strategy_sid(
+                upd.id, XtSteadyClock::steady_now_ms());
             erase_slot(upd.id);
         }
         publish_snapshot_();
@@ -805,6 +1190,9 @@ void XtOrderRuntimeBook::reset_for_recovery(const std::vector<std::string>& posi
         order_terminal_fifo_.clear();
         tracked_codes_.clear();
 
+        pre_reg_stash_.clear();
+        pre_reg_trade_stash_.clear();
+
         init_slot_pool();
         for (const auto& code : position_codes) {
             if (code.empty()) continue;
@@ -880,14 +1268,6 @@ std::vector<std::string> XtOrderRuntimeBook::sync_position_snapshot(
     return stale_codes;
 }
 
-void XtOrderRuntimeBook::on_position_snapshot(
-    const std::vector<std::string>& position_codes,
-    bool is_recovery,
-    bool is_cold_start) {
-
-    (void)sync_position_snapshot(position_codes, is_recovery, is_cold_start);
-}
-
 int64_t XtOrderRuntimeBook::open_no_trade_qty_fp(const char* code, bool is_buy) const {
     if (!code || code[0] == '\0') return 0;
     auto guard = hp_domain_.protect(current_);
@@ -904,7 +1284,6 @@ int64_t XtOrderRuntimeBook::open_no_trade_qty_fp(const char* code, bool is_buy) 
 }
 
 int64_t XtOrderRuntimeBook::undone_qty_fp(const char* code) const {
-    XT_ALLOC_GUARD();
     const bool filter_by_code = (code && code[0] != '\0');
     auto guard = hp_domain_.protect(current_);
     if (!guard) return 0;
@@ -919,7 +1298,6 @@ int64_t XtOrderRuntimeBook::undone_qty_fp(const char* code) const {
 }
 
 int64_t XtOrderRuntimeBook::signed_inflight_fp(StrategySid sid, const char* code) const {
-    XT_ALLOC_GUARD();
     const bool filter_by_code = (code && code[0] != '\0');
     const bool filter_by_sid  = sid.has_value();
     const uint32_t want_sid   = sid.raw();
@@ -962,12 +1340,13 @@ void XtOrderRuntimeBook::record_force_flat_order(uint64_t oid,
     if (oid == 0 || code.empty()) std::abort();
 
     if (!is_bound_worker_thread()) {
-        if (post_to_worker([this, oid, code, is_buy, qty_fp, close_offset, sid] {
-                record_force_flat_order(oid, code, is_buy, qty_fp, close_offset, sid);
-            })) {
-            return;
-        }
+        (void)post_to_worker([this, oid, code, is_buy, qty_fp, close_offset, sid] {
+            record_force_flat_order(oid, code, is_buy, qty_fp, close_offset, sid);
+        });
+        return;
     }
+
+    if (should_skip_submit(oid)) return;
 
     const XtInstrumentId iid = instrument_registry_.register_or_get(code.c_str());
 
@@ -986,7 +1365,10 @@ void XtOrderRuntimeBook::record_force_flat_order(uint64_t oid,
     atom->is_buy = is_buy;
     atom->is_close = true;
     atom->is_force_flat = true;
-    atom->close_offset = close_offset;
+
+    assert(close_offset != XtOffset::Open);
+    atom->close_offset =
+        (close_offset == XtOffset::Open) ? XtOffset::Close : close_offset;
     atom->leaves_qty_fp = std::max<int64_t>(0, qty_fp);
     atom->qty_fp = std::max<int64_t>(0, qty_fp);
     atom->filled_upd_fp = 0;
@@ -1015,14 +1397,9 @@ void XtOrderRuntimeBook::record_force_flat_order(uint64_t oid,
         tracked_codes_.insert(iid);
     }
     publish_snapshot_();
-}
 
-void XtOrderRuntimeBook::record_global_force_flat_order(uint64_t oid,
-                                                         const std::string& code,
-                                                         bool is_buy,
-                                                         int64_t qty_fp,
-                                                         XtOffset close_offset) {
-    record_force_flat_order(oid, code, is_buy, qty_fp, close_offset, StrategySid::legacy());
+    replay_pre_registration_updates_(oid);
+    replay_pre_registration_trades_(oid);
 }
 
 void XtOrderRuntimeBook::fillup_populate_slot_(OrderLifecycleSlot& atom,
@@ -1140,9 +1517,12 @@ void XtOrderRuntimeBook::fillup_alloc_filled_(OrderLifecycleSlot& atom, int64_t 
         atom.filled_today_fp = std::min(filled_fp, atom.locked_today_fp);
     } else {
 
-        const int64_t total_locked = atom.locked_today_fp + atom.locked_yesterday_fp;
+        const __int128 total_locked = static_cast<__int128>(atom.locked_today_fp) +
+                                      static_cast<__int128>(atom.locked_yesterday_fp);
         if (total_locked > 0) {
-            const int64_t t = (filled_fp * atom.locked_today_fp) / total_locked;
+            const __int128 prod = static_cast<__int128>(filled_fp) *
+                                  static_cast<__int128>(atom.locked_today_fp);
+            const int64_t t = static_cast<int64_t>(prod / total_locked);
             const int64_t y = filled_fp - t;
             atom.filled_today_fp = std::min(t, atom.locked_today_fp);
             atom.filled_yesterday_fp = std::min(y, atom.locked_yesterday_fp);
@@ -1172,13 +1552,39 @@ struct QuotaKeyHash {
 void XtOrderRuntimeBook::fillup_alive_inflight_orders_batch(
     const std::vector<AliveInflightOrder>& orders,
     std::function<xt_account::CloseableView(const std::string& code,
-                                             bool is_buy_to_close)> view_for) {
+                                             bool is_buy_to_close)> view_for,
+    std::vector<AcceptedRearmOrder>* accepted_out) {
 
     std::unordered_map<QuotaKey, xt_account::CloseableView, QuotaKeyHash> remaining;
     remaining.reserve(orders.size() * 2);
 
-    for (const auto& ord : orders) {
-        if (ord.local_id == 0 || ord.code.empty()) continue;
+    bool batch_qty_clamped = false;
+    uint64_t batch_first_bad_id = 0;
+    int64_t batch_first_bad_total = 0;
+    int64_t batch_first_bad_filled = 0;
+
+    for (const auto& raw : orders) {
+        if (raw.local_id == 0 || raw.code.empty()) continue;
+
+        if (terminal_order_seen_(raw.local_id)) {
+            xt_runtime_book_drops::fillup_terminal_resurrect_blocked().fetch_add(
+                1, std::memory_order_relaxed);
+            continue;
+        }
+
+        AliveInflightOrder ord = raw;
+        const bool bad_total = clamp_fillup_venue_qty(ord.total_qty_fp);
+        const bool bad_filled = clamp_fillup_venue_qty(ord.filled_qty_fp);
+        if (bad_total || bad_filled) {
+            xt_runtime_book_drops::venue_fillup_qty_sanitized().fetch_add(
+                1, std::memory_order_relaxed);
+            if (!batch_qty_clamped) {
+                batch_qty_clamped = true;
+                batch_first_bad_id = raw.local_id;
+                batch_first_bad_total = raw.total_qty_fp;
+                batch_first_bad_filled = raw.filled_qty_fp;
+            }
+        }
 
         const XtInstrumentId iid = instrument_registry_.register_or_get(ord.code.c_str());
         if (iid == kInvalidInstrumentId) continue;
@@ -1224,9 +1630,37 @@ void XtOrderRuntimeBook::fillup_alive_inflight_orders_batch(
         add_slot_close_contribution(*atom);
 
         tracked_codes_.insert(iid);
+
+        if (accepted_out)
+            accepted_out->push_back(
+                AcceptedRearmOrder{ord.code, ord.local_id, ord.is_buy, ord.price_fp});
+    }
+
+    if (batch_qty_clamped) {
+        std::fprintf(stderr,
+                     "[OrderBook][error] fillup: venue-reported qty out of sane bound "
+                     "(<0 or >%lld fp) — clamped to [0,cap], continuing recovery. "
+                     "first bad order id=%llu total_fp=%lld filled_fp=%lld "
+                     "(clientOrderId/OrderRef decode or transport corruption?).\n",
+                     static_cast<long long>(kMaxSaneFillupQtyFp),
+                     static_cast<unsigned long long>(batch_first_bad_id),
+                     static_cast<long long>(batch_first_bad_total),
+                     static_cast<long long>(batch_first_bad_filled));
     }
 
     publish_snapshot_();
+
+    if (!pre_reg_stash_.empty() || !pre_reg_trade_stash_.empty()) {
+        for (const auto& raw : orders) {
+            if (raw.local_id == 0) continue;
+            if (find_slot(raw.local_id) != nullptr) {
+
+                replay_pre_registration_updates_(raw.local_id);
+
+                clear_pre_registration_trades_for_id_(raw.local_id);
+            }
+        }
+    }
 }
 
 void XtOrderRuntimeBook::collect_active_order_prices(const char* code,
@@ -1333,6 +1767,8 @@ bool XtOrderRuntimeBook::has_genuine_global_force_flat_pending(const char* code)
 bool XtOrderRuntimeBook::is_collect_thread_allowed_() const noexcept {
 
     if (marshal_bound_.load(std::memory_order_acquire)) {
+
+        if (marshal_quiescent_.load(std::memory_order_acquire)) return true;
         return std::this_thread::get_id() == marshal_worker_tid_;
     }
 
@@ -1418,27 +1854,8 @@ uint32_t XtOrderRuntimeBook::order_sid_id(uint64_t id) const {
     return slot.sid_id;
 }
 
-size_t XtOrderRuntimeBook::collect_recovered_unowned_ids(uint64_t* out, size_t max) const {
-    if (!out || max == 0) return 0;
-    if (!is_collect_thread_allowed_()) {
-        on_cross_thread_direct_read_blocked_();
-        return 0;
-    }
-
-    size_t n = 0;
-    for (const auto& kv : id_to_slot_idx_) {
-        if (n >= max) break;
-        const uint16_t idx = kv.second;
-        if (idx >= kMaxInflightOrders) continue;
-        const OrderLifecycleSlot& slot = slot_pool_[idx];
-        if (slot.id == 0 || !slot.recovered_unowned) continue;
-        if (slot.leaves_qty_fp <= 0) continue;
-        out[n++] = slot.id;
-    }
-    return n;
-}
-
-size_t XtOrderRuntimeBook::reap_recovered_unowned(uint64_t* out, size_t max) {
+size_t XtOrderRuntimeBook::reap_recovered_unowned(uint64_t* out, size_t max,
+                                                  std::vector<uint64_t>* reaped_ids) {
     if (!out || max == 0) return 0;
     if (!is_collect_thread_allowed_()) {
         on_cross_thread_direct_read_blocked_();
@@ -1456,21 +1873,33 @@ size_t XtOrderRuntimeBook::reap_recovered_unowned(uint64_t* out, size_t max) {
         if (slot.leaves_qty_fp <= 0) continue;
         if (!slot.orphan_reap_attempted) {
 
-            slot.orphan_reap_attempted = true;
-            if (n < max) out[n++] = slot.id;
+            if (n < max) {
+                slot.orphan_reap_attempted = true;
+                out[n++] = slot.id;
+            }
         } else if (dead_n < dead.size()) {
 
             dead[dead_n++] = slot.id;
         }
     }
     for (size_t i = 0; i < dead_n; ++i) {
+
+        if (OrderLifecycleSlot* dead_slot = find_slot(dead[i])) {
+            remove_slot_close_contribution(*dead_slot);
+        }
+
+        xt_identity::OrderAttributionStore::forget_order_strategy_sid(dead[i]);
+
+        if (reaped_ids) reaped_ids->push_back(dead[i]);
         erase_slot(dead[i]);
         xt_runtime_book_drops::orphan_reap_dropped().fetch_add(1, std::memory_order_relaxed);
 #ifdef XT_HAVE_METRICS
         ct::metrics::XtMetricRegistry::instance().inc_runtime_book_drop_total("orphan_reap");
 #endif
     }
-    if (dead_n > 0) publish_snapshot_();
+
+    const size_t drift = reconcile_close_outstanding_from_slots_();
+    if (dead_n > 0 || drift > 0) publish_snapshot_();
     return n;
 }
 

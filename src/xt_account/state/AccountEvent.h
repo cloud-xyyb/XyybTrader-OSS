@@ -19,9 +19,6 @@ struct XtAccountEvent {
         MarketTick,
         OrderAccepted,
         OrderExecUpdate,
-        OrderFilled,
-        OrderCanceled,
-        OrderRejected,
         DailySettlement,
         CashTransfer,
         TradeEx,
@@ -30,8 +27,6 @@ struct XtAccountEvent {
     Type type = Type::Invalid;
     const char* code = nullptr;
     uint64_t order_id = 0;
-
-    uint32_t trading_date = 0;
 
     union {
         // SetCash / CashTransfer：资金事件；SetCash 写现金绝对值，CashTransfer 累加现金变动。
@@ -64,10 +59,9 @@ struct XtAccountEvent {
             int64_t per_unit_margin;
         } order_accepted;
 
-        // OrderExecUpdate / OrderFilled / OrderCanceled / OrderRejected：订单状态回报；终态释放冻结。
+        // OrderExecUpdate：订单状态回报；终态释放冻结。
         struct {
             int64_t filled;
-            int64_t remaining;
             bool is_final;
         } order_state;
 
@@ -88,10 +82,9 @@ struct XtAccountEvent {
         } trade_ex;
     } payload = {};
 
-    static XtAccountEvent session_begin(uint32_t date) {
+    static XtAccountEvent session_begin() {
         XtAccountEvent ev;
         ev.type = Type::SessionBegin;
-        ev.trading_date = date;
         return ev;
     }
 
@@ -154,52 +147,12 @@ struct XtAccountEvent {
         return ev;
     }
 
-    static XtAccountEvent order_update(uint64_t order_id,
-                                       int64_t filled,
-                                       int64_t remaining,
-                                       bool is_final) {
+    static XtAccountEvent order_update(uint64_t order_id, int64_t filled, bool is_final) {
         XtAccountEvent ev;
         ev.type = Type::OrderExecUpdate;
         ev.order_id = order_id;
-        ev.payload.order_state.filled    = filled;
-        ev.payload.order_state.remaining = remaining;
-        ev.payload.order_state.is_final  = is_final;
-        return ev;
-    }
-
-    static XtAccountEvent order_filled(uint64_t order_id,
-                                       int64_t filled,
-                                       int64_t remaining) {
-        XtAccountEvent ev;
-        ev.type = Type::OrderFilled;
-        ev.order_id = order_id;
-        ev.payload.order_state.filled    = filled;
-        ev.payload.order_state.remaining = remaining;
-        ev.payload.order_state.is_final  = true;
-        return ev;
-    }
-
-    static XtAccountEvent order_canceled(uint64_t order_id,
-                                         int64_t filled,
-                                         int64_t remaining) {
-        XtAccountEvent ev;
-        ev.type = Type::OrderCanceled;
-        ev.order_id = order_id;
-        ev.payload.order_state.filled    = filled;
-        ev.payload.order_state.remaining = remaining;
-        ev.payload.order_state.is_final  = true;
-        return ev;
-    }
-
-    static XtAccountEvent order_rejected(uint64_t order_id,
-                                         int64_t filled,
-                                         int64_t remaining) {
-        XtAccountEvent ev;
-        ev.type = Type::OrderRejected;
-        ev.order_id = order_id;
-        ev.payload.order_state.filled    = filled;
-        ev.payload.order_state.remaining = remaining;
-        ev.payload.order_state.is_final  = true;
+        ev.payload.order_state.filled   = filled;
+        ev.payload.order_state.is_final = is_final;
         return ev;
     }
 

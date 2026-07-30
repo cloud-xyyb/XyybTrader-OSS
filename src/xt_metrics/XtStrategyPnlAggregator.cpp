@@ -1,11 +1,15 @@
 #include "xt_metrics/XtStrategyPnlAggregator.h"
 
 #include "xt_util/path/PathUtil.h"
+#include "XtLogger.h"
 
+#include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -21,6 +25,35 @@ constexpr double kFpScale = 1'000'000.0;
 
 std::string normalize_sid(std::string_view sid) {
     return sid.empty() ? std::string("_default") : std::string(sid);
+}
+
+bool is_value_terminator(char c) {
+    return c == '\0' || c == ',' || c == '}' || c == ']';
+}
+
+bool parse_int64_strict(const char* s, int64_t& out) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s) return false;
+    if (errno == ERANGE) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') ++end;
+    if (!is_value_terminator(*end)) return false;
+    out = static_cast<int64_t>(v);
+    return true;
+}
+
+bool parse_double_strict(const char* s, double& out) {
+    errno = 0;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s) return false;
+    if (errno == ERANGE) return false;
+    if (!std::isfinite(v)) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') ++end;
+    if (!is_value_terminator(*end)) return false;
+    out = v;
+    return true;
 }
 
 std::string json_escape(std::string_view s) {
@@ -142,20 +175,82 @@ bool XtStrategyPnlAggregator::save_state(std::string_view path) const {
     return out.commit();
 }
 
-bool XtStrategyPnlAggregator::load_state(std::string_view path) {
-    std::ifstream f{std::string(path)};
-    if (!f) return false;
+XtStrategyPnlAggregator::LoadResult
+XtStrategyPnlAggregator::reject_and_quarantine_(const std::string& path,
+                                               std::string_view reason) {
+    invalid_load_count_.fetch_add(1, std::memory_order_relaxed);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    fs::path dst(path + ".quarantine");
+    if (fs::exists(dst, ec) || ec) {
+        const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        dst = fs::path(path + ".quarantine." + std::to_string(epoch_ms));
+    }
+    fs::rename(path, dst, ec);
+    if (ec) {
+        XtLogger::error_m("control",
+            "PNL aggregator state INVALID ({}); quarantine rename FAILED ({}): {} -> {}; "
+            "rows_ unchanged, caller must fail-closed",
+            std::string(reason), ec.message(), path, dst.string());
+    } else {
+        XtLogger::error_m("control",
+            "PNL aggregator state INVALID ({}); quarantined {} -> {}; "
+            "rows_ unchanged, caller must fail-closed",
+            std::string(reason), path, dst.string());
+    }
+    return LoadResult::kInvalid;
+}
+
+XtStrategyPnlAggregator::LoadResult
+XtStrategyPnlAggregator::load_state(std::string_view path) {
+    namespace fs = std::filesystem;
+    const std::string p(path);
+
+    std::error_code ec;
+    const bool present = fs::exists(p, ec);
+    if (ec) {
+        invalid_load_count_.fetch_add(1, std::memory_order_relaxed);
+        XtLogger::error_m("control",
+            "PNL aggregator state cannot be stat'd ({}): {}; fail-closed kInvalid, "
+            "rows_ unchanged, caller must fail-closed", ec.message(), p);
+        return LoadResult::kInvalid;
+    }
+
+    if (!present) return LoadResult::kMissing;
+
+    std::ifstream f{p};
+
+    if (!f) return reject_and_quarantine_(p, "state file exists but cannot be opened");
+
     std::ostringstream ss;
     ss << f.rdbuf();
     const std::string body = ss.str();
-    if (body.empty()) return false;
+
+    {
+        auto vpos = body.find("\"version\"");
+        if (vpos == std::string::npos)
+            return reject_and_quarantine_(p, "missing top-level version");
+        auto vc = body.find(':', vpos);
+        if (vc == std::string::npos)
+            return reject_and_quarantine_(p, "malformed version field");
+        int64_t version = 0;
+        if (!parse_int64_strict(body.c_str() + vc + 1, version))
+            return reject_and_quarantine_(p, "non-integer version value");
+        if (version != 1)
+            return reject_and_quarantine_(p, "unsupported version (expect 1)");
+    }
 
     auto rows_pos = body.find("\"rows\"");
-    if (rows_pos == std::string::npos) return false;
+    if (rows_pos == std::string::npos)
+        return reject_and_quarantine_(p, "missing rows array");
     auto arr_open = body.find('[', rows_pos);
-    if (arr_open == std::string::npos) return false;
+    if (arr_open == std::string::npos)
+        return reject_and_quarantine_(p, "rows array not opened");
     auto arr_close = body.find(']', arr_open);
-    if (arr_close == std::string::npos) return false;
+    if (arr_close == std::string::npos)
+        return reject_and_quarantine_(p, "rows array not closed (truncated)");
 
     std::string arr = body.substr(arr_open + 1, arr_close - arr_open - 1);
     std::unordered_map<Key, State, PairHash> parsed;
@@ -164,49 +259,62 @@ bool XtStrategyPnlAggregator::load_state(std::string_view path) {
         auto obj_open = arr.find('{', pos);
         if (obj_open == std::string::npos) break;
         auto obj_close = arr.find('}', obj_open);
-        if (obj_close == std::string::npos) break;
+        if (obj_close == std::string::npos)
+            return reject_and_quarantine_(p, "row object not closed (brace mismatch)");
         std::string obj = arr.substr(obj_open + 1, obj_close - obj_open - 1);
         pos = obj_close + 1;
 
-        auto extract_str = [&](const std::string& key) -> std::string {
+        auto extract_str = [&](const std::string& key, std::string& out) -> bool {
             auto k = obj.find("\"" + key + "\"");
-            if (k == std::string::npos) return {};
+            if (k == std::string::npos) return false;
             auto c = obj.find(':', k);
-            if (c == std::string::npos) return {};
+            if (c == std::string::npos) return false;
             auto q1 = obj.find('"', c);
-            if (q1 == std::string::npos) return {};
+            if (q1 == std::string::npos) return false;
             auto q2 = obj.find('"', q1 + 1);
-            if (q2 == std::string::npos) return {};
-            return obj.substr(q1 + 1, q2 - q1 - 1);
+            if (q2 == std::string::npos) return false;
+            out = obj.substr(q1 + 1, q2 - q1 - 1);
+            return true;
         };
-        auto extract_int64 = [&](const std::string& key) -> int64_t {
+
+        auto value_start = [&](const std::string& key) -> const char* {
             auto k = obj.find("\"" + key + "\"");
-            if (k == std::string::npos) return 0;
+            if (k == std::string::npos) return nullptr;
             auto c = obj.find(':', k);
-            if (c == std::string::npos) return 0;
-            return std::strtoll(obj.c_str() + c + 1, nullptr, 10);
+            if (c == std::string::npos) return nullptr;
+            return obj.c_str() + c + 1;
         };
-        auto extract_double = [&](const std::string& key) -> double {
-            auto k = obj.find("\"" + key + "\"");
-            if (k == std::string::npos) return 0.0;
-            auto c = obj.find(':', k);
-            if (c == std::string::npos) return 0.0;
-            return std::atof(obj.c_str() + c + 1);
-        };
-        std::string sid  = extract_str("sid");
-        std::string code = extract_str("code");
-        if (code.empty()) continue;
-        State st;
-        st.realized_fp = extract_int64("realized_fp");
-        st.fees        = extract_double("fees");
-        st.fills       = static_cast<uint64_t>(extract_int64("fills"));
-        parsed[Key{normalize_sid(sid), std::move(code)}] = std::move(st);
+
+        std::string sid;
+        std::string code;
+        const bool  sid_ok  = extract_str("sid", sid);
+        const bool  code_ok = extract_str("code", code);
+        const char* rf      = value_start("realized_fp");
+        const char* fe      = value_start("fees");
+        const char* fl      = value_start("fills");
+        if (!sid_ok || !code_ok || rf == nullptr || fe == nullptr || fl == nullptr)
+            return reject_and_quarantine_(p, "row missing required field");
+        if (code.empty())
+            return reject_and_quarantine_(p, "row with empty code");
+
+        State stt;
+        if (!parse_int64_strict(rf, stt.realized_fp))
+            return reject_and_quarantine_(p, "invalid realized_fp");
+        if (!parse_double_strict(fe, stt.fees))
+            return reject_and_quarantine_(p, "invalid fees");
+        int64_t fills_i = 0;
+        if (!parse_int64_strict(fl, fills_i) || fills_i < 0)
+            return reject_and_quarantine_(p, "invalid fills");
+        stt.fills = static_cast<uint64_t>(fills_i);
+
+        auto ins = parsed.emplace(Key{normalize_sid(sid), std::move(code)}, stt);
+        if (!ins.second)
+            return reject_and_quarantine_(p, "duplicate (sid, code) key");
     }
 
-    if (parsed.empty()) return false;
     std::unique_lock<std::shared_mutex> lock(mu_);
     rows_ = std::move(parsed);
-    return true;
+    return LoadResult::kLoaded;
 }
 
 }

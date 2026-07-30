@@ -66,10 +66,18 @@ void BinanceOrderLedger::erase_inflight_unlocked_(OrderRecord& rec) {
     rec.trace_id = 0;
 }
 
-void BinanceOrderLedger::erase_client_route_unlocked_(OrderRecord& rec) {
-    if (rec.client_order_id.empty()) return;
+bool BinanceOrderLedger::erase_client_route_unlocked_(OrderRecord& rec) {
+    if (rec.client_order_id.empty()) return false;
     client_to_local_.erase(rec.client_order_id);
     rec.client_order_id.clear();
+    return true;
+}
+
+void BinanceOrderLedger::settle_ack_terminal_unlocked_(OrderRecord& rec) {
+    erase_inflight_unlocked_(rec);
+    if (erase_client_route_unlocked_(rec)) {
+        route_erased_ack_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 BinanceOrderLedger::TerminalDecision
@@ -124,20 +132,20 @@ BinanceOrderLedger::on_ack(const TransportAck& ack, uint64_t local_cb_us) {
         if (order_status_is_final(upd.status)) {
             upd.leaves_fp = 0;
             remember_terminal_unlocked_(ack.local_id);
-            if (it != records_.end()) erase_inflight_unlocked_(it->second);
+            if (it != records_.end()) settle_ack_terminal_unlocked_(it->second);
         }
         break;
     case TransportAck::Kind::kCanceled:
 
         upd.status = XtOrderStatus::Canceled;
         remember_terminal_unlocked_(ack.local_id);
-        if (it != records_.end()) erase_inflight_unlocked_(it->second);
+        if (it != records_.end()) settle_ack_terminal_unlocked_(it->second);
         break;
     case TransportAck::Kind::kRejected:
         upd.status = XtOrderStatus::Rejected;
         upd.leaves_fp = 0;
         remember_terminal_unlocked_(ack.local_id);
-        if (it != records_.end()) erase_inflight_unlocked_(it->second);
+        if (it != records_.end()) settle_ack_terminal_unlocked_(it->second);
         break;
     case TransportAck::Kind::kTransportError_Stale:
     case TransportAck::Kind::kTransportError_TimeoutBeforeSend:
@@ -147,7 +155,7 @@ BinanceOrderLedger::on_ack(const TransportAck& ack, uint64_t local_cb_us) {
         upd.status = XtOrderStatus::Rejected;
         upd.leaves_fp = 0;
         remember_terminal_unlocked_(ack.local_id);
-        if (it != records_.end()) erase_inflight_unlocked_(it->second);
+        if (it != records_.end()) settle_ack_terminal_unlocked_(it->second);
         break;
     case TransportAck::Kind::kTransportError_TimeoutAfterSend:
     case TransportAck::Kind::kTransportError_Disconnect:
@@ -158,7 +166,7 @@ BinanceOrderLedger::on_ack(const TransportAck& ack, uint64_t local_cb_us) {
         upd.status = XtOrderStatus::Rejected;
         upd.leaves_fp = 0;
         remember_terminal_unlocked_(ack.local_id);
-        if (it != records_.end()) erase_inflight_unlocked_(it->second);
+        if (it != records_.end()) settle_ack_terminal_unlocked_(it->second);
         break;
     }
     return d;
@@ -198,11 +206,19 @@ BinanceOrderLedger::on_reconcile_terminal(uint64_t local_id, ReconcileTerminal k
         apply_record_fields_(it->second, upd);
         remember_terminal_unlocked_(local_id);
         erase_inflight_unlocked_(it->second);
+        if (erase_client_route_unlocked_(it->second)) {
+            route_erased_reconcile_.fetch_add(1, std::memory_order_relaxed);
+        }
         break;
     case ReconcileTerminal::kVenueTerminal:
 
         remember_terminal_unlocked_(local_id);
-        if (it != records_.end()) erase_inflight_unlocked_(it->second);
+        if (it != records_.end()) {
+            erase_inflight_unlocked_(it->second);
+            if (erase_client_route_unlocked_(it->second)) {
+                route_erased_reconcile_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         break;
     }
     d.action = TerminalDecision::Action::kEmit;
@@ -229,6 +245,125 @@ void BinanceOrderLedger::remember_terminal_unlocked_(uint64_t local_id) {
 void BinanceOrderLedger::remember_terminal(uint64_t local_id) {
     std::lock_guard<std::mutex> lk(ledger_mu_);
     remember_terminal_unlocked_(local_id);
+}
+
+std::string BinanceOrderLedger::make_orderless_fill_key_(std::string_view symbol,
+                                                        int64_t trade_id) {
+    std::string key;
+    key.reserve(symbol.size() + 21);
+    key.append(symbol);
+    key.push_back('|');
+    key.append(std::to_string(trade_id));
+    return key;
+}
+
+bool BinanceOrderLedger::orderless_fill_contains_unlocked_(const std::string& key) const {
+    return orderless_fill_keys_.find(key) != orderless_fill_keys_.end();
+}
+
+void BinanceOrderLedger::insert_orderless_fill_unlocked_(std::string key, uint64_t owner) {
+
+    if (orderless_fill_keys_.find(key) != orderless_fill_keys_.end()) return;
+    orderless_fill_keys_.emplace(key, owner);
+    orderless_fill_fifo_.push_back(std::move(key));
+    while (orderless_fill_keys_.size() > kOrderlessFillWindowCap &&
+           !orderless_fill_fifo_.empty()) {
+        orderless_fill_keys_.erase(orderless_fill_fifo_.front());
+        orderless_fill_fifo_.pop_front();
+    }
+}
+
+bool BinanceOrderLedger::note_orderless_fill_unlocked_(std::string_view symbol,
+                                                       int64_t trade_id) {
+    orderless_fill_routed_.fetch_add(1, std::memory_order_relaxed);
+    std::string key = make_orderless_fill_key_(symbol, trade_id);
+    if (orderless_fill_contains_unlocked_(key)) {
+
+        orderless_fill_dups_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    insert_orderless_fill_unlocked_(std::move(key),  0);
+    return true;
+}
+
+bool BinanceOrderLedger::note_fill_seen(uint64_t order_id, std::string_view symbol,
+                                        int64_t trade_id) {
+    if (trade_id <= 0) return true;
+    std::lock_guard<std::mutex> lk(ledger_mu_);
+    if (order_id != 0) {
+        auto it = records_.find(order_id);
+        if (it != records_.end()) {
+            OrderRecord& rec = it->second;
+            if (rec.fill_tids.count(trade_id) > 0) {
+                per_order_fill_dups_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            std::string key = make_orderless_fill_key_(symbol, trade_id);
+            const auto wit = orderless_fill_keys_.find(key);
+            if (wit != orderless_fill_keys_.end()) {
+                const uint64_t owner = wit->second;
+                if (owner == 0 || owner == order_id) {
+
+                    cross_domain_fill_dups_.fetch_add(1, std::memory_order_relaxed);
+                    rec.fill_tids.insert(trade_id);
+                    return false;
+                }
+
+                self_trade_leg_passthrough_.fetch_add(1, std::memory_order_relaxed);
+                rec.fill_tids.insert(trade_id);
+                return true;
+            }
+            if (rec.fill_tids.size() < kMaxFillKeysPerOrder) {
+                rec.fill_tids.insert(trade_id);
+
+                insert_orderless_fill_unlocked_(std::move(key), order_id);
+                return true;
+            }
+
+            per_order_fill_overflow_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+    }
+    return note_orderless_fill_unlocked_(symbol, trade_id);
+}
+
+BinanceOrderLedger::FillDedupStats BinanceOrderLedger::fill_dedup_stats() const {
+    FillDedupStats s;
+    s.per_order_dups = per_order_fill_dups_.load(std::memory_order_relaxed);
+    s.cross_domain_dups = cross_domain_fill_dups_.load(std::memory_order_relaxed);
+    s.self_trade_leg_passthrough =
+        self_trade_leg_passthrough_.load(std::memory_order_relaxed);
+    s.per_order_overflow = per_order_fill_overflow_.load(std::memory_order_relaxed);
+    s.orderless_routed = orderless_fill_routed_.load(std::memory_order_relaxed);
+    s.orderless_dups = orderless_fill_dups_.load(std::memory_order_relaxed);
+    s.route_erased_ack = route_erased_ack_.load(std::memory_order_relaxed);
+    s.route_erased_reconcile = route_erased_reconcile_.load(std::memory_order_relaxed);
+    return s;
+}
+
+bool BinanceOrderLedger::is_order_terminal(uint64_t local_id) const {
+    std::lock_guard<std::mutex> lk(ledger_mu_);
+    auto it = records_.find(local_id);
+
+    if (it != records_.end() && it->second.has_inflight) return false;
+    if (terminal_orders_.count(local_id) > 0) return true;
+
+    return it != records_.end();
+}
+
+bool BinanceOrderLedger::lookup_terminal(uint64_t local_id, XtOrderStatus& out_status,
+                                         int64_t& out_filled_fp) const {
+    std::lock_guard<std::mutex> lk(ledger_mu_);
+    auto it = records_.find(local_id);
+
+    if (it == records_.end() || it->second.has_inflight) return false;
+    const OrderRecord& rec = it->second;
+
+    if (!order_status_is_final(rec.status)) return false;
+    out_status = rec.status;
+    out_filled_fp = (rec.status == XtOrderStatus::Filled) ? rec.qty_fp : -1;
+    return true;
 }
 
 bool BinanceOrderLedger::is_inflight(uint64_t local_id) const {

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,9 @@ struct XtRunnerSignals;
 
 namespace xt_live::control {
 
+class PanelForceExitLatch;
+class ForceFlatSubmitFence;
+
 /// @brief Panel helper 的非拥有依赖视图。
 ///
 /// Runner bootstrap 单线程装配本结构；gRPC server 启动后只读。所有指针均指向
@@ -52,16 +56,26 @@ struct XtPanelContext {
     XtRunnerSignals*                        runtime_shared_state = nullptr;
     XtLiveParamDomain*                      param_domain        = nullptr;
     const XtCommodityCatalog*               catalog             = nullptr;
+
+    PanelForceExitLatch*                    force_exit_latch    = nullptr;
+
+    ForceFlatSubmitFence*                   force_flat_fence    = nullptr;
+
+    std::vector<std::string>                hosted_strategies;
+
+    bool                                    attribution_router_mode = false;
 };
 
 enum class ForceExitOutcome : uint8_t {
-    NoTd               = 0,
-    AlreadyForceFlat   = 1,
-    NoPosition         = 2,
-    NoMarkPrice        = 3,
-    CancelledOnly      = 4,
-    ForceClosed        = 5,
-    SubmitFailed       = 6,
+    Unspecified        = 0,
+    NoTd               = 1,
+    AlreadyForceFlat   = 2,
+    NoPosition         = 3,
+    NoMarkPrice        = 4,
+    CancelledOnly      = 5,
+    ForceClosed        = 6,
+    SubmitFailed       = 7,
+    Count_,
 };
 
 enum class ManualOrderOutcome : uint8_t {
@@ -126,6 +140,12 @@ void wire_per_strategy_risk_state(
     xt_account::AccountStateStore* account_store,
     XtLiveOrderGateway* order_gateway,
     const xt_risk::XtRiskMonitorState* risk_monitor_state) noexcept;
+
+std::function<void(uint32_t  , const std::string&  )>
+make_strategy_init_failure_handler(
+    xt_risk::XtRiskMonitorState* risk_monitor_state) noexcept;
+
+uint64_t strategy_init_failure_latched_total() noexcept;
 
 bool wire_risk_state_and_validate(
     xt_risk::XtRiskMonitor* risk_monitor,

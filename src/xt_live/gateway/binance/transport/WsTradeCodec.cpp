@@ -2,6 +2,7 @@
 
 #include "BinanceTdWireUtil.h"
 #include "BinanceOrderParams.h"
+#include "RestTradeTransport.h"
 #include "rest/BinanceSign.h"
 #include "refdata/BinanceExchangeInfo.h"
 
@@ -53,6 +54,13 @@ std::string build_request(std::string_view req_id, std::string_view method,
 
 int json_int_or(const nlohmann::json& j, const char* key, int dflt) {
     try { return j.value(key, dflt); } catch (...) { return dflt; }
+}
+
+TransportAck::Kind classify_failure_kind(int status, int err_code) {
+    return classify_rest_submit_failure(status, err_code) ==
+                   RestSubmitFailureClass::kExecutionUnknown
+               ? TransportAck::Kind::kTransportError_TimeoutAfterSend
+               : TransportAck::Kind::kRejected;
 }
 
 std::string json_string_or_empty(const nlohmann::json& j, const char* key) {
@@ -129,6 +137,8 @@ std::string build_cancel_request(const TransportCancelReq& req,
 std::string parse_response(std::string_view payload, TransportAck& out_ack) {
     out_ack = TransportAck{};
 
+    out_ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;
+
     g_parse_json = nlohmann::json::parse(payload, nullptr, false);
     if (g_parse_json.is_discarded() || !g_parse_json.is_object()) return {};
     std::string req_id = id_to_string(g_parse_json);
@@ -145,12 +155,13 @@ std::string parse_response(std::string_view payload, TransportAck& out_ack) {
         }
         out_ack.kind = (out_ack.err_code == -2011)
                            ? TransportAck::Kind::kCancelNoop
-                           : TransportAck::Kind::kRejected;
+                           : classify_failure_kind(status, out_ack.err_code);
         return req_id;
     }
 
     if (status != 200) {
-        out_ack.kind = TransportAck::Kind::kRejected;
+
+        out_ack.kind = classify_failure_kind(status,  0);
         out_ack.err_code = status;
         return req_id;
     }

@@ -30,5 +30,3 @@ void validate_live_config(const YAML::Node& runtime_node,
 
 bool validate_strategy_or_strategies_cfg(const YAML::Node& runtime_node,
                                          std::string& err);
-
-bool live_selector_section_present(const YAML::Node& root);

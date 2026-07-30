@@ -91,6 +91,7 @@ private:
     };
 
     bool load_streams();
+
     bool load_one_stream(const std::string& exchange,
                          const std::string& symbol,
                          uint32_t trading_day,

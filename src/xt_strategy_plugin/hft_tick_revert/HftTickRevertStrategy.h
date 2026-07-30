@@ -13,7 +13,16 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
+/// @warning GTC 模式（use_ioc=0）close 追价语义：持仓下若某 GTC close 单落在当前市价的
+///   不可成交侧，累计 close_chase_ticks 个 on_tick 后 cancel 该单，待其终态回报（Canceled）
+///   再按当时 last 价重挂一次（wait-for-terminal，逐 K 周期追至成交；重挂前旧单必已终态出账，
+///   不存在旧/新 close 同时在簿的漏算窗）。close_chase_ticks<=0 = disabled（不追价）。
+///   CTP 上启用需留意交易所撤单考核（稳态可能每若干 K 一撤一挂）。IOC 模式不触发（IOC 单不留挂）。
+/// @warning 换月迁移窗内 per-symbol 净仓可能短暂 +2：migrate_gtc_orders 先 cancel 旧合约在途
+///   单再 resubmit 到新合约，旧单 cancel 终态回报与新单成交之间，旧/新合约瞬时各持一腿。
+///   aggregate 逻辑净仓仍守 ±1，仅单合约维度出现瞬时 +2（roll/holiday 场景实测可见，已披露）。
 class HftTickRevertStrategy : public XtStrategyBase {
 public:
     static int64_t decision_price_fp(const XtTick& tk) noexcept {
@@ -40,6 +49,8 @@ public:
         close_reject_backoff_ms_ = cfg.get_int("close_reject_backoff_ms", 3000);
 
         close_expire_backoff_ms_ = cfg.get_int("close_expire_backoff_ms", 0);
+
+        close_chase_ticks_ = cfg.get_int("close_chase_ticks", 20);
         debug_first_ticks_ = cfg.get_int("debug_first_ticks", 0);
         debug_first_decisions_ = cfg.get_int("debug_first_decisions", 0);
 
@@ -142,6 +153,10 @@ public:
 
         if (!ctx->can_submit()) return;
 
+        if (!use_ioc_ && close_chase_ticks_ > 0 && !close_chase_age_.empty()) {
+            maybe_chase_close_(ctx, tk);
+        }
+
         ++count_;
 
         if (debug_tick_emitted_ < debug_first_ticks_) {
@@ -190,8 +205,9 @@ public:
             ctx->log_warn(nzbuf);
         }
 
-        const int64_t cur_pos      = positions_.logical_fp()
-                                   + ctx->projected_inflight_fp(symbol_.c_str());
+        const int64_t cur_pos      = positions_.logical_fp() +
+            (use_ioc_ ? ctx->projected_inflight_fp(symbol_.c_str())
+                      : self_inflight_signed_fp_());
 
         xt_runtime::XtStraPositionDetail pos_det{};
         ctx->get_position_detail(symbol_.c_str(), &pos_det, 1);
@@ -311,6 +327,8 @@ public:
 
         if (end_price_fp > start_price_fp_) {
             if (long_leg_fp > 0) {
+
+                if (!use_ioc_) cancel_opposite_resting_(ctx,  false);
                 tag = "rev_close_long";
                 std::snprintf(reason_buf, sizeof(reason_buf),
                               "tick_revert|dir=down|delta=%+.4f", delta_ticks);
@@ -321,7 +339,10 @@ public:
                     last_close_at_ = tk.action_time;
                     close_oids_.insert(oid);
                 }
-            } else if (long_leg_fp == 0 && short_leg_fp == 0 && cur_pos == 0 && open_qty_fp > 0) {
+            } else if (long_leg_fp == 0 && short_leg_fp == 0 && cur_pos == 0 &&
+                       positions_.logical_fp() == 0 && open_qty_fp > 0) {
+
+                if (!use_ioc_) cancel_opposite_resting_(ctx,  false);
                 tag = "rev_short";
                 std::snprintf(reason_buf, sizeof(reason_buf),
                               "tick_revert|dir=down|delta=%+.4f", delta_ticks);
@@ -331,6 +352,8 @@ public:
             }
         } else if (end_price_fp < start_price_fp_) {
             if (short_leg_fp > 0) {
+
+                if (!use_ioc_) cancel_opposite_resting_(ctx,  true);
                 tag = "rev_close_short";
                 std::snprintf(reason_buf, sizeof(reason_buf),
                               "tick_revert|dir=up|delta=%+.4f", delta_ticks);
@@ -341,7 +364,9 @@ public:
                     last_close_at_ = tk.action_time;
                     close_oids_.insert(oid);
                 }
-            } else if (long_leg_fp == 0 && short_leg_fp == 0 && cur_pos == 0 && open_qty_fp > 0) {
+            } else if (long_leg_fp == 0 && short_leg_fp == 0 && cur_pos == 0 &&
+                       positions_.logical_fp() == 0 && open_qty_fp > 0) {
+                if (!use_ioc_) cancel_opposite_resting_(ctx,  true);
                 tag = "rev_long";
                 std::snprintf(reason_buf, sizeof(reason_buf),
                               "tick_revert|dir=up|delta=%+.4f", delta_ticks);
@@ -353,6 +378,12 @@ public:
 
         if (oid != 0 && maker_ttl_ms_ > 0 && !use_ioc_) {
             ttl_orders_.emplace(oid, tk.action_time);
+        }
+
+        if (oid != 0 && !use_ioc_ && close_chase_ticks_ > 0 && tag != nullptr &&
+            (std::strcmp(tag, "rev_close_long") == 0 ||
+             std::strcmp(tag, "rev_close_short") == 0)) {
+            close_chase_age_[oid] = 0;
         }
         if (oid != 0 && debug_decision_emitted_ <= debug_first_decisions_) {
             const char* side = (end_price_fp > start_price_fp_) ? "SELL" : "BUY";
@@ -377,6 +408,8 @@ public:
                   const XtOrderExecUpdate& upd) override {
         orders_.apply_update(upd);
 
+        if (!orders_.find(upd.id)) close_chase_age_.erase(upd.id);
+
         const bool tracked_close = (close_oids_.count(upd.id) > 0);
 
         const bool is_terminal =
@@ -386,6 +419,32 @@ public:
         if (is_terminal) {
             close_oids_.erase(upd.id);
             ttl_orders_.erase(upd.id);
+        }
+
+        if (chase_pending_oid_ != 0 && upd.id == chase_pending_oid_ && is_terminal) {
+            const int64_t qty_fp = chase_pending_qty_fp_;
+            const bool    is_buy = chase_pending_is_buy_;
+            const char*   tag_p  = chase_pending_tag_;
+            chase_pending_oid_    = 0;
+            chase_pending_qty_fp_ = 0;
+            chase_pending_tag_    = nullptr;
+
+            const int64_t logical_fp = positions_.logical_fp();
+            const bool close_dir_ok  = is_buy ? (logical_fp < 0) : (logical_fp > 0);
+            if (upd.status == XtOrderStatus::Canceled && upd.filled_fp == 0 &&
+                close_dir_ok && qty_fp > 0 && tag_p != nullptr) {
+                const int64_t abs_logical_fp = (logical_fp < 0) ? -logical_fp : logical_fp;
+                const int64_t requeue_qty_fp = (qty_fp < abs_logical_fp) ? qty_fp : abs_logical_fp;
+                const XtTick* snap = ctx->get_last_tick(symbol_.c_str());
+                const int64_t last_fp = snap ? decision_price_fp(*snap) : 0;
+                if (requeue_qty_fp > 0 && last_fp > 0) {
+                    ctx->set_next_order_reason("tick_revert|chase_close");
+                    const uint64_t new_oid = xt_rollover::submit_and_track(
+                        ctx, orders_, positions_, symbol_.c_str(), is_buy,
+                        last_fp, requeue_qty_fp, IStrategyContext::TIF_GTC, tag_p, XtOffset::Open);
+                    if (new_oid != 0 && close_chase_ticks_ > 0) close_chase_age_[new_oid] = 0;
+                }
+            }
         }
 
         if (tracked_close && upd.status == XtOrderStatus::Rejected && last_close_at_ != 0) {
@@ -423,9 +482,25 @@ public:
     void on_roll(IStrategyContext* ctx, const char* old_code,
                  const char* new_code, uint32_t  ,
                  int64_t  ) override {
+
+        chase_pending_oid_    = 0;
+        chase_pending_qty_fp_ = 0;
+        chase_pending_tag_    = nullptr;
+        close_chase_age_.clear();
+
         xt_rollover::migrate_gtc_orders(ctx, orders_, old_code, new_code);
 
         ttl_orders_.clear();
+
+        if (!use_ioc_ && close_chase_ticks_ > 0) {
+            for (const auto& kv : orders_.all()) {
+                const auto& ord = kv.second;
+                if (ord.leaves_fp <= 0) continue;
+                if (ord.tag == "rev_close_long" || ord.tag == "rev_close_short") {
+                    close_chase_age_[ord.id] = 0;
+                }
+            }
+        }
         positions_.touch(old_code);
         positions_.on_update(new_code,
             ctx->get_position_fp(new_code) - ctx->projected_inflight_fp(new_code));
@@ -463,6 +538,64 @@ private:
         }
     }
 
+    int64_t self_inflight_signed_fp_() const {
+        int64_t total = 0;
+        for (const auto& kv : orders_.all()) {
+            const auto& ord = kv.second;
+            total += ord.is_buy ? ord.leaves_fp : -ord.leaves_fp;
+        }
+        return total;
+    }
+
+    void cancel_opposite_resting_(IStrategyContext* ctx, bool want_is_buy) {
+        std::vector<uint64_t> ids;
+        for (const auto& kv : orders_.all()) {
+            if (kv.second.is_buy != want_is_buy) ids.push_back(kv.first);
+        }
+        for (uint64_t id : ids) ctx->cancel(id);
+    }
+
+    void maybe_chase_close_(IStrategyContext* ctx, const XtTick& tk) {
+
+        if (chase_pending_oid_ != 0) return;
+
+        for (auto& kv : close_chase_age_) ++kv.second;
+        const int64_t confirmed_fp = positions_.logical_fp();
+        if (confirmed_fp == 0) return;
+        const int64_t last_fp = decision_price_fp(tk);
+        if (last_fp <= 0) return;
+
+        const bool  want_is_buy = (confirmed_fp < 0);
+        const char* want_tag    = (confirmed_fp > 0) ? "rev_close_long" : "rev_close_short";
+
+        uint64_t stale_id     = 0;
+        int64_t  stale_qty_fp = 0;
+        for (const auto& kv : orders_.all()) {
+            const auto& ord = kv.second;
+            if (ord.is_buy != want_is_buy) continue;
+            if (ord.tag    != want_tag)    continue;
+            if (ord.leaves_fp <= 0)        continue;
+            const auto ait = close_chase_age_.find(ord.id);
+            if (ait == close_chase_age_.end()) continue;
+            if (ait->second < close_chase_ticks_) continue;
+
+            const bool unfillable = want_is_buy ? (last_fp > ord.price_fp)
+                                                : (last_fp < ord.price_fp);
+            if (!unfillable) continue;
+            stale_id     = ord.id;
+            stale_qty_fp = ord.leaves_fp;
+            break;
+        }
+        if (stale_id == 0) return;
+
+        close_chase_age_.erase(stale_id);
+        chase_pending_oid_    = stale_id;
+        chase_pending_qty_fp_ = stale_qty_fp;
+        chase_pending_is_buy_ = want_is_buy;
+        chase_pending_tag_    = want_tag;
+        ctx->cancel(stale_id);
+    }
+
     std::string symbol_;
     xt_rollover::PositionAggregator   positions_;
     xt_rollover::WorkingOrderRegistry orders_;
@@ -483,6 +616,12 @@ private:
     int         close_expire_backoff_ms_ = 0;
     uint32_t    last_close_expire_at_ = 0;
     std::unordered_set<uint64_t> close_oids_;
+    int         close_chase_ticks_ = 20;
+    std::unordered_map<uint64_t, int> close_chase_age_;
+    uint64_t    chase_pending_oid_    = 0;
+    int64_t     chase_pending_qty_fp_ = 0;
+    bool        chase_pending_is_buy_ = false;
+    const char* chase_pending_tag_    = nullptr;
     int         debug_first_ticks_ = 0;
     int         debug_first_decisions_ = 0;
     int         debug_tick_emitted_ = 0;

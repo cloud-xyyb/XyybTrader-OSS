@@ -20,9 +20,12 @@ class IHftEngineObserver {
 public:
     virtual ~IHftEngineObserver() = default;
 
-    virtual void on_trade(const XtTradeRecord&  ) {}
+    virtual void on_trade(const XtTradeRecord&  ,
+                          XtLatencyEligibility   = XtLatencyEligibility::kEligible,
+                          uint64_t   = 0) {}
 
-    virtual void on_order_update(const XtOrderExecUpdate&  ) {}
+    virtual void on_order_update(const XtOrderExecUpdate&  ,
+                                 XtLatencyEligibility   = XtLatencyEligibility::kEligible) {}
 
     virtual void on_order_submit(int64_t  ,
                                  uint64_t  ,

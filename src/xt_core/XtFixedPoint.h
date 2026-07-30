@@ -6,6 +6,9 @@
 
 /// @file
 /// @brief 全项目 fixed-point scale 与基础转换/算术工具。
+///
+/// 价格、数量、资金一律用 int64 定点数表示（value × kPriceFpScale），避免浮点
+/// 误差在撮合、风控、账务链路里累积；本文件给出 double↔fp 边界转换与 fp 乘除法。
 
 constexpr int64_t kPriceFpScale = 1'000'000;
 static_assert(kPriceFpScale == 1'000'000, "kPriceFpScale invariant must hold");

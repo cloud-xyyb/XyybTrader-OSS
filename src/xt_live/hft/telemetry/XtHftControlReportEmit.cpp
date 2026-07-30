@@ -38,6 +38,7 @@
 #include "xt_metrics/XtStrategyPnlAggregator.h"
 #include "xt_metrics/XtStrategyPnlBaseline.h"
 #include "xt_metrics/XtVenueLabel.h"
+#include "xt_ipc/XtShmMdGateway.h"
 #include "XtDeclaredSymbolRegistry.h"
 #include "xt_risk/config/XtRiskCfg.h"
 #endif
@@ -282,12 +283,14 @@ void maybe_flush_account_truth_snapshot(XtHftRunnerControlContext& ctx,
     const int64_t ts_sec = frame.now_ms / 1000;
     if (ts_sec == st.last_account_truth_snap_sec) return;
 
+    ctx.account_truth_source->poll();
     AccountTruth truth = ctx.account_truth_source->fetch_snapshot();
     if (truth.trading_day_id > 0 &&
         st.last_account_truth_day > 0 &&
         truth.trading_day_id != st.last_account_truth_day) {
         ctx.account_truth_source->on_trading_day_rollover(
             st.last_account_truth_day, truth.trading_day_id);
+        ctx.account_truth_source->poll();
         truth = ctx.account_truth_source->fetch_snapshot();
     }
     if (truth.trading_day_id > 0) {
@@ -489,11 +492,25 @@ void build_kpi_latency(const ControlSnapshot& snap, xt_report::LatencyStats& lat
     latency.event_to_fill_us_p50  = snap.latency_stats.event_to_fill.p50_us;
     latency.event_to_fill_us_p90  = snap.latency_stats.event_to_fill.p90_us;
     latency.event_to_fill_us_p99  = snap.latency_stats.event_to_fill.p99_us;
-    latency.risk_block_count      = snap.risk_stats.submit_attempts > snap.risk_stats.submit_success
-                                        ? snap.risk_stats.submit_attempts - snap.risk_stats.submit_success : 0;
+
+    latency.submit_to_ack_us_samples  = snap.latency_stats.submit_to_ack.samples;
+    latency.fill_after_ack_us_samples = snap.latency_stats.ack_to_fill.samples;
+    latency.local_submit_us_samples   = snap.latency_stats.submit_wire.samples;
+    latency.submit_to_ack_paired_us_samples = snap.latency_stats.submit_to_ack_paired.samples;
+    latency.submit_to_trade_ack_us_samples  = snap.latency_stats.submit_to_trade_ack.samples;
+    latency.uds_first_savings_us_samples    = snap.latency_stats.uds_first_savings.samples;
+    latency.submit_to_fill_us_samples       = snap.latency_stats.submit_to_fill.samples;
+    latency.strategy_us_samples             = snap.latency_stats.strategy_processing.samples;
+    latency.ack_path_us_samples             = snap.latency_stats.ack_path.samples;
+    latency.event_to_ack_us_samples         = snap.latency_stats.event_to_ack.samples;
+    latency.event_to_fill_us_samples        = snap.latency_stats.event_to_fill.samples;
+
+    latency.risk_block_count      = snap.risk_stats.total_rejects();
     latency.md_gap_ms_p99         = static_cast<double>(snap.tick_lag_p99_us) / 1000.0;
+    latency.md_gap_ms_peak        = static_cast<double>(snap.tick_lag_peak_us) / 1000.0;
     latency.event_drop            = snap.tick_drop + snap.td_flow_event_rejected;
-    latency.queue_depth_p99       = static_cast<double>(snap.td_event_peak_backlog);
+
+    latency.queue_depth_p99       = static_cast<double>(snap.td_event_backlog);
 }
 
 void emit_td_drop_metrics(std::string_view venue,
@@ -587,10 +604,15 @@ void emit_live_reports(const XtRunnerControlConfig& cfg,
     xt_report::LatencyStats latency;
     build_kpi_ratios(frame.snapshot, ratios);
     build_kpi_latency(frame.snapshot, latency);
+
     st.kpi_window_tick_lag_us_peak =
-        std::max(st.kpi_window_tick_lag_us_peak, frame.snapshot.tick_lag_p99_us);
+        std::max(st.kpi_window_tick_lag_us_peak, frame.snapshot.tick_lag_peak_us);
+    st.kpi_window_tick_lag_us_p99 =
+        std::max(st.kpi_window_tick_lag_us_p99, frame.snapshot.tick_lag_p99_us);
     xt_report::LatencyStats emit_latency = latency;
     emit_latency.md_gap_ms_p99 =
+        static_cast<double>(st.kpi_window_tick_lag_us_p99) / 1000.0;
+    emit_latency.md_gap_ms_peak =
         static_cast<double>(st.kpi_window_tick_lag_us_peak) / 1000.0;
 
     const bool kill_switch_active = ctx.runtime_shared_state.kill_switch.load(std::memory_order_acquire);
@@ -610,6 +632,7 @@ void emit_live_reports(const XtRunnerControlConfig& cfg,
 
             ct::metrics::XtMetricRegistry::RuntimeKpiSnapshot kpi_sample{};
             kpi_sample.md_gap_ms_p99 = emit_latency.md_gap_ms_p99;
+            kpi_sample.md_gap_ms_peak = emit_latency.md_gap_ms_peak;
             const auto last_md_tick_ms =
                 ctx.runtime_shared_state.last_tick_steady_ms.load(std::memory_order_relaxed);
             kpi_sample.has_md_age_ms = last_md_tick_ms > 0;
@@ -623,6 +646,15 @@ void emit_live_reports(const XtRunnerControlConfig& cfg,
             kpi_sample.risk_block_count = static_cast<double>(emit_latency.risk_block_count);
             reg.set_runtime_kpi_snapshot(
                 "_runtime", "_runtime", venue, "_all", kpi_sample);
+
+            const uint64_t risk_rejects_total =
+                static_cast<uint64_t>(kpi_sample.risk_block_count);
+            const uint64_t risk_rejects_delta =
+                risk_rejects_total >= st.last_risk_rejects_prom_total
+                    ? (risk_rejects_total - st.last_risk_rejects_prom_total)
+                    : risk_rejects_total;
+            reg.inc_risk_rejects_total(venue, risk_rejects_delta);
+            st.last_risk_rejects_prom_total = risk_rejects_total;
         }
         const uint64_t md_total = frame.snapshot.md_in;
         const uint64_t md_delta = md_total >= st.last_md_ticks_prom_total
@@ -630,6 +662,12 @@ void emit_live_reports(const XtRunnerControlConfig& cfg,
             : md_total;
         reg.inc_md_ticks_total(venue, md_delta);
         st.last_md_ticks_prom_total = md_total;
+
+        if (ctx.shm_md_gateway) {
+            const auto& ring = ctx.shm_md_gateway->ring_name();
+            reg.set_shm_md_attach_failing(ring, ctx.shm_md_gateway->attach_failing());
+            reg.set_shm_md_attach_fail_count(ring, ctx.shm_md_gateway->attach_fail_count());
+        }
 
         const uint64_t reap_total = ctx.strategy_event_loop.engine_orphan_reap_cancel_count();
         const uint64_t reap_delta = reap_total >= st.last_orphan_reap_prom_total
@@ -660,6 +698,7 @@ void emit_live_reports(const XtRunnerControlConfig& cfg,
 #endif
     if (kpi_flushed) {
         st.kpi_window_tick_lag_us_peak = 0;
+        st.kpi_window_tick_lag_us_p99 = 0;
     }
 
 #ifdef XT_HAVE_METRICS

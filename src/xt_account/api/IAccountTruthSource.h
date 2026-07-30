@@ -5,6 +5,7 @@
 ///
 /// Source 负责把 venue、AccountStateStore provider 或测试数据转换为 AccountTruth；
 /// 调用方只消费快照字段，不通过该接口修改 reducer 状态。
+/// venue 回报灌入（broker overlay / 成交手续费）走写侧 IAccountTruthSink。
 
 #include <cstdint>
 #include <string>
@@ -38,19 +39,18 @@ struct AccountTruth {
 /// @brief account truth 的读侧 source 接口。
 ///
 /// 实现把 venue、AccountStateStore provider 或测试数据转换成 AccountTruth。
-/// 调用方通过 fetch_snapshot() 按值读取，并用 rollover / overlay / fee 入口
-/// 同步 source 自己维护的 day-scoped 状态；本接口不修改本地 reducer 状态。
+/// 调用方通过 fetch_snapshot() 按值读取，并用 rollover 入口同步 source 自己维护的
+/// day-scoped 状态；本接口不修改本地 reducer 状态，也不接受 venue 回报灌入
+/// （broker overlay / 成交手续费在写侧 IAccountTruthSink）。
 class IAccountTruthSource {
 public:
     virtual ~IAccountTruthSource() = default;
 
+    virtual void poll() {}
+
     [[nodiscard]] virtual AccountTruth fetch_snapshot() = 0;
 
     virtual void on_trading_day_rollover(int64_t prev_day, int64_t new_day) = 0;
-
-    virtual void update_broker_overlay(const BrokerVenueTruth&) {}
-
-    virtual void note_fill_fee_fp(int64_t  , uint64_t  ) {}
 };
 
 inline int64_t account_truth_equity_fp(const AccountTruth& truth) noexcept {

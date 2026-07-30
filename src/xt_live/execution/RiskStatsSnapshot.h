@@ -17,4 +17,14 @@ struct RiskStatsSnapshot {
     uint64_t canceled_terminal_total = 0;
 
     std::vector<std::pair<std::string, uint64_t>> reject_by_reason;
+
+    [[nodiscard]] uint64_t total_rejects() const {
+        uint64_t sum = 0;
+        for (const auto& kv : reject_by_reason) {
+
+            if (kv.first.compare(0, 7, "CANCEL_") == 0) continue;
+            sum += kv.second;
+        }
+        return sum;
+    }
 };

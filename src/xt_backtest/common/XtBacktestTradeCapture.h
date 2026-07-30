@@ -5,18 +5,21 @@
 #include <unordered_map>
 #include <vector>
 
-#include "api/IHftEngineObserver.h"
+#include "api/XtBtFillTruth.h"
 #include "xt_backtest/common/XtBacktestReport.h"
 
-/// @brief Backtest 成交采集 observer，只把 XtTradeRecord 转成 BarTradeRow。
+/// @brief Backtest 成交采集器，把真值点的 `XtBtFillTruth` 转成 BarTradeRow。
 ///
 /// 支持两种模式：single-bucket 将所有成交写入一个外部 vector；multi-bucket
 /// 按 `strategy_id` 写入已注册 vector。所有 sink 均为 non-owning，调用方必须保证
-/// 生命周期覆盖 observer。multi-bucket 下空或未知 `strategy_id` 会 fail-fast，避免
+/// 生命周期覆盖本对象。multi-bucket 下空或未知 `strategy_id` 会 fail-fast，避免
 /// 成交流入错误策略结果。
 ///
-/// @note 本类不修改账户、订单或 frozen state；SEL frozen release 由独立 observer 处理。
-class XtBacktestTradeCapture final : public xt_runtime::IHftEngineObserver {
+/// @note 挂在引擎的 `XtBtFillSink`（account apply 之后）而非 gateway observer fan；
+///       后者位于 apply 之前，据此采集就只能事后回填账户状态（BR-01 的成因）。
+/// @note 本类不修改账户、订单或 frozen state；SEL frozen release 仍由 gateway fan 上的
+///       独立 observer 处理，二者互不替代。
+class XtBacktestTradeCapture final {
 public:
 
     explicit XtBacktestTradeCapture(std::vector<BarTradeRow>& sink) noexcept
@@ -38,7 +41,8 @@ public:
         }
     }
 
-    void on_trade(const XtTradeRecord& tr) override {
+    void operator()(const XtBtFillTruth& t) {
+        const XtTradeRecord& tr = t.tr;
         std::vector<BarTradeRow>* target = single_bucket_;
         if (!buckets_.empty()) {
             if (tr.strategy_id.empty()) {
@@ -53,7 +57,7 @@ public:
         if (!target) {
             throw std::runtime_error("backtest trade capture has no registered sink");
         }
-        target->push_back(to_bar_trade_row(tr));
+        target->push_back(to_bar_trade_row(t));
     }
 
 private:

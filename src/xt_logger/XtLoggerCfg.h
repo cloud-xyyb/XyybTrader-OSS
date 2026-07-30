@@ -18,7 +18,7 @@ enum class LogLevel { Trace, Debug, Info, Warn, Error, Critical, Off };
 /// `modules` 是 module name -> enabled；`throttle_ms` 是 throttle key -> window ms。
 struct XtLoggerCfg {
 
-    std::string path = "logs/ct.log";
+    std::string path = "logs/xt.log";
 
     bool console = true;
 

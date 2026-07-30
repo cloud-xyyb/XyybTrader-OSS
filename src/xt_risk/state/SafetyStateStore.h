@@ -10,8 +10,9 @@
 ///
 /// 这些闩锁跨重启存活——kill switch 拉起后进程重启不能自动解除。
 /// - runner 周期把 SafetyState 落盘，启动时读回恢复；
-/// - writer 只写最新 schema，load() 兼容过时格式布局并用长度/schema/CRC 校验拒绝损坏文件，
-/// 读取失败按冷启动默认值处理。
+/// - writer 只写最新 schema，load() 兼容过时格式布局并用长度/schema/CRC 校验拒绝损坏文件；
+/// - `load_checked()` 区分「文件缺失」（冷启动正常）与「文件存在但校验失败」（损坏），
+///   供调用方对损坏文件 fail-closed（带闩启动）；`load()` 是不区分二者的薄便利封装。
 
 namespace xt_risk::state {
 
@@ -62,6 +63,20 @@ inline bool operator!=(const SafetyState& a, const SafetyState& b) noexcept {
     return !(a == b);
 }
 
+enum class LoadStatus {
+    Ok,
+    Missing,
+    Invalid,
+};
+
+/// @brief 带状态的 load 结果。
+///
+/// `state` 仅在 `status == LoadStatus::Ok` 时有值；Missing/Invalid 时为 nullopt。
+struct LoadResult {
+    LoadStatus                 status = LoadStatus::Missing;
+    std::optional<SafetyState> state;
+};
+
 /// @brief SafetyState 磁盘读写工具。
 ///
 /// `save()` 使用临时文件、CRC32、fsync 和原子 rename；`load()` 只返回通过完整
@@ -74,6 +89,8 @@ public:
     static bool save(const std::filesystem::path& target, const SafetyState& state);
 
     static std::optional<SafetyState> load(const std::filesystem::path& source);
+
+    static LoadResult load_checked(const std::filesystem::path& source);
 };
 
 }

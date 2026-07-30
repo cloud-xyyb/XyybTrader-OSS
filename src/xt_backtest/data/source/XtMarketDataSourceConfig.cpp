@@ -67,6 +67,9 @@ void XtMarketDataSourceConfig::validate(std::vector<std::string>& errors) const 
     if (replay_mode == "event_stream" && mode != "tick") {
         errors.push_back("backtest.datasource.replay_mode=event_stream 要求 backtest.datasource.mode=tick");
     }
+    if (!str_in(tick_cache_format, {"v2", "v3"})) {
+        errors.push_back("backtest.tick_cache.format 仅支持 v2/v3");
+    }
     if (simtick_spread < 0.0) {
         errors.push_back("backtest.datasource.bar.simtick.spread 不能为负");
     }
@@ -110,6 +113,12 @@ void XtMarketDataSourceConfig::validate(std::vector<std::string>& errors) const 
         }
         if (replay_mode == "event_stream" && !has_orderflow_input) {
             errors.push_back("backtest.datasource.replay_mode=event_stream 要求配置 orderflow 文件");
+        }
+
+        if (replay_mode == "event_stream" && (has_fbs_input || has_events_parquet_input)) {
+            errors.push_back("backtest.datasource.replay_mode=event_stream 不支持 "
+                             "tick.fbs_root / tick.events_parquet_root（这两个源仅支持 stream，"
+                             "无法为 event_stream 物化 tick）；请改用 tick.files / tick.root");
         }
         return;
     }
@@ -164,6 +173,9 @@ XtMarketDataSourceConfig parse_market_data_source_config(
     c.tick_events_parquet_root = XtConfigYamlUtil::as_or<std::string>(tick, "events_parquet_root", defaults.tick_events_parquet_root);
     c.tick_cache_dir = XtConfigYamlUtil::as_or<std::string>(tick, "cache_dir", defaults.tick_cache_dir);
     c.tick_use_bin_cache = XtConfigYamlUtil::as_or<bool>(tick, "use_bin_cache", defaults.tick_use_bin_cache);
+
+    c.tick_cache_format =
+        XtConfigYamlUtil::as_or<std::string>(node["tick_cache"], "format", defaults.tick_cache_format);
     c.tick_volume_mode = XtConfigYamlUtil::as_or<std::string>(tick, "volume_mode", defaults.tick_volume_mode);
     c.qty_base = XtConfigYamlUtil::as_or<double>(tick, "qty_base", defaults.qty_base);
     c.tick_main_symbol = XtConfigYamlUtil::as_or<std::string>(tick, "main_symbol", defaults.tick_main_symbol);

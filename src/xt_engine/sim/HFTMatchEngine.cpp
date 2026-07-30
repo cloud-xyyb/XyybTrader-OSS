@@ -4,6 +4,8 @@
 #include "RatioQueueModel.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -14,32 +16,37 @@
 
 namespace {
 
-void split_qty(double qty,
-               double min_qty,
-               double max_qty,
-               double qty_tick,
-               std::mt19937& rng,
-               std::vector<double>& out) {
+void split_qty_fp(int64_t qty_fp,
+                  int64_t min_fp,
+                  int64_t max_fp,
+                  int64_t tick_fp,
+                  std::mt19937& rng,
+                  std::vector<int64_t>& out) {
     out.clear();
-    if (qty <= 0.0) return;
-    if (qty_tick <= 0.0) qty_tick = 1.0;
-    if (min_qty <= 0.0) min_qty = qty_tick;
-    if (max_qty < min_qty) max_qty = min_qty;
-    int min_steps = static_cast<int>(min_qty / qty_tick);
-    int max_steps = static_cast<int>(max_qty / qty_tick);
+    if (qty_fp <= 0) return;
+    int64_t min_steps = min_fp / tick_fp;
+    int64_t max_steps = max_fp / tick_fp;
     if (min_steps <= 0) min_steps = 1;
     if (max_steps < min_steps) max_steps = min_steps;
-    if (max_steps <= 0) {
-        out.push_back(qty);
+
+    constexpr int64_t kMaxSplitParts = 100'000;
+    const int64_t chunk = max_steps * tick_fp;
+    if (qty_fp / chunk >= kMaxSplitParts) {
+        out.push_back(qty_fp);
         return;
     }
-    std::uniform_int_distribution<int> dist(min_steps, max_steps);
-    double left = qty;
-    int max_iter = 1000;
-    while (left > 1e-9 && --max_iter > 0) {
-        double cur = dist(rng) * qty_tick;
+    std::uniform_int_distribution<int64_t> dist(min_steps, max_steps);
+    int64_t left = qty_fp;
+    int sample_budget = 1000;
+    while (left > 0 && --sample_budget > 0) {
+        int64_t cur = dist(rng) * tick_fp;
         if (cur > left) cur = left;
-        if (cur <= 0.0) continue;
+        out.push_back(cur);
+        left -= cur;
+    }
+
+    while (left > 0) {
+        const int64_t cur = std::min(left, chunk);
         out.push_back(cur);
         left -= cur;
     }
@@ -70,9 +77,18 @@ void XtHftMatchEngine::set_config(const Config& cfg) {
     error_rate_    = cfg.error_rate;
     reject_rate_   = cfg.reject_rate;
     split_fills_   = cfg.split_fills;
-    split_min_qty_ = cfg.split_min_qty;
-    split_max_qty_ = cfg.split_max_qty;
-    split_qty_tick_ = cfg.split_qty_tick;
+
+    if (!std::isfinite(cfg.split_min_qty) || !std::isfinite(cfg.split_max_qty) ||
+        !std::isfinite(cfg.split_qty_tick)) {
+        throw std::runtime_error("fill.min_qty/max_qty/qty_tick 必须是有限数值");
+    }
+    constexpr double kMaxSplitQty = 9.0e12;
+    const double tick_q = std::min(cfg.split_qty_tick > 0.0 ? cfg.split_qty_tick : 1.0, kMaxSplitQty);
+    const double min_q  = std::min(cfg.split_min_qty > 0.0 ? cfg.split_min_qty : tick_q, kMaxSplitQty);
+    const double max_q  = std::min(cfg.split_max_qty < min_q ? min_q : cfg.split_max_qty, kMaxSplitQty);
+    split_tick_fp_ = std::max<int64_t>(1, order_exec_to_fp(tick_q));
+    split_min_fp_  = std::max<int64_t>(1, order_exec_to_fp(min_q));
+    split_max_fp_  = std::max(split_min_fp_, order_exec_to_fp(max_q));
     volume_limit_  = cfg.volume_limit;
     cancel_latency_enabled_ = cfg.cancel_latency_enabled;
     price_limit_enabled_ = cfg.price_limit_enabled;
@@ -87,24 +103,48 @@ void XtHftMatchEngine::set_config(const Config& cfg) {
 }
 
 void XtHftMatchEngine::reset_volume_cache() {
-    for (auto& e : volume_table_) e = VolumeEntry{};
+    volume_table_.clear();
+}
+
+void XtHftMatchEngine::advance_clock(uint64_t tick_idx, int64_t event_now_ns,
+                                     uint32_t trading_date, uint32_t action_time_ms) {
+    prev_date_ = current_date_;
+    prev_time_ms_ = current_time_ms_;
+    current_date_ = trading_date;
+    current_time_ms_ = action_time_ms;
+    if (event_now_ns > cur_event_ns_) cur_event_ns_ = event_now_ns;
+    order_manager_.advance_clock(tick_idx, event_now_ns, trading_date, action_time_ms);
 }
 
 void XtHftMatchEngine::advance_clock(uint64_t tick_idx, uint32_t date, uint32_t time_ms) {
+    advance_clock(tick_idx, xt_time::to_ns(date, time_ms), date, time_ms);
+}
+
+void XtHftMatchEngine::advance_clock_to(int64_t event_now_ns,
+                                        uint32_t trading_date, uint32_t action_time_ms) {
     prev_date_ = current_date_;
     prev_time_ms_ = current_time_ms_;
-    current_date_ = date;
-    current_time_ms_ = time_ms;
-    order_manager_.advance_clock(tick_idx, date, time_ms);
+    current_date_    = trading_date;
+    current_time_ms_ = action_time_ms;
+    if (event_now_ns > cur_event_ns_) cur_event_ns_ = event_now_ns;
+    order_manager_.advance_clock_to(event_now_ns, trading_date, action_time_ms);
 }
 
 void XtHftMatchEngine::advance_clock(uint32_t date, uint32_t time_ms) {
-    prev_date_ = current_date_;
-    prev_time_ms_ = current_time_ms_;
-    current_date_    = date;
-    current_time_ms_ = time_ms;
-    const int64_t now_ns = xt_time::to_ns(date, time_ms);
-    order_manager_.advance_clock_to(now_ns);
+    advance_clock_to(xt_time::to_ns(date, time_ms), date, time_ms);
+}
+
+int64_t XtHftMatchEngine::query_event_ts_() const {
+    if (cur_event_ns_ == INT64_MIN) {
+        if (latency_model_ && latency_model_->requires_event_timestamp()) {
+            throw std::runtime_error(
+                "latency model 需要 event timestamp，但首个 event 前发生 submit/cancel"
+                "（interpolated 时变模型不允许静默取首样本；改用 type:constant/cdf 或"
+                "确保首个行情事件先于首次下单）");
+        }
+        return 0;
+    }
+    return cur_event_ns_;
 }
 
 uint64_t XtHftMatchEngine::submit(uint64_t order_id,
@@ -135,14 +175,16 @@ uint64_t XtHftMatchEngine::submit(uint64_t order_id,
         }
         d.close_offset = close_offset;
         d.is_resubmit = is_resubmit;
+        d.lookup_event_ns = query_event_ts_();
         const uint32_t target = (wheel_cursor_ + order_delay_ticks_) % delay_wheel_.size();
         delay_wheel_[target].push_back(d);
         return order_id;
     }
+    const int64_t sample_ts = query_event_ts_();
     const uint32_t ack_delay_ms  = sample_ack_delay_ms();
-    const uint32_t fill_latency_ms = sample_fill_latency_ms();
+    const uint32_t fill_latency_ms = sample_fill_latency_ms(sample_ts);
 
-    const int64_t response_ns = latency_model_ ? sample_response_latency_ns() : -1;
+    const int64_t response_ns = latency_model_ ? sample_response_latency_ns(sample_ts) : -1;
 
     const uint64_t id = order_manager_.submit(order_id,
                                               code,
@@ -166,7 +208,21 @@ uint64_t XtHftMatchEngine::submit(uint64_t order_id,
 }
 
 bool XtHftMatchEngine::cancel(uint64_t id) {
-    return order_manager_.cancel(id, sample_cancel_delay_ms());
+
+    if (order_delay_ticks_ > 0) {
+        for (auto& slot : delay_wheel_) {
+            for (auto it = slot.begin(); it != slot.end(); ++it) {
+                if (it->order_id == id) {
+                    order_manager_.emit_in_transit_canceled(
+                        it->order_id, it->code, it->is_buy, it->price_fp,
+                        it->qty_fp, it->tif, it->user_tag, it->close_offset);
+                    slot.erase(it);
+                    return true;
+                }
+            }
+        }
+    }
+    return order_manager_.cancel(id, sample_cancel_delay_ms(query_event_ts_()));
 }
 
 void XtHftMatchEngine::on_tick(const XtTick& tick, std::vector<XtTradeRecord>& trades) {
@@ -213,14 +269,32 @@ std::size_t XtHftMatchEngine::delay_wheel_pending_count() const noexcept {
     return total;
 }
 
+void XtHftMatchEngine::collect_in_transit_order_ids(std::vector<uint64_t>& out) const {
+    if (order_delay_ticks_ == 0) return;
+    for (const auto& slot : delay_wheel_) {
+        for (const auto& d : slot) out.push_back(d.order_id);
+    }
+}
+
 std::size_t XtHftMatchEngine::discard_in_transit_orders() noexcept {
 
     if (order_delay_ticks_ == 0) return 0;
     const std::size_t before = delay_wheel_pending_count();
     if (before == 0) return 0;
-    for (auto& slot : delay_wheel_) slot.clear();
+    for (auto& slot : delay_wheel_) {
+        for (const auto& d : slot) {
+            order_manager_.emit_in_transit_canceled(
+                d.order_id, d.code, d.is_buy, d.price_fp, d.qty_fp,
+                d.tif, d.user_tag, d.close_offset);
+        }
+        slot.clear();
+    }
     lost_in_transit_count_ += static_cast<std::uint64_t>(before);
     return before;
+}
+
+void XtHftMatchEngine::discard_eof_live_orders() {
+    order_manager_.discard_eof_live_orders();
 }
 
 double XtHftMatchEngine::next_rand01() {
@@ -233,7 +307,9 @@ double XtHftMatchEngine::calc_max_fill_qty(const XtTick& tick) {
     const double volume = xt_tick_convert::qty_from_fp(tick.volume_fp);
     if (total_volume > 0.0) {
         double& last = find_or_insert_volume(tick.code);
-        double diff = (last > 0.0) ? (total_volume - last) : total_volume;
+
+        const bool first_obs = (last <= 0.0);
+        double diff = first_obs ? 0.0 : (total_volume - last);
         if (diff < 0.0) diff = total_volume;
         last = total_volume;
         if (volume > 0.0) {
@@ -244,7 +320,7 @@ double XtHftMatchEngine::calc_max_fill_qty(const XtTick& tick) {
     if (volume > 0.0) {
         return volume;
     }
-    return 0.0;
+    return -1.0;
 }
 
 uint32_t XtHftMatchEngine::sample_ack_delay_ms() {
@@ -261,42 +337,35 @@ uint32_t XtHftMatchEngine::sample_ack_delay_ms() {
     return static_cast<uint32_t>((clamped_us + 999.0) / 1000.0);
 }
 
-uint32_t XtHftMatchEngine::sample_fill_latency_ms() {
+uint32_t XtHftMatchEngine::sample_fill_latency_ms(int64_t event_ts_ns) {
 
     if (!latency_model_) return 0;
-    const int64_t ns = latency_model_->entry_latency_ns(0);
+    const int64_t ns = xt_latency::validate_latency_ns(
+        latency_model_->entry_latency_ns(event_ts_ns), "entry");
     if (ns <= 0) return 0;
     return static_cast<uint32_t>((ns + 999'999LL) / 1'000'000LL);
 }
 
-uint32_t XtHftMatchEngine::sample_cancel_delay_ms() {
+uint32_t XtHftMatchEngine::sample_cancel_delay_ms(int64_t event_ts_ns) {
 
     if (!cancel_latency_enabled_ || !latency_model_) return 0;
-    const int64_t ns = latency_model_->entry_latency_ns(0);
+    const int64_t ns = xt_latency::validate_latency_ns(
+        latency_model_->entry_latency_ns(event_ts_ns), "cancel_entry");
 
-    (void)latency_model_->response_latency_ns(0);
+    (void)latency_model_->response_latency_ns(event_ts_ns);
     if (ns <= 0) return 0;
     return static_cast<uint32_t>((ns + 999'999LL) / 1'000'000LL);
 }
 
-double& XtHftMatchEngine::find_or_insert_volume(const char* code) noexcept {
+double& XtHftMatchEngine::find_or_insert_volume(const char* code) {
 
     for (auto& e : volume_table_) {
-        if (e.valid && std::strncmp(e.code, code, sizeof(e.code)) == 0)
-            return e.volume;
+        if (std::strncmp(e.code, code, sizeof(e.code)) == 0) return e.volume;
     }
-    for (auto& e : volume_table_) {
-        if (!e.valid) {
-            std::strncpy(e.code, code, sizeof(e.code) - 1);
-            e.code[sizeof(e.code) - 1] = '\0';
-            e.valid  = true;
-            e.volume = 0.0;
-            return e.volume;
-        }
-    }
-
-    volume_table_[0].volume = 0.0;
-    return volume_table_[0].volume;
+    VolumeEntry entry{};
+    std::strncpy(entry.code, code, sizeof(entry.code) - 1);
+    volume_table_.push_back(entry);
+    return volume_table_.back().volume;
 }
 
 void XtHftMatchEngine::advance_wheel_and_flush_() {
@@ -323,7 +392,8 @@ void XtHftMatchEngine::inject_cancel_errors_() {
 
 void XtHftMatchEngine::match_orders_on_tick_depth_(const XtTick& tick,
                                                    std::vector<XtTradeRecord>& trades) {
-    order_manager_.set_depth_snapshot_fp(tick.bid_price_fp,
+    order_manager_.set_depth_snapshot_fp(tick.code,
+                                         tick.bid_price_fp,
                                          tick.ask_price_fp,
                                          tick.bid_qty_fp,
                                          tick.ask_qty_fp,
@@ -333,7 +403,7 @@ void XtHftMatchEngine::match_orders_on_tick_depth_(const XtTick& tick,
         price_limit_enabled_ ? tick.upper_limit_fp : 0,
         price_limit_enabled_ ? tick.lower_limit_fp : 0);
 
-    double max_fill_qty = volume_limit_ ? calc_max_fill_qty(tick) : 0.0;
+    double max_fill_qty = volume_limit_ ? calc_max_fill_qty(tick) : -1.0;
 
     constexpr int64_t kDepthQtyInflation = 1'000'000;
     int64_t inflated_bid_qty[XtTick::DEPTH];
@@ -389,15 +459,27 @@ void XtHftMatchEngine::split_new_fills_(size_t first_new_trade,
                                   + static_cast<uint64_t>(current_date_) * 65537ULL
                                   + static_cast<uint64_t>(current_time_ms_);
         std::mt19937 local_rng(static_cast<uint32_t>(order_seed));
-        split_qty(order_exec_from_fp(trades[i].qty_fp),
-                  split_min_qty_,
-                  split_max_qty_,
-                  split_qty_tick_,
-                  local_rng,
-                  parts_buf_);
-        for (double part_qty : parts_buf_) {
+        split_qty_fp(trades[i].qty_fp,
+                     split_min_fp_,
+                     split_max_fp_,
+                     split_tick_fp_,
+                     local_rng,
+                     parts_buf_);
+        int64_t sum_fp = 0;
+        for (int64_t part_fp : parts_buf_) sum_fp += part_fp;
+        if (sum_fp != trades[i].qty_fp) {
+
+            std::fprintf(stderr,
+                         "[XtHftMatchEngine] split conservation mismatch "
+                         "qty_fp=%lld sum_fp=%lld parts=%zu, fill kept unsplit\n",
+                         static_cast<long long>(trades[i].qty_fp),
+                         static_cast<long long>(sum_fp), parts_buf_.size());
+            expanded_buf_.push_back(trades[i]);
+            continue;
+        }
+        for (int64_t part_fp : parts_buf_) {
             XtTradeRecord part = trades[i];
-            part.qty_fp = order_exec_to_fp(part_qty);
+            part.qty_fp = part_fp;
             expanded_buf_.push_back(part);
         }
     }
@@ -407,10 +489,11 @@ void XtHftMatchEngine::split_new_fills_(size_t first_new_trade,
 }
 
 uint64_t XtHftMatchEngine::submit_immediate_(const DeferredOrder& d) {
-    const uint32_t ack_delay_ms = sample_ack_delay_ms();
-    const uint32_t fill_latency_ms = sample_fill_latency_ms();
 
-    const int64_t response_ns = latency_model_ ? sample_response_latency_ns() : -1;
+    const uint32_t ack_delay_ms = sample_ack_delay_ms();
+    const uint32_t fill_latency_ms = sample_fill_latency_ms(d.lookup_event_ns);
+
+    const int64_t response_ns = latency_model_ ? sample_response_latency_ns(d.lookup_event_ns) : -1;
     const uint64_t id = order_manager_.submit(d.order_id, d.code, d.is_buy,
                                               d.price_fp, d.qty_fp, d.tif,
                                               d.order_date, d.order_time_ms,

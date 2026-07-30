@@ -51,6 +51,8 @@ private:
     friend void md_binance_test_make_book_ready(void*, const char*);
     friend void md_binance_test_disconnect(void*);
     friend int md_binance_test_backfill_inflight(void*);
+    friend bool md_binance_test_agg_state(void*, const char*, long long*,
+                                          unsigned long long*);
 #endif
 };
 
@@ -63,6 +65,10 @@ void md_binance_test_make_book_ready(void* impl_void, const char* symbol);
 void md_binance_test_disconnect(void* impl_void);
 
 int md_binance_test_backfill_inflight(void* impl_void);
+
+bool md_binance_test_agg_state(void* impl_void, const char* symbol,
+                               long long* out_last_agg_id,
+                               unsigned long long* out_dropped);
 #endif
 
 }

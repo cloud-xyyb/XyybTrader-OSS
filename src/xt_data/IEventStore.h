@@ -3,9 +3,10 @@
 /// @file
 /// @brief append-only 事件存储接口，覆盖 MdTick 分片与日级 EventExt 流。
 ///
-/// 写侧接收已经序列化完成的 FlatBuffers bytes，并按 routing key 持久化。
-/// append 路径按 single-writer 设计；需要多 writer 时由调用方加锁或拆分 store 实例。
-/// query 只读取已经对后端可见的 record。
+/// live runner 要把每条行情 tick 和扩展事件落盘——既供回测「录制即数据集」直接回放，也供
+/// 事后审计。本接口是这套落盘的抽象：写侧接收已序列化好的 FlatBuffers bytes，按 routing key
+/// 持久化；读侧按交易日范围顺序取回 MdTick。append 路径按 single-writer 设计；需要多 writer
+/// 时由调用方加锁或拆分 store 实例。query 只读取已经对后端可见的 record。
 
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +28,7 @@ struct MdTickView {
     std::size_t bytes_len = 0;
 };
 
-/// @brief 提供 MdTick 查询结果的顺序读取。
+/// @brief MdTick 查询结果的顺序读取游标。
 ///
 /// 调用 `next()` 取得下一条 MdTick；返回 false 表示结果耗尽或读取出错。
 /// 每次成功读取都会更新输出的 MdTickView，上一条 view 随之失效。
@@ -42,7 +43,7 @@ public:
     virtual bool has_error() const = 0;
 };
 
-/// @brief 提供 MdTick 与 EventExt 的 append-only 事件存储。
+/// @brief MdTick 与 EventExt 的 append-only 事件存储抽象。
 ///
 /// `append()` 写入 MdTick record，`append_event_ext()` 写入日级扩展事件流。
 /// `query()` 创建 MdTick iterator；查询结果不包含 EventExt payload。
@@ -68,7 +69,7 @@ public:
 
     virtual std::unique_ptr<IEventIterator> query(const QueryRange& range) = 0;
 
-    virtual void flush() = 0;
+    virtual bool flush() = 0;
 
     virtual bool append_event_ext(std::uint32_t trading_day,
                                   const void* fbs_buf,

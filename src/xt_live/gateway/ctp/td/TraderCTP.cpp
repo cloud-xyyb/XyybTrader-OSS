@@ -6,6 +6,7 @@
 
 #include "xt_identity/OrderAttributionStore.h"
 #include "ctp/td/TraderCTP.h"
+#include "ctp/td/CtpLoginBackoff.h"
 
 #include "ctp/common/CTPUtil.h"
 #include "xt_util/path/PathUtil.h"
@@ -37,8 +38,6 @@ namespace {
 
 constexpr double kDefaultAccountSnapshotMaxAbs = 1e12;
 
-constexpr int kCtpLoginForbiddenErrorId = 75;
-
 static const char* rc(XtLiveRejectReason code)  { return live_reject_reason_str(code); }
 static const char* rc(XtLiveRecoveryError code) { return live_recovery_error_str(code); }
 
@@ -52,8 +51,15 @@ CtpRecovery::HostPorts TraderCTP::make_recovery_host_ports(TraderCTP* self) {
     CtpRecovery::HostPorts ports;
     ports.publish_positions = [self](const std::vector<CtpRecovery::PositionSnapshot>& in) {
         auto out = self->convert_position_snapshot(in);
+
         self->readiness_gate_.satisfy(xt_live::gateway::TdReadinessStage::Position,
                                       "ctp position query completed");
+        if (self->recovery_.is_recovering()) {
+
+            self->stage_recovery_positions_(std::move(out));
+            return;
+        }
+
         if (self->callbacks_.on_position) self->callbacks_.on_position(out);
     };
 
@@ -65,7 +71,16 @@ CtpRecovery::HostPorts TraderCTP::make_recovery_host_ports(TraderCTP* self) {
     return ports;
 }
 
-TraderCTP::TraderCTP() : recovery_(make_recovery_host_ports(this)) {}
+TraderCTP::TraderCTP() : recovery_(make_recovery_host_ports(this)) {
+
+    process_start_epoch_us_ = wall_now_epoch_us_();
+}
+
+int64_t TraderCTP::wall_now_epoch_us_() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 TraderCTP::~TraderCTP() {
     stop();
@@ -102,9 +117,7 @@ void TraderCTP::on_recovery_ready() {
 
     const bool cold = is_first_recovery_;
     is_first_recovery_ = false;
-    rebuild_alive_inflight_and_emit(cold);
-
-    flush_recovery_window_trades_();
+    emit_recovery_finish_sequence_(cold);
     emit_ready_if_td_readiness_satisfied();
 }
 
@@ -122,6 +135,15 @@ void TraderCTP::configure_ctp(const CTPTdCfg& ctp_cfg) {
     recovery_rearm_backoff_ms_ = ctp_cfg.recovery_rearm_backoff_ms;
     recovery_rearm_alert_rounds_ = ctp_cfg.recovery_rearm_alert_rounds;
     if (recovery_rearm_alert_rounds_ < 0) recovery_rearm_alert_rounds_ = 0;
+
+    refresh_query_timeout_ms_ = ctp_cfg.refresh_query_timeout_ms;
+    if (refresh_query_timeout_ms_ < 0) refresh_query_timeout_ms_ = 0;
+    refresh_query_wedge_rounds_ = ctp_cfg.refresh_query_wedge_rounds;
+    if (refresh_query_wedge_rounds_ < 0) refresh_query_wedge_rounds_ = 0;
+
+    query_generation_fence_ = ctp_cfg.query_generation_fence;
+
+    exec_ledger_query_fill_delivery_ = ctp_cfg.exec_ledger_query_fill_delivery;
 }
 
 bool TraderCTP::init(const Config& cfg) {
@@ -306,6 +328,8 @@ void TraderCTP::reset_session_state() {
     reset_query_control_states();
     reset_td_readiness();
 
+    query_session_gen_.fetch_add(1, std::memory_order_acq_rel);
+
     {
         std::lock_guard<std::mutex> lk(recovery_rearm_mu_);
         recovery_rearm_round_ = 0;
@@ -320,6 +344,13 @@ void TraderCTP::reset_session_state() {
         recovery_window_gate_closed_ = false;
         recovery_window_overflow_ = 0;
     }
+
+    {
+        std::lock_guard<std::mutex> lk(recovery_staged_pos_mu_);
+        recovery_staged_positions_.clear();
+        recovery_staged_pos_valid_ = false;
+    }
+    recovery_position_anchor_us_.store(0, std::memory_order_release);
 }
 
 void TraderCTP::reset_td_readiness() {
@@ -426,11 +457,13 @@ void TraderCTP::handle_login_failed(CThostFtdcRspInfoField* pRspInfo) {
     XtLogger::error_m("TD", "event=td_login_failed reason_code={} error_id={} consecutive_failures={}",
                       rc(XtLiveRejectReason::TdLoginFailed), err_id, fails);
 
-    if (err_id == kCtpLoginForbiddenErrorId) {
+    if (ctp_login::is_credential_class_login_error(err_id)) {
+
         XtLogger::error_m("TD",
-            "CTP error 75 LOGIN_FORBIDDEN — broker-side lockout after consecutive failures. "
-            "Operator must reset password at https://www.simnow.com.cn (forgot password). "
-            "Aggressive retry keeps lockout sticky; backing off to 1-hour intervals.");
+            "CTP error {} credential-class login failure — operator action required "
+            "(reset/update password or auth info; SimNow: https://www.simnow.com.cn forgot-password). "
+            "Backing off to 1-hour intervals to avoid (re-)tripping broker lockout (error 75).",
+            err_id);
     }
 
     if (auto* rec = XtLiveRecorder::global()) {
@@ -592,8 +625,10 @@ TraderCTP::QueryControlStats TraderCTP::query_control_stats() const {
 
 void TraderCTP::OnRspQryOrder(CThostFtdcOrderField* pOrder,
                               CThostFtdcRspInfoField* pRspInfo,
-                              int,
+                              int nRequestID,
                               bool bIsLast) {
+
+    if (!query_row_owned_(QueryKind::XtOrder, nRequestID)) return;
     if (is_error(pRspInfo)) {
         XtLogger::error_m("TD", "query order failed");
         readiness_gate_.fail(xt_live::gateway::TdReadinessStage::OpenOrders,
@@ -660,8 +695,10 @@ void TraderCTP::OnRspQryOrder(CThostFtdcOrderField* pOrder,
 
 void TraderCTP::OnRspQryTrade(CThostFtdcTradeField* pTrade,
                               CThostFtdcRspInfoField* pRspInfo,
-                              int,
+                              int nRequestID,
                               bool bIsLast) {
+
+    if (!query_row_owned_(QueryKind::Trade, nRequestID)) return;
     if (is_error(pRspInfo)) {
         XtLogger::error_m("TD", "query trade failed");
         readiness_gate_.fail(xt_live::gateway::TdReadinessStage::ReverseSync,
@@ -684,9 +721,17 @@ void TraderCTP::OnRspQryTrade(CThostFtdcTradeField* pTrade,
 
 void TraderCTP::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField* pPosition,
                                          CThostFtdcRspInfoField* pRspInfo,
-                                         int,
+                                         int nRequestID,
                                          bool bIsLast) {
+
+    if (!query_row_owned_(QueryKind::Position, nRequestID)) return;
     if (is_error(pRspInfo)) {
+
+        if (!recovery_.position_query_owns(nRequestID)) {
+            recovery_.note_stale_position_frame();
+            maybe_log_stale_position_frame_(nRequestID);
+            return;
+        }
         XtLogger::error_m("TD", "query position failed");
         readiness_gate_.fail(xt_live::gateway::TdReadinessStage::Position,
                              "ctp position query failed");
@@ -698,10 +743,13 @@ void TraderCTP::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField* pPosit
         }
         return;
     }
-    recovery_.on_position(pPosition, bIsLast);
-    if (bIsLast) {
 
-        recovery_position_snap_seq_.fetch_add(1, std::memory_order_relaxed);
+    const bool owned = recovery_.on_position(pPosition, bIsLast, nRequestID);
+    if (!owned) {
+        maybe_log_stale_position_frame_(nRequestID);
+        return;
+    }
+    if (bIsLast) {
         clear_recovery_query_timeout(QueryKind::Position);
         on_query_response_done(QueryKind::Position, true);
 
@@ -710,6 +758,50 @@ void TraderCTP::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField* pPosit
         else
             XtLogger::debug_m("TD", "query position done");
     }
+}
+
+bool TraderCTP::query_row_owned_(QueryKind kind, int request_id) {
+    if (!query_generation_fence_) return true;
+    const int active =
+        qry_[qry_idx(kind)].active_request_id.load(std::memory_order_acquire);
+
+    if (request_id <= 0 || active == 0) {
+        stale_query_row_unfenceable_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (request_id == active) return true;
+
+    stale_query_row_dropped_.fetch_add(1, std::memory_order_relaxed);
+    maybe_log_stale_query_row_(kind, request_id);
+    return false;
+}
+
+void TraderCTP::maybe_log_stale_query_row_(QueryKind kind, int request_id) {
+
+    const int64_t now_ms = XtSteadyClock::steady_now_ms();
+    int64_t last = last_stale_query_row_log_ms_.load(std::memory_order_relaxed);
+    if (now_ms - last < 5000) return;
+    if (!last_stale_query_row_log_ms_.compare_exchange_strong(last, now_ms,
+                                                              std::memory_order_relaxed))
+        return;
+    XtLogger::warn_m("TD",
+        "event=stale_query_row_dropped stage={} req_id={} dropped_total={} "
+        "(过期轮查询回包，generation fence 拦截)",
+        query_meta(kind).name, request_id,
+        stale_query_row_dropped_.load(std::memory_order_relaxed));
+}
+
+void TraderCTP::maybe_log_stale_position_frame_(int request_id) {
+
+    const int64_t now_ms = XtSteadyClock::steady_now_ms();
+    int64_t last = last_stale_position_log_ms_.load(std::memory_order_relaxed);
+    if (now_ms - last < 5000) return;
+    if (!last_stale_position_log_ms_.compare_exchange_strong(last, now_ms,
+                                                             std::memory_order_relaxed))
+        return;
+    XtLogger::warn_m("TD",
+        "event=stale_position_frame_dropped req_id={} total={} (过期轮持仓回包，归属栅栏拦截)",
+        request_id, recovery_.stale_position_frame_dropped());
 }
 
 void TraderCTP::maybe_emit_daily_settlement_event(const CThostFtdcTradingAccountField* pAccount) {
@@ -751,8 +843,10 @@ void TraderCTP::maybe_emit_daily_settlement_event(const CThostFtdcTradingAccount
 
 void TraderCTP::OnRspQryTradingAccount(CThostFtdcTradingAccountField* pAccount,
                                        CThostFtdcRspInfoField* pRspInfo,
-                                       int,
+                                       int nRequestID,
                                        bool bIsLast) {
+
+    if (!query_row_owned_(QueryKind::AccountState, nRequestID)) return;
     if (is_error(pRspInfo)) {
         XtLogger::error_m("TD", "query account failed");
         readiness_gate_.fail(xt_live::gateway::TdReadinessStage::Account,

@@ -3,9 +3,11 @@
 #   - XtClockSkewEstimator ：server event_time vs 本地 monotonic 偏移估计（metric-gated）
 #   - XtMdFreshness        ：MD stale watchdog 纯函数（header-only）
 #   - IoContextThread      ：单 io_context + 独占线程 lifecycle RAII（header-only）
+#   - XtExecDeliveryLedger ：per-order 交付投影（fill 记账/终态 payload/撤单证据）
 #   - WriteSerializer / TdReadinessGate / ReverseSyncHelper / ... （header-only helper）
 add_library(xt_gateway_common STATIC
     XtWsConnection.cpp
+    XtExecDeliveryLedger.cpp
 )
 
 target_include_directories(xt_gateway_common PUBLIC

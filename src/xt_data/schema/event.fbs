@@ -8,8 +8,9 @@
 //   - scripts/data_pipeline/MANIFEST.yaml（normalized_v2 CSV）
 //
 // 字段命名与 XtTick.h 保持一致；×1e6 定点字段全部带 `_fp` 后缀。
-// FBS event-store v1 固定 L1-L5：写方必须写 5 档，读方必须拒绝非 5 档。
-// 更深 live 盘口属于 JSONL recorder 或 control RPC snapshot，不改变本 schema。
+// Depth 契约 v2（变长 1..20）：写方按 venue 真实档数写 depth_levels_real 档，
+// 读方接受 1..kEventStoreMdDepth(20) 并校验数组长度 == depth_levels_real；
+// 旧 v1 固定 5 档文件天然落在区间内，向后兼容直读。
 
 namespace ct.data.schema;
 
@@ -20,11 +21,21 @@ namespace ct.data.schema;
 // ---------------------------------------------------------------------------
 enum SourceKind : byte {
   UNKNOWN      = 0,  // 未设置 — 消费方必须拒绝（数据源不可信）
-  LIVE_CTP     = 1,  // XtLiveRecorder + ParserCTP 实时写入 (FBS v1 top-5 depth + 真实 settlement)
+  LIVE_CTP     = 1,  // XtLiveRecorder + ParserCTP 实时写入 (5 档源 + 真实 settlement)
   MIGRATED_V2  = 2,  // scripts/migrate_normalized_v2_to_fbs.py (L1 only, sentinel 0)
   REPLAY       = 3,  // 预留：replay tool 回放 / shadow 注入
-  LIVE_BINANCE = 4,  // XtLiveRecorder + MdBinanceUGateway 实时写入（JSONL 20 档；FBS v1 top-5）
-  LIVE_XTP     = 5,  // XtLiveRecorder + ParserXTP 实时写入（XTP 源可 10 档；FBS v1 top-5）
+  LIVE_BINANCE = 4,  // XtLiveRecorder + MdBinanceUGateway 实时写入（20 档源）
+  LIVE_XTP     = 5,  // XtLiveRecorder + ParserXTP 实时写入（10 档源）
+}
+
+// ---------------------------------------------------------------------------
+// total_volume_fp 编码标注（Volume encoding）：UNKNOWN=0 = 旧文件未标注。
+// 新写方（live recorder / migrator）必须显式写 FP_1E6；读方对 UNKNOWN
+// 按 source_kind 查表判定单位（见 XtFbsTickReader::decode_total_volume_fp）。
+// ---------------------------------------------------------------------------
+enum VolumeEncoding : byte {
+  UNKNOWN = 0,  // 未标注（旧文件）— reader 按 source_kind 查表
+  FP_1E6  = 1,  // total_volume_fp = qty ×1e6 定点
 }
 
 // ---------------------------------------------------------------------------
@@ -75,11 +86,12 @@ table MdTick {
   upper_limit_fp:int64;                // 对齐 XtTick::upper_limit_fp
   lower_limit_fp:int64;                // 对齐 XtTick::lower_limit_fp
 
-  // ── Depth L1–L5（fp ×1e6）──────────────────────────────────────────
+  // ── Depth L1–L20（fp ×1e6，变长契约 v2）─────────────────────────────
   //
   // FlatBuffers vector 为可变长度，schema 层不强制 size。
-  // 写方必须保证 `size() == 5`（不足档位用 0 补齐）。
-  // 读方（XtFbsTickReader 等）必须校验 `size() == 5`，否则拒绝。
+  // 写方按 venue 真实档数写入 `depth_levels_real` 档（1..kEventStoreMdDepth）。
+  // 读方（XtFbsTickReader 等）必须校验 `size() == depth_levels_real` 且
+  // depth_levels_real 落在 1..kEventStoreMdDepth，否则拒绝。
   // 字段名单数形式对齐 XtTick::bid_price_fp[DEPTH] / ask_price_fp[DEPTH] / bid_qty_fp[DEPTH]。
   bid_price_fp:[int64];                // [0] = best bid, 档位越深数值越低
   ask_price_fp:[int64];                // [0] = best ask, 档位越深数值越高
@@ -105,8 +117,15 @@ table MdTick {
   // 未赋值的读方拿到 UNKNOWN / 0，应 fail-fast 拒绝此条数据。
   // has_settlement 默认 false（保守：写方显式 true 才可信，缺省视作不可信）。
   source_kind:SourceKind;              // explicit non-UNKNOWN source
-  depth_levels_real:ubyte;             // FBS v1 必须 == 5
+  depth_levels_real:ubyte;             // venue 真实档数，1..kEventStoreMdDepth(20)
   has_settlement:bool = false;
+
+  // ── total_volume_fp 编码标注（appended 2026-07-10，T2.BT-9）─────────────
+  //
+  // 旧文件缺字段读出 UNKNOWN(0)：reader 按 source_kind 查表判定单位
+  //（LIVE_CTP/LIVE_XTP 存量为 raw 手数；LIVE_BINANCE/MIGRATED_V2 存量为 fp；
+  //  REPLAY 不可判定 → fail-fast 要求重新迁移）。新写方必须显式写 FP_1E6。
+  volume_encoding:VolumeEncoding = UNKNOWN;
 }
 
 root_type MdTick;

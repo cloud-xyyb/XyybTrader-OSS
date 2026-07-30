@@ -15,6 +15,7 @@
 #include "xt_metrics/XtMetricRegistry.h"
 #endif
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "xt_account/state/AccountStateStore.h"
 #include "xt_metrics/XtStrategyPnlAggregator.h"
@@ -23,6 +24,7 @@
 #include "XtFixedPoint.h"
 #include "xt_identity/StrategySidRegistry.h"
 #include "xt_risk/engine/XtRiskMonitorState.h"
+#include "xt_risk/engine/XtRiskProjection.h"
 #include "xt_util/time/XtSteadyClock.h"
 #include "XtLogger.h"
 #include "xt_util/time/CtHHMM.h"
@@ -166,7 +168,8 @@ XtRiskSnapshot XtLiveRiskGuardContext::make_snapshot(const xt_core::XtOrder& req
 
     XtRiskSnapshot out{};
     if (account_store_submit_) {
-        out = account_store_submit_->snapshot_risk(req.code);
+        const auto frame = account_store_submit_->snapshot_account_and_position(req.code);
+        out = xt_risk::project_risk_snapshot(frame.account, frame.position);
 
         out.starting_balance_fp = account_store_submit_->starting_balance_fp();
     }
@@ -381,6 +384,9 @@ XtRiskResult XtLiveRiskGuardContext::guard_before_submit(const xt_core::XtOrder&
                                 ? static_cast<uint64_t>(XtSteadyClock::steady_now_ms())
                                 : 0;
 
+    const auto frame =
+        account_store_submit_->snapshot_account_and_position(req.code ? req.code : "");
+
     const XtCommodityInfo* info = catalog_->find(req.code);
 
     SubmitResourceSnapshot snap;
@@ -404,7 +410,7 @@ XtRiskResult XtLiveRiskGuardContext::guard_before_submit(const xt_core::XtOrder&
     const bool venue_has_broker_frozen =
         (info && info->has_broker_frozen_push);
     if (snapshot_fresh) {
-        const auto pos = account_store_submit_->snapshot_position(req.code ? req.code : "");
+        const auto& pos = frame.position;
         const auto closeable = xt_account::closeable_view(pos, req.is_buy);
         snap.closeable_today_fp     = closeable.today_fp;
         snap.closeable_yesterday_fp = closeable.yesterday_fp;
@@ -432,7 +438,7 @@ XtRiskResult XtLiveRiskGuardContext::guard_before_submit(const xt_core::XtOrder&
             }
         }
     }
-    snap.available_cash_fp = account_store_submit_->snapshot_account().available_cash;
+    snap.available_cash_fp = frame.account.available_cash;
 
     if (snap.position_snapshot_fresh) {
 

@@ -102,12 +102,15 @@ std::size_t BinanceReconciler::cancel_leaked_venue_orders(
 std::optional<XtOrderExecUpdate>
 BinanceReconciler::fetch_order_status(const std::string& sys_id,
                                       const std::string& symbol,
-                                      uint64_t local_id) {
+                                      uint64_t local_id,
+                                      XtLatencyEligibility& out_elig) {
+    out_elig = XtLatencyEligibility::kEligible;
     auto resp = rest_->get_signed("/fapi/v1/order",
                                   {{"symbol", symbol}, {"orderId", sys_id}});
     if (!resp.ok()) {
 
         if (parse_venue_err_code(resp.body) == kErrOrderNotExist) {
+            out_elig = XtLatencyEligibility::kIneligible;
             return synthesize_not_exist_terminal_(local_id, sys_id);
         }
         XtLogger::warn_m("BinanceTD",
@@ -223,7 +226,8 @@ bool BinanceReconciler::synthesize_blank_sys_id_reject(uint64_t local_id) {
     const bool erased =
         decision.action == BinanceOrderLedger::TerminalDecision::Action::kEmit;
     if (erased) {
-        emit_reconcile_terminal_update(upd);
+
+        emit_reconcile_terminal_update(upd, XtLatencyEligibility::kIneligible);
     }
     return erased;
 }
@@ -267,7 +271,8 @@ BinanceReconciler::detect_and_resolve_ghosts(uint32_t min_age_ms) {
         }
         if (exchange_open.count(inf.sys_id) > 0) continue;
 
-        auto term = fetch_order_status(inf.sys_id, inf.symbol, inf.local_id);
+        XtLatencyEligibility term_elig = XtLatencyEligibility::kEligible;
+        auto term = fetch_order_status(inf.sys_id, inf.symbol, inf.local_id, term_elig);
         if (!term.has_value()) {
             note_ghost_fetch_failure_(inf.local_id, inf.sys_id, next_fetch_fail_streak);
             continue;
@@ -285,7 +290,7 @@ BinanceReconciler::detect_and_resolve_ghosts(uint32_t min_age_ms) {
         if (ledger_.on_reconcile_terminal(
                 inf.local_id, BinanceOrderLedger::ReconcileTerminal::kVenueTerminal,
                 *term).action == BinanceOrderLedger::TerminalDecision::Action::kEmit) {
-            emit_reconcile_terminal_update(*term);
+            emit_reconcile_terminal_update(*term, term_elig);
         }
         ++resolved_count;
 
@@ -310,72 +315,129 @@ void BinanceReconciler::resync_user_trades_for_symbol(const std::string& symbol)
 
     const int64_t from_id = last_seen > 0 ? last_seen + 1 : 1;
 
-    std::map<std::string, std::string> qs = {
-        {"symbol", symbol},
-        {"fromId", std::to_string(from_id)},
-        {"limit",  "500"},
-    };
-    auto resp = rest_->get_signed("/fapi/v1/userTrades", qs);
-    if (!resp.ok()) {
-        XtLogger::warn_m("BinanceTD",
-            "resync_user_trades GET failed sym={} http={} err='{}'",
-            symbol, resp.http_status, resp.curl_err);
-        return;
-    }
-    auto j = nlohmann::json::parse(resp.body, nullptr,  false);
-    if (!j.is_array()) return;
-    if (j.empty()) {
-        XtLogger::info_m("BinanceTD",
-            "resync_user_trades sym={} from_id={} no missed fills (UDS healthy)",
-            symbol, from_id);
-        return;
-    }
+    int64_t cursor = from_id;
+    size_t emitted = 0, deduped = 0, skipped = 0;
+    int rounds = 0;
+    for (;;) {
+        ++rounds;
+        std::map<std::string, std::string> qs = {
+            {"symbol", symbol},
+            {"fromId", std::to_string(cursor)},
+            {"limit",  std::to_string(kUserTradesPageLimit)},
+        };
+        auto resp = rest_->get_signed("/fapi/v1/userTrades", qs);
+        if (!resp.ok()) {
+            XtLogger::warn_m("BinanceTD",
+                "resync_user_trades GET failed sym={} round={} http={} err='{}'",
+                symbol, rounds, resp.http_status, resp.curl_err);
+            return;
+        }
+        auto j = nlohmann::json::parse(resp.body, nullptr,  false);
+        if (!j.is_array()) return;
+        if (j.empty()) {
+            if (rounds == 1) {
+                XtLogger::info_m("BinanceTD",
+                    "resync_user_trades sym={} from_id={} no missed fills (UDS healthy)",
+                    symbol, from_id);
+                return;
+            }
+            break;
+        }
+        int64_t max_tid = 0;
+        replay_user_trades_json_(symbol, j, emitted, deduped, skipped, max_tid);
+        if (j.size() < kUserTradesPageLimit) break;
+        if (max_tid < cursor) {
 
-    size_t emitted = 0, deduped = 0;
-    replay_user_trades_json_(symbol, j, emitted, deduped);
+            XtLogger::warn_m("BinanceTD",
+                "resync_user_trades sym={} round={} cursor not advancing (max_tid={} cursor={})",
+                symbol, rounds, max_tid, cursor);
+            break;
+        }
+        cursor = max_tid + 1;
+        if (rounds >= kUserTradesPageRoundsMax) {
+            user_trades_pages_capped_total_.fetch_add(1, std::memory_order_relaxed);
+            XtLogger::error_m("BinanceTD",
+                "resync_user_trades sym={} page rounds capped at {} (still full page); "
+                "residual left to next reconcile cycle",
+                symbol, kUserTradesPageRoundsMax);
+            break;
+        }
+    }
     XtLogger::warn_m("BinanceTD",
-        "resync_user_trades sym={} from_id={} replayed={} deduped={} (UDS already had it)",
-        symbol, from_id, emitted, deduped);
+        "resync_user_trades sym={} from_id={} rounds={} replayed={} deduped={} skipped={} (UDS already had it)",
+        symbol, from_id, rounds, emitted, deduped, skipped);
 }
 
 void BinanceReconciler::resync_user_trades_for_order(const std::string& symbol,
                                                      const std::string& sys_id) {
     if (!uds_ || !rest_ || symbol.empty() || sys_id.empty()) return;
-    auto resp = rest_->get_signed("/fapi/v1/userTrades",
-                                  {{"symbol", symbol},
-                                   {"orderId", sys_id},
-                                   {"limit", "500"}});
-    if (!resp.ok()) {
-        XtLogger::warn_m("BinanceTD",
-            "resync_user_trades(orderId) GET failed sym={} orderId={} http={} err='{}'",
-            symbol, sys_id, resp.http_status, resp.curl_err);
-        return;
-    }
-    auto j = nlohmann::json::parse(resp.body, nullptr,  false);
-    if (!j.is_array()) return;
-    if (j.empty()) {
 
-        XtLogger::warn_m("BinanceTD",
-            "resync_user_trades(orderId) sym={} orderId={} returned no trades",
-            symbol, sys_id);
-        return;
+    int64_t cursor = 0;
+    size_t emitted = 0, deduped = 0, skipped = 0;
+    int rounds = 0;
+    for (;;) {
+        ++rounds;
+        std::map<std::string, std::string> qs = {
+            {"symbol", symbol},
+            {"orderId", sys_id},
+            {"limit", std::to_string(kUserTradesPageLimit)},
+        };
+        if (cursor > 0) qs.emplace("fromId", std::to_string(cursor));
+        auto resp = rest_->get_signed("/fapi/v1/userTrades", qs);
+        if (!resp.ok()) {
+            XtLogger::warn_m("BinanceTD",
+                "resync_user_trades(orderId) GET failed sym={} orderId={} round={} http={} err='{}'",
+                symbol, sys_id, rounds, resp.http_status, resp.curl_err);
+            return;
+        }
+        auto j = nlohmann::json::parse(resp.body, nullptr,  false);
+        if (!j.is_array()) return;
+        if (j.empty()) {
+            if (rounds == 1) {
+
+                XtLogger::warn_m("BinanceTD",
+                    "resync_user_trades(orderId) sym={} orderId={} returned no trades",
+                    symbol, sys_id);
+                return;
+            }
+            break;
+        }
+        int64_t max_tid = 0;
+        replay_user_trades_json_(symbol, j, emitted, deduped, skipped, max_tid);
+        if (j.size() < kUserTradesPageLimit) break;
+        if (max_tid < cursor) {
+            XtLogger::warn_m("BinanceTD",
+                "resync_user_trades(orderId) sym={} orderId={} round={} cursor not advancing",
+                symbol, sys_id, rounds);
+            break;
+        }
+        cursor = max_tid + 1;
+        if (rounds >= kUserTradesPageRoundsMax) {
+            user_trades_pages_capped_total_.fetch_add(1, std::memory_order_relaxed);
+            XtLogger::error_m("BinanceTD",
+                "resync_user_trades(orderId) sym={} orderId={} page rounds capped at {}; "
+                "residual left to next reconcile cycle",
+                symbol, sys_id, kUserTradesPageRoundsMax);
+            break;
+        }
     }
-    size_t emitted = 0, deduped = 0;
-    replay_user_trades_json_(symbol, j, emitted, deduped);
     XtLogger::warn_m("BinanceTD",
-        "resync_user_trades(orderId) sym={} orderId={} replayed={} deduped={}",
-        symbol, sys_id, emitted, deduped);
+        "resync_user_trades(orderId) sym={} orderId={} rounds={} replayed={} deduped={} skipped={}",
+        symbol, sys_id, rounds, emitted, deduped, skipped);
 }
 
 void BinanceReconciler::replay_user_trades_json_(const std::string& symbol,
                                                  const nlohmann::json& trades,
-                                                 size_t& emitted, size_t& deduped) {
+                                                 size_t& emitted, size_t& deduped,
+                                                 size_t& out_skipped,
+                                                 int64_t& out_max_trade_id) {
 
     for (const auto& t : trades) {
         try {
             XtTradeRecord tr;
             const int64_t binance_trade_id = t.value("id", 0LL);
-            if (binance_trade_id <= 0) continue;
+            if (binance_trade_id <= 0) { ++out_skipped; continue; }
+            out_max_trade_id = std::max(out_max_trade_id, binance_trade_id);
             const int64_t exchange_order_id = t.value("orderId", 0LL);
             tr.trade_id   = std::to_string(binance_trade_id);
             tr.order_sys_id = std::to_string(exchange_order_id);
@@ -414,7 +476,7 @@ void BinanceReconciler::replay_user_trades_json_(const std::string& symbol,
             } else {
                 ++deduped;
             }
-        } catch (...) { continue; }
+        } catch (...) { ++out_skipped; continue; }
     }
 }
 

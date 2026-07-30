@@ -410,6 +410,8 @@ private:
         }
 
         void handle_connect() {
+
+            if (!running || stopping) return;
             connected.store(true, std::memory_order_relaxed);
             consecutive_fail = 0;
             last_msg_ms.store(now_ms(), std::memory_order_relaxed);

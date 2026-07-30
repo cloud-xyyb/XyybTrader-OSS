@@ -8,10 +8,6 @@
 
 struct XtAccountEvent;
 
-namespace xt_account {
-class AccountStateStore;
-}
-
 /// @brief reducer 背后的可变账户账本对象。
 ///
 /// 保存账户资金、持仓表和订单冻结 ledger；不负责线程同步、snapshot 发布或
@@ -31,13 +27,6 @@ public:
         const XtCommodityCatalog* catalog = nullptr;
     };
 
-    /// @brief 内部构造令牌；限制 AccountState 只能由 AccountStateStore 创建。
-    struct CtorToken {
-    private:
-        CtorToken() = default;
-        friend class xt_account::AccountStateStore;
-    };
-
     /// @brief 单订单冻结资金 ledger entry，用于维护账户级 frozen_cash 不变量。
     ///
     /// 该结构不表达订单生命周期；订单状态归 XtOrderRuntimeBook。这里仅记录
@@ -48,7 +37,7 @@ public:
         int64_t per_unit = 0;
     };
 
-    explicit AccountState(const Config& cfg, CtorToken);
+    explicit AccountState(const Config& cfg);
 
     [[nodiscard]] int64_t cash() const;
 
@@ -121,7 +110,7 @@ private:
 
     static int64_t available_cover_of_(const Position& p, bool is_today, bool t1_enabled);
 
-    void on_session_begin(uint32_t action_date);
+    void on_session_begin();
 
     void reset_positions();
 
@@ -140,7 +129,7 @@ private:
 
     void on_order_accepted(uint64_t order_id, int64_t required_margin, int64_t per_unit_margin);
 
-    void on_order_update(uint64_t order_id, int64_t filled, int64_t remaining, bool is_final);
+    void on_order_update(uint64_t order_id, int64_t filled, bool is_final);
 
     void on_daily_settlement(int64_t realized_delta, int64_t settlement_fee);
 
@@ -161,7 +150,6 @@ private:
     int64_t fees_ = 0;
     bool t1_enabled_ = false;
     bool futures_mode_ = false;
-    uint32_t last_action_date_ = 0;
 
     std::unordered_map<std::string, Position> pos_;
 

@@ -34,11 +34,6 @@ public:
         return {};
     }
 
-    [[nodiscard]] virtual xt_account::RiskSnapshot risk(std::string_view code) const {
-        (void)code;
-        return {};
-    }
-
     [[nodiscard]] virtual std::vector<std::string> tracked_codes() const {
         return {};
     }

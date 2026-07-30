@@ -10,10 +10,14 @@
 #include "xt_util/time/XtTime.h"
 
 /// @file XtSessionFilter.h
-/// @brief session 时间段过滤与 closeout/no-open 窗口判断。
+/// @brief 交易时段（session）区间判断与收盘禁开仓/强平窗口判断。
 ///
-/// YAML 解析声明位于 `xt_backtest/infra/XtSessionFilterParser.h`，避免 xt_core
-/// 依赖 yaml-cpp。
+/// 一个交易日分成若干可交易时段（section）——日盘、夜盘各是一段，中间还有午休。引擎要不停
+/// 回答「当前时刻在不在可交易时段内」「是否已进入收盘前的禁开仓/强平窗口」，才知道能不能
+/// 派 tick、能不能下开仓单。本文件把这些区间判断收成一处纯函数，半开与闭区间、跨午夜、
+/// HHMM 与 HHMMSSmmm 两种编码各有对应 helper。
+///
+/// YAML 解析声明放在 `xt_backtest/infra/XtSessionFilterParser.h`，让 xt_core 不依赖 yaml-cpp。
 
 namespace xt_core {
 

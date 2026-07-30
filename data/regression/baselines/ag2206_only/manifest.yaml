@@ -33,8 +33,8 @@ inputs:
 golden:
   output: fills.csv
   expected: data/regression/baselines/ag2206_only/expected_fills.csv
-  sha256: 4d8ff8939bd896560390ffc1bf9d68ccd4bbcbed0f79b89d684743eb4b4ee73e
-  bytes: 537935
-  lines: 2962
+  sha256: 261837d2c3161e351a712914d2acbf5ad584402a21b06135746acedce2e27b53
+  bytes: 398030
+  lines: 2190
   tolerance: bit-exact
 driver: bash scripts/run_baselines.sh ag2206_only

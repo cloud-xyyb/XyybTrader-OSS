@@ -15,6 +15,7 @@
 #include "xt_core/order/XtOffsetPolicy.h"
 
 #include "XtLiveRuntimeStateCfg.h"
+#include "XtLiveConfig.h"
 #include "ConfigValidationCtx.h"
 #include "xt_config/yaml/ConfigYamlUtil.h"
 #include "xt_util/net/XtLoopbackHost.h"
@@ -106,6 +107,14 @@ bool validate_strategies_entries(const YAML::Node& strategies, std::string& err)
         const std::string id = e["id"] ? e["id"].as<std::string>("") : "";
         if (id.empty()) {
             err = "runtime.strategies[" + std::to_string(i) + "].id 必填";
+            return false;
+        }
+        if (!id.empty() && id[0] == '_') {
+
+            err = "runtime.strategies[" + std::to_string(i) +
+                  "].id='" + id +
+                  "' 使用了保留的 '_' 前缀 (保留名 {_global, _default, _manual}),"
+                  "不得用作策略 id";
             return false;
         }
         const std::string so = e["so"] ? e["so"].as<std::string>("") : "";
@@ -241,6 +250,10 @@ void validate_td_cfg(const YAML::Node& td_node, const ITradeGateway::Config* td_
                  "runtime.td.xtp.software_version 不能为空");
         v.add_if(!x || !x["account_key"] || x["account_key"].as<std::string>("").empty(),
                  "runtime.td.xtp.account_key 不能为空");
+
+        const int xtp_pos_ms = YamlNodeUtil::as_or<int>(x, "position_refresh_ms", 60000);
+        v.add_if(xtp_pos_ms <= 0,
+                 "runtime.td.xtp.position_refresh_ms 必须 > 0（周期持仓/资产 requery 兜底）");
     } else if (provider == "ctp") {
 
         v.add_if(!td_node["broker"] || td_node["broker"].as<std::string>("").empty(),
@@ -906,9 +919,11 @@ void validate_control_grpc_node(const YAML::Node& runtime_node, ValidationCtx& v
         return;
     }
 
-    bool enabled = false;
-    (void)v.read_bool(cg_node["enabled"], "runtime.control_grpc.enabled", enabled);
-    if (!enabled) return;
+    bool enabled_key_value = false;
+    (void)v.read_bool(cg_node["enabled"], "runtime.control_grpc.enabled", enabled_key_value);
+    XtLiveControlGrpcConfig cg_cfg;
+    fill_control_grpc_cfg(runtime_node, cg_cfg);
+    if (!cg_cfg.enabled) return;
 
     std::string listen_addr;
     if (v.read_string(cg_node["listen_addr"], "runtime.control_grpc.listen_addr", listen_addr)) {
@@ -1125,14 +1140,6 @@ bool validate_strategy_or_strategies_cfg(const YAML::Node& runtime_node,
     if (!validate_strategies_entries(strategies, err)) return false;
     if (!validate_strategies_b1_symbol_guard(runtime_node, strategies, err)) return false;
     err.clear();
-    return true;
-}
-
-bool live_selector_section_present(const YAML::Node& root) {
-    const YAML::Node sel = root["selector"];
-    if (!sel || sel.IsNull()) return false;
-
-    if (sel.IsMap() || sel.IsSequence()) return sel.size() > 0;
     return true;
 }
 

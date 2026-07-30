@@ -55,6 +55,8 @@ public:
     using Slot = MdRingSlot<T>;
     static constexpr uint64_t kSlotStride = sizeof(Slot);
 
+    static constexpr uint32_t kElementSize = static_cast<uint32_t>(sizeof(T));
+
     explicit XtShmRing(void* base) noexcept
         : ctrl_(reinterpret_cast<RingControlBlock*>(base)),
           slots_(reinterpret_cast<Slot*>(static_cast<char*>(base) + sizeof(RingControlBlock))),

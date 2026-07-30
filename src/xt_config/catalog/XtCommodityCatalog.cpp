@@ -82,6 +82,17 @@ std::vector<std::string> margin_lookup_keys(const char* code) {
     return keys;
 }
 
+template <typename T>
+T as_or_throw(const YAML::Node& node, const std::string& key, const char* field,
+              const char* type_name) {
+    try {
+        return node.as<T>();
+    } catch (const YAML::Exception&) {
+        throw std::runtime_error("commodities." + key + "." + field + ": expected " +
+                                 type_name + ", got \"" + node.Scalar() + "\"");
+    }
+}
+
 std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML::Node& node) {
     std::unordered_map<std::string, XtCommodityInfo> out;
     if (!node || node.IsNull() || !node.IsMap()) return out;
@@ -94,20 +105,31 @@ std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML:
 
         const YAML::Node item = it->second;
         XtCommodityInfo info;
-        if (item["price_tick"])  info.price_tick  = item["price_tick"].as<double>();
-        if (item["vol_scale"])   info.vol_scale   = item["vol_scale"].as<double>();
-        if (item["margin_rate"]) info.margin_rate = item["margin_rate"].as<double>();
-        if (item["slippage"])    info.slippage    = item["slippage"].as<double>();
+        if (item["price_tick"])
+            info.price_tick = as_or_throw<double>(item["price_tick"], key, "price_tick", "double");
+        if (item["vol_scale"])
+            info.vol_scale = as_or_throw<double>(item["vol_scale"], key, "vol_scale", "double");
+        if (item["margin_rate"])
+            info.margin_rate = as_or_throw<double>(item["margin_rate"], key, "margin_rate", "double");
+        if (item["slippage"]) {
+            info.slippage = as_or_throw<double>(item["slippage"], key, "slippage", "double");
+            if (!std::isfinite(info.slippage) || info.slippage < 0.0)
+
+                throw std::runtime_error("commodities." + key + ".slippage 必须是有限非负数，得到 " +
+                                         std::to_string(info.slippage));
+        }
         if (item["allow_short"]) info.allow_short = item["allow_short"].as<bool>();
 
         if (item["has_open_interest"]) info.has_open_interest = item["has_open_interest"].as<bool>();
         if (item["has_settle_price"])  info.has_settle_price  = item["has_settle_price"].as<bool>();
         if (item["is_t_plus_1"])       info.is_t_plus_1       = item["is_t_plus_1"].as<bool>();
-        if (item["min_lot"])           info.min_lot           = item["min_lot"].as<int>();
+        if (item["min_lot"])
+            info.min_lot = as_or_throw<int>(item["min_lot"], key, "min_lot", "int");
         if (item["has_broker_frozen_push"])
             info.has_broker_frozen_push = item["has_broker_frozen_push"].as<bool>();
         if (item["daily_price_limit_pct"])
-            info.daily_price_limit_pct = item["daily_price_limit_pct"].as<double>();
+            info.daily_price_limit_pct =
+                as_or_throw<double>(item["daily_price_limit_pct"], key, "daily_price_limit_pct", "double");
         if (item["offset_policy"]) {
             const std::string v = item["offset_policy"].as<std::string>();
             if (v == "close_first")       info.offset_policy = XtOffsetPolicy::CloseFirst;

@@ -5,6 +5,7 @@
 
 #include "ctp/td/TraderCTP.h"
 
+#include "ctp/td/CtpRefreshTimeout.h"
 #include "XtLogger.h"
 #include "xt_util/runtime/ThreadUtil.h"
 
@@ -86,5 +87,47 @@ void TraderCTP::start_refresh_loop() {
             }
         }
         refresh_running_.store(false, std::memory_order_release);
+    });
+}
+
+void TraderCTP::arm_refresh_query_timeout(QueryKind kind) {
+    if (refresh_query_timeout_ms_ <= 0) return;
+    if (recovery_.is_recovering()) return;
+    if (session_phase_.load(std::memory_order_acquire) != SessionPhase::Ready) return;
+
+    auto&          q          = qry_[qry_idx(kind)];
+    const uint64_t token      = q.refresh_timeout_token.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const int      timeout_ms = refresh_query_timeout_ms_;
+
+    schedule_after_ms(timeout_ms, [this, kind, token, timeout_ms]() {
+        if (!is_session_alive()) return;
+        if (recovery_.is_recovering()) return;
+        if (session_phase_.load(std::memory_order_acquire) != SessionPhase::Ready) return;
+        auto& q = qry_[qry_idx(kind)];
+        if (q.refresh_timeout_token.load(std::memory_order_acquire) != token) return;
+        if (!q.inflight.load(std::memory_order_acquire)) return;
+
+        const int consecutive =
+            q.refresh_timeout_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        refresh_query_timeout_total_.fetch_add(1, std::memory_order_acq_rel);
+        const auto d = ctp_refresh::refresh_timeout_decision(consecutive, refresh_query_wedge_rounds_);
+        const QueryMeta meta = query_meta(kind);
+
+        if (d.raise_wedge) {
+            XtLogger::error_m("TD",
+                "event=refresh_query_wedged stage={} timeout_ms={} consecutive={}/{} re-issuing",
+                meta.name, timeout_ms, consecutive, refresh_query_wedge_rounds_);
+        } else {
+            XtLogger::warn_m("TD",
+                "event=refresh_query_timeout stage={} timeout_ms={} consecutive={} re-issuing",
+                meta.name, timeout_ms, consecutive);
+        }
+        if (!d.reissue) return;
+
+        q.inflight.store(false, std::memory_order_release);
+        q.dirty.store(false, std::memory_order_release);
+        q.next_allowed_ms.store(0, std::memory_order_release);
+        q.backoff_level.store(0, std::memory_order_release);
+        query_once(kind);
     });
 }

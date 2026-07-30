@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include "xt_core/order/XtOrderLifecycle.h"
 #include "xt_core/order/XtOrderTypes.h"
 #include "xt_core/order/XtTradeRecord.h"
+#include "xt_live/gateway/common/XtExecDeliveryLedger.h"
 #include "ThostFtdcTraderApi.h"
 
 /// @brief CTP 回报的翻译与去重层：把 CTP 各种回报转成内部统一订单/成交事件。
@@ -19,6 +21,11 @@
 /// - 把这些回报翻译成内部 `XtOrderExecUpdate` / `XtTradeRecord`
 /// - 记住每笔订单的 CTP 路由字段（OrderRef/OrderSysID/FrontID/SessionID），撤单时反查
 /// - 对重复回报去重，防止同一事件被处理两次
+///
+/// 成交去重判据 = 交付投影（`XtExecDeliveryLedger`）的 fill 记账（查+记一体，
+/// exactly-once：同 key 任一来源先到恰好记账一次；记忆按进程生命周期保留，
+/// recovery 不清）。终态 payload 同步写入投影。fill 的 absorbed/delivered 语义
+/// 由 caller 按来源规则决定（`TraderCTP::on_rtn_trade_`）。
 ///
 /// 只做翻译和记录，不调 gateway callbacks、不记账、不做风控。
 /// 内部由 mutex 保护，线程安全。
@@ -48,7 +55,12 @@ public:
                         bool is_close,
                         bool is_today,
                         uint64_t submit_begin_us,
-                        uint64_t submit_end_us);
+                        uint64_t submit_end_us,
+                        int64_t absorbed_watermark_fp = 0);
+
+    void rollback_register(uint64_t local_id);
+
+    void note_submit_end(uint64_t local_id, uint64_t submit_end_us);
 
     bool get_order_ref(uint64_t local_id, std::string& out_ref) const;
 
@@ -64,8 +76,6 @@ public:
                                  int front_id,
                                  int session_id);
 
-    void on_recovery_begin();
-
     bool on_order_insert_reject(const CThostFtdcInputOrderField* pInputOrder,
                                 const CThostFtdcRspInfoField* pRspInfo,
                                 uint64_t local_cb_us,
@@ -78,12 +88,36 @@ public:
 
     bool on_trade(const CThostFtdcTradeField* pTrade,
                   uint64_t local_cb_us,
-                  XtTradeRecord& out);
+                  XtTradeRecord& out,
+                  xt_live::gateway::FillSource fill_source =
+                      xt_live::gateway::FillSource::kLivePush,
+                  bool absorbed = false,
+                  uint32_t query_gen = 0);
 
     bool on_cancel_action_error(const char* order_ref,
                                 int error_id,
                                 uint64_t local_cb_us,
                                 XtOrderExecUpdate& out);
+
+    bool make_cum_filled_completion(uint64_t local_id,
+                                    uint64_t local_cb_us,
+                                    XtOrderExecUpdate& out);
+
+    const xt_live::gateway::XtExecDeliveryLedger& exec_ledger() const { return exec_ledger_; }
+
+    uint64_t watermark_breach_total() const {
+        return watermark_breach_total_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t synth_cum_filled_total() const {
+        return synth_cum_filled_total_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t cum_filled_conflict_total() const {
+        return cum_filled_conflict_total_.load(std::memory_order_relaxed);
+    }
+
+    static uint64_t fill_epoch_us(const CThostFtdcTradeField* pTrade);
 
 private:
 
@@ -103,7 +137,6 @@ private:
         bool is_close = false;
         bool is_today = false;
 
-        double traded_qty = 0.0;
         uint64_t submit_begin_us = 0;
         uint64_t submit_end_us = 0;
     };
@@ -116,7 +149,7 @@ private:
 
     void update_local_cancel_fields(uint64_t local_id, const CThostFtdcOrderField* pOrder);
 
-    void accumulate_local_trade_qty(uint64_t local_id, double qty);
+    int64_t ledger_effective_filled_fp_(uint64_t local_id) const;
 
     bool should_emit(uint64_t local_id, const XtOrderExecUpdate& upd);
 
@@ -129,15 +162,22 @@ private:
 
     void remember_terminal_key_unlocked(const std::string& key);
 
+    void record_terminal_projection(uint64_t local_id,
+                                    const XtOrderExecUpdate& upd,
+                                    xt_live::gateway::TerminalProvenance prov);
+
     mutable std::mutex mu_;
+
     std::unordered_map<uint64_t, LocalOrderState> local_;
     order_lifecycle::XtOrderUpdateDeduper deduper_;
-
-    std::unordered_set<std::string> trade_seen_;
-    std::deque<std::string> trade_seen_fifo_;
 
     std::unordered_set<uint64_t> terminal_local_ids_;
     std::deque<uint64_t> terminal_local_fifo_;
     std::unordered_set<std::string> terminal_order_keys_;
     std::deque<std::string> terminal_order_key_fifo_;
+
+    xt_live::gateway::XtExecDeliveryLedger exec_ledger_;
+    std::atomic<uint64_t> watermark_breach_total_{0};
+    std::atomic<uint64_t> synth_cum_filled_total_{0};
+    std::atomic<uint64_t> cum_filled_conflict_total_{0};
 };

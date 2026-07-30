@@ -45,6 +45,8 @@ struct XtMarketDataSourceConfig {
     bool tick_auto_main = false;
     std::string tick_cache_dir = "data/ticks/cache";
     bool tick_use_bin_cache = true;
+
+    std::string tick_cache_format = "v3";
     std::string tick_volume_mode = "cumulative";
     double qty_base = 100.0;
 

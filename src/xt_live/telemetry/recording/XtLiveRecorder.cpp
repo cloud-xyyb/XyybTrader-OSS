@@ -302,6 +302,7 @@ inline ::ct::data::schema::SourceKind venue_kind_from_exchange(const char* excha
         std::strcmp(exchange_id, "DCE") == 0 ||
         std::strcmp(exchange_id, "CFFEX") == 0 ||
         std::strcmp(exchange_id, "CZCE") == 0 ||
+        std::strcmp(exchange_id, "GFEX") == 0 ||
         std::strcmp(exchange_id, "INE") == 0) {
         return SK::LIVE_CTP;
     }
@@ -581,11 +582,31 @@ void XtLiveRecorder::serialize_md_tick(const Event& ev, std::string& os,
                 using namespace ct::data::schema;
                 const auto code_off = fbb->CreateString(ev.md_code);
                 const auto exch_off = fbb->CreateString(ev.md_exchange_id);
-                constexpr int kDepth = ct::data::kEventStoreMdDepth;
-                const auto bid_px_off  = fbb->CreateVector(ev.md_bid_prices_fp, kDepth);
-                const auto ask_px_off  = fbb->CreateVector(ev.md_ask_prices_fp, kDepth);
-                const auto bid_qty_off = fbb->CreateVector(ev.md_bid_qty, kDepth);
-                const auto ask_qty_off = fbb->CreateVector(ev.md_ask_qty, kDepth);
+
+                const int depth =
+                    ev.md_depth_levels < 1 ? 1
+                    : (ev.md_depth_levels > ct::data::kEventStoreMdDepth
+                           ? ct::data::kEventStoreMdDepth
+                           : ev.md_depth_levels);
+                const auto bid_px_off  = fbb->CreateVector(ev.md_bid_prices_fp, depth);
+                const auto ask_px_off  = fbb->CreateVector(ev.md_ask_prices_fp, depth);
+                const auto bid_qty_off = fbb->CreateVector(ev.md_bid_qty, depth);
+                const auto ask_qty_off = fbb->CreateVector(ev.md_ask_qty, depth);
+
+                const auto kind = venue_kind_from_exchange(ev.md_exchange_id);
+
+                int64_t total_volume_fp = ev.md_volume;
+                bool volume_unit_ok = true;
+                if (kind == SourceKind::LIVE_CTP || kind == SourceKind::LIVE_XTP) {
+
+                    if (total_volume_fp < 0 ||
+                        total_volume_fp >
+                            std::numeric_limits<int64_t>::max() / 1'000'000) {
+                        volume_unit_ok = false;
+                    } else {
+                        total_volume_fp *= 1'000'000;
+                    }
+                }
 
                 MdTickBuilder b(*fbb);
                 b.add_code(code_off);
@@ -594,17 +615,20 @@ void XtLiveRecorder::serialize_md_tick(const Event& ev, std::string& os,
                 b.add_action_day(ev.md_action_date);
                 b.add_action_time(ev.md_action_time);
                 b.add_price_fp(ev.md_last_fp);
-                b.add_total_volume_fp(ev.md_volume);
+                b.add_total_volume_fp(total_volume_fp);
                 b.add_bid_price_fp(bid_px_off);
                 b.add_ask_price_fp(ask_px_off);
                 b.add_bid_qty_fp(bid_qty_off);
                 b.add_ask_qty_fp(ask_qty_off);
                 b.add_ts_local_ns(ev.ts_local_ns);
-
-                b.add_source_kind(venue_kind_from_exchange(ev.md_exchange_id));
-                b.add_depth_levels_real(ct::data::kEventStoreMdDepth);
+                b.add_source_kind(kind);
+                b.add_depth_levels_real(static_cast<uint8_t>(depth));
 
                 b.add_has_settlement(false);
+
+                if (volume_unit_ok && kind != SourceKind::UNKNOWN) {
+                    b.add_volume_encoding(VolumeEncoding::FP_1E6);
+                }
                 fbb->Finish(b.Finish(), "XTEV");
 
                 if (!es->append(ev.md_trading_date,
@@ -705,6 +729,12 @@ void XtLiveRecorder::serialize_order_submit(const Event& ev, std::string& os,
             if (ev.os_trigger_tick_ts != 0) {
                 os.append(",\"trigger_tick_ts\":");
                 append_u64(os, ev.os_trigger_tick_ts);
+            }
+
+            if (ev.os_event_clock_valid) {
+                os.append(",\"event_clock_valid\":true");
+                os.append(",\"event_ts_local_ns\":");
+                append_i64(os, ev.os_event_ts_local_ns);
             }
             if (ev.os_reason[0] != '\0') {
                 os.append(",\"reason\":\"");
@@ -1509,7 +1539,8 @@ void XtLiveRecorder::emit_md_tick(uint64_t ts_local_ns,
                                   const int64_t bid_prices_fp[kMdDepth],
                                   const int64_t ask_prices_fp[kMdDepth],
                                   const int64_t bid_qty[kMdDepth],
-                                  const int64_t ask_qty[kMdDepth]) {
+                                  const int64_t ask_qty[kMdDepth],
+                                  int depth_levels) {
 
 #ifdef XT_HAVE_METRICS
     ct::metrics::XtMetricRegistry::instance().on_md_tick(
@@ -1535,6 +1566,7 @@ void XtLiveRecorder::emit_md_tick(uint64_t ts_local_ns,
         ev.md_bid_qty[i]       = bid_qty[i];
         ev.md_ask_qty[i]       = ask_qty[i];
     }
+    ev.md_depth_levels = depth_levels;
     push_or_drop(std::move(ev));
 }
 
@@ -1580,6 +1612,8 @@ void XtLiveRecorder::emit_order_submit(const OrderSubmitParams& p) {
     copy_fixed(ev.os_account_id, sizeof(ev.os_account_id), p.account_id);
     copy_fixed(ev.os_user_tag,   sizeof(ev.os_user_tag),   p.user_tag);
     ev.os_decision_mono_ns = p.decision_mono_ns;
+    ev.os_event_clock_valid = p.event_clock_valid;
+    ev.os_event_ts_local_ns = p.event_ts_local_ns;
     push_or_drop(std::move(ev));
 }
 

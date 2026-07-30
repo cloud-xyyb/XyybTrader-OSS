@@ -78,7 +78,23 @@ void XtBacktestReporter::on_fill(const xt_report::XtFillRow& fill, const XtTrade
 
     fills_.push_back(fill);
 
-    event_writer_->on_trade(packed_ts_from_trade(raw), raw);
+    {
+        auto& row = fills_.back();
+        if (raw.sim_visible_at_ns >= 0) {
+            row.ts_event_ns = raw.sim_visible_at_ns;
+            row.ts_recv_ns  = raw.sim_visible_at_ns;
+            row.ts_ms       = raw.sim_visible_at_ns / 1'000'000LL;
+        } else if (last_tick_ts_ >= 1'000'000'000LL) {
+            const auto ad = static_cast<uint32_t>(last_tick_ts_ / 1'000'000'000LL);
+            const auto at = static_cast<uint32_t>(last_tick_ts_ % 1'000'000'000LL);
+            row.ts_ms       = xt_time::to_ns(ad, at) / 1'000'000LL;
+            row.ts_event_ns = row.ts_ms * 1'000'000LL;
+            row.ts_recv_ns  = row.ts_event_ns;
+        }
+    }
+
+    event_writer_->on_trade(
+        last_tick_ts_ >= 1'000'000'000LL ? last_tick_ts_ : packed_ts_from_trade(raw), raw);
 
 }
 

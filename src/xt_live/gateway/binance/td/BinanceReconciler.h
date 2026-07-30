@@ -27,6 +27,7 @@
 #include "xt_core/order/XtOrderTypes.h"
 #include "xt_core/order/XtTradeRecord.h"
 #include "xt_live/gateway/binance/td/EffectiveSignalDedup.h"
+#include "xt_live/gateway/binance/td/ResyncFillReplayer.h"
 #include "xt_live/gateway/common/TdReadinessGate.h"
 #include "xt_util/time/XtSteadyClock.h"
 
@@ -81,7 +82,8 @@ public:
     /// 字段顺序就是初始化顺序；Impl 构造时全部绑定，不可为空。
     struct ImplHooks {
 
-        std::function<void(const XtOrderExecUpdate&, EffectiveSignalDedup::Source)>
+        std::function<void(const XtOrderExecUpdate&, EffectiveSignalDedup::Source,
+                           XtLatencyEligibility)>
             emit_through_dedup;
 
         std::function<bool()> queue_reconcile_resync;
@@ -131,14 +133,20 @@ public:
 
     bool rebuild_from_open_orders_body(const std::string& body, bool is_cold_start);
 
-    void forward_uds_trade(const XtTradeRecord& tr);
+    uint64_t user_trades_pages_capped_total() const {
+        return user_trades_pages_capped_total_.load(std::memory_order_relaxed);
+    }
+
+    void forward_uds_trade(const XtTradeRecord& tr, XtLatencyEligibility elig);
 
     void forward_order_update_gated(const XtOrderExecUpdate& upd,
-                                    EffectiveSignalDedup::Source src);
+                                    EffectiveSignalDedup::Source src,
+                                    XtLatencyEligibility elig);
 
     void forward_uds_position(const std::vector<XtPositionSnapshot>& positions);
 
-    void emit_reconcile_terminal_update(const XtOrderExecUpdate& upd);
+    void emit_reconcile_terminal_update(const XtOrderExecUpdate& upd,
+                                        XtLatencyEligibility elig);
 
     /// @brief 对账快照落地期间，把并发到达的 fill 暂存、排好序再放行的栅栏。
     ///
@@ -186,7 +194,8 @@ private:
 
     std::optional<XtOrderExecUpdate> fetch_order_status(const std::string& sys_id,
                                                         const std::string& symbol,
-                                                        uint64_t local_id);
+                                                        uint64_t local_id,
+                                                        XtLatencyEligibility& out_elig);
 
     std::optional<XtOrderExecUpdate>
         synthesize_not_exist_terminal_(uint64_t local_id, const std::string& sys_id);
@@ -207,7 +216,8 @@ private:
     void resync_user_trades_for_order(const std::string& symbol, const std::string& sys_id);
 
     void replay_user_trades_json_(const std::string& symbol, const nlohmann::json& trades,
-                                  size_t& emitted, size_t& deduped);
+                                  size_t& emitted, size_t& deduped, size_t& out_skipped,
+                                  int64_t& out_max_trade_id);
 
     [[nodiscard]] std::optional<GapFillOrderAttribution>
         resolve_gap_fill_order_attribution(const std::string& symbol,
@@ -253,14 +263,18 @@ private:
     bool resync_buffering_ = false;
     std::vector<XtTradeRecord> resync_fill_buffer_;
 
-    std::vector<std::pair<XtOrderExecUpdate, EffectiveSignalDedup::Source>>
-        resync_terminal_buffer_;
+    std::vector<ResyncTerminal> resync_terminal_buffer_;
     uint64_t resync_pos_dropped_total_ = 0;
 
     static constexpr uint32_t kGhostFetchFailEscalateCycles = 10;
     std::unordered_map<uint64_t, uint32_t> ghost_fetch_fail_streak_;
 
     static constexpr std::size_t kSymbolFilterMax = 8;
+
+    static constexpr std::size_t kUserTradesPageLimit = 500;
+    static constexpr int kUserTradesPageRoundsMax = 8;
+
+    std::atomic<uint64_t> user_trades_pages_capped_total_{0};
 };
 
 }

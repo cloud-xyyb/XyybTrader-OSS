@@ -27,13 +27,17 @@ public:
     };
 
     using OnOrderUpdate = std::function<void(const XtOrderExecUpdate&)>;
-    using OnTrade       = std::function<void(const XtTradeRecord&)>;
+
+    using OnTrade       = std::function<void(const XtTradeRecord&, XtLatencyEligibility)>;
     using OnAccount     = std::function<void(const ITradeGateway::AccountSnapshot&)>;
     using OnPosition    = std::function<void(const std::vector<XtPositionSnapshot>&)>;
 
     using ParseLocalId  = std::function<uint64_t(std::string_view client_order_id)>;
 
     using OnUnattributedFill = std::function<void()>;
+
+    using FillDedup = std::function<bool(uint64_t order_id, std::string_view symbol,
+                                         int64_t trade_id)>;
 
     BinanceUserDataStream(Config cfg, BinanceRestClient& rest);
     ~BinanceUserDataStream();
@@ -48,6 +52,8 @@ public:
                         ParseLocalId parse_local_id);
 
     void set_unattributed_fill_handler(OnUnattributedFill handler);
+
+    void set_fill_dedup(FillDedup fn);
 
     bool start();
 

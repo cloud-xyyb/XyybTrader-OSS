@@ -47,8 +47,9 @@ public:
                       BinanceReconciler::ImplHooks{
 
                           [this](const XtOrderExecUpdate& upd,
-                                 EffectiveSignalDedup::Source src) {
-                              emit_through_dedup(upd, src);
+                                 EffectiveSignalDedup::Source src,
+                                 XtLatencyEligibility elig) {
+                              emit_through_dedup(upd, src, elig);
                           },
 
                           [this] { return queue_reconcile_resync_if_absent_(); },
@@ -63,8 +64,8 @@ public:
                           },
 
                           [this] { emit_ready_if_td_readiness_satisfied(); }}),
-          local_id_gen_(xt_core::local_id::PerVenueLocalIdGenerator::default_state_path(
-              "binance_u")) {}
+
+          local_id_gen_(std::in_place, std::string{}) {}
 
     /// @brief cold worker 的维护任务描述符。
     struct ColdWorkerTask {
@@ -85,6 +86,19 @@ public:
 
     void configure(const BinanceTdCfg& cfg) {
         td_cfg = cfg;
+        using Gen = xt_core::local_id::PerVenueLocalIdGenerator;
+        local_id_gen_.reset();
+        local_id_gen_error_.clear();
+        try {
+            if (!cfg.local_id_instance.empty()) {
+                local_id_gen_.emplace(
+                    Gen::InstanceIdentity{"binance_u", cfg.local_id_instance});
+            } else {
+                local_id_gen_.emplace(Gen::default_state_path("binance_u"));
+            }
+        } catch (const std::exception& e) {
+            local_id_gen_error_ = e.what();
+        }
         reset_td_readiness();
     }
 
@@ -141,7 +155,8 @@ public:
 private:
 
     void emit_through_dedup(const XtOrderExecUpdate& upd,
-                            EffectiveSignalDedup::Source src);
+                            EffectiveSignalDedup::Source src,
+                            XtLatencyEligibility elig);
 
     void on_uds_order_update(const XtOrderExecUpdate& upd);
 
@@ -156,7 +171,9 @@ public:
 
     void request_resnap();
 
-    void forward_uds_trade(const XtTradeRecord& tr) { reconciler_.forward_uds_trade(tr); }
+    void forward_uds_trade(const XtTradeRecord& tr, XtLatencyEligibility elig) {
+        reconciler_.forward_uds_trade(tr, elig);
+    }
 
     void forward_uds_position(const std::vector<XtPositionSnapshot>& positions) {
         reconciler_.forward_uds_position(positions);
@@ -181,7 +198,8 @@ public:
         if (ledger_.on_reconcile_terminal(
                 u.id, BinanceOrderLedger::ReconcileTerminal::kVenueTerminal, u).action ==
             BinanceOrderLedger::TerminalDecision::Action::kEmit) {
-            reconciler_.emit_reconcile_terminal_update(u);
+
+            reconciler_.emit_reconcile_terminal_update(u, XtLatencyEligibility::kEligible);
         }
     }
 
@@ -198,7 +216,9 @@ public:
 	        return ledger_.trace_id_for(local_id);
 	    }
 
-	    void test_forward_uds_trade(const XtTradeRecord& tr) { forward_uds_trade(tr); }
+	    void test_forward_uds_trade(const XtTradeRecord& tr) {
+	        forward_uds_trade(tr, XtLatencyEligibility::kEligible);
+	    }
 
     void test_bootstrap_snapshot() { reconciler_.bootstrap_snapshot(); }
 
@@ -223,23 +243,33 @@ public:
     void test_install_uds_prod_wired(const std::string& tracked_symbol) {
         BinanceUserDataStream::Config ucfg;
         uds = std::make_unique<BinanceUserDataStream>(ucfg, *rest);
+
+        uds->set_fill_dedup([this](uint64_t order_id, std::string_view symbol,
+                                   int64_t tid) {
+            return ledger_.note_fill_seen(order_id, symbol, tid);
+        });
         XtTradeRecord seed;
         seed.trade_id = "1";
         seed.code = tracked_symbol;
         (void)uds->inject_gap_fill_trade(seed);
         uds->bind_callbacks(
             [this](const XtOrderExecUpdate& upd) { this->on_uds_order_update(upd); },
-            [this](const XtTradeRecord& tr) { forward_uds_trade(tr); },
+            [this](const XtTradeRecord& tr, XtLatencyEligibility elig) { forward_uds_trade(tr, elig); },
             {}, {},
             [this](std::string_view s) { return parse_local_id_from_client_order_id(s); });
     }
 
     void test_boot_cold_worker_with_uds(
         const std::string& tracked_symbol,
-        std::function<void(const XtTradeRecord&)> on_gap_fill_trade) {
+        std::function<void(const XtTradeRecord&, XtLatencyEligibility)> on_gap_fill_trade) {
         reset_td_readiness();
         BinanceUserDataStream::Config ucfg;
         uds = std::make_unique<BinanceUserDataStream>(ucfg, *rest);
+
+        uds->set_fill_dedup([this](uint64_t order_id, std::string_view symbol,
+                                   int64_t tid) {
+            return ledger_.note_fill_seen(order_id, symbol, tid);
+        });
         XtTradeRecord seed;
         seed.trade_id = "1";
         seed.code = tracked_symbol;
@@ -296,7 +326,8 @@ public:
 
     BinanceReconciler reconciler_;
 
-    xt_core::local_id::PerVenueLocalIdGenerator local_id_gen_;
+    std::optional<xt_core::local_id::PerVenueLocalIdGenerator> local_id_gen_;
+    std::string local_id_gen_error_;
     std::atomic<uint64_t> local_id_persist_fail_seen_{0};
     std::atomic<uint64_t> nonce_ctr{0};
     std::atomic<uint32_t> last_time_sync_ms{0};

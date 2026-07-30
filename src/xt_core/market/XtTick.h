@@ -12,12 +12,12 @@ enum class TickKind : uint8_t {
 /**
  * @brief 热路径行情 tick（fixed-point）。
  *
- * 承载最新价、OHLC、成交量、涨跌停价及 L1-L10 盘口深度。价格、数量与成交额
+ * 承载最新价、OHLC、成交量、涨跌停价及 L1-L20 盘口深度。价格、数量与成交额
  * 使用 fixed-point 整数，供策略层和撮合引擎直接比较；原始 double 行情由
  * `XtRawTick` 表示并通过转换层进入本结构。
  */
 struct XtTick {
-    static constexpr int DEPTH = 10;
+    static constexpr int DEPTH = 20;
 
     char exchg[10] = {};
     char code[32] = {};

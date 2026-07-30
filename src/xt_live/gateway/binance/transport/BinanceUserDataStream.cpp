@@ -14,7 +14,6 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
-#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -22,7 +21,6 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -107,6 +105,10 @@ public:
 
     void set_unattributed_fill_handler(BinanceUserDataStream::OnUnattributedFill h) {
         on_unattributed_fill_ = std::move(h);
+    }
+
+    void set_fill_dedup(BinanceUserDataStream::FillDedup fn) {
+        fill_dedup_ = std::move(fn);
     }
 
     bool start() {
@@ -337,7 +339,8 @@ private:
             tr.trade_id = std::to_string(binance_trade_id);
             tr.order_sys_id = std::to_string(value_int64_or(o, "i", 0));
 
-            const bool tid_newly_seen = note_trade_id_seen(binance_trade_id);
+            const bool tid_newly_seen =
+                fill_first_seen(local_id, tr.code, binance_trade_id);
             if (tid_newly_seen) {
                 update_last_seen_trade_id(tr.code, binance_trade_id);
 
@@ -360,7 +363,7 @@ private:
                 event_ms, xt_core::TimezonePolicy::UtcNaturalDay);
 
             if (tid_newly_seen) {
-                on_trade_(tr);
+                on_trade_(tr, XtLatencyEligibility::kEligible);
             } else {
                 ++uds_trade_dedup_skips_;
                 const uint64_t now_us = lat_now_us();
@@ -473,29 +476,28 @@ public:
     static constexpr uint64_t kLatT2LogSampleN = 100;
     uint64_t lat_t2_log_seq_ = 0;
 
-    mutable std::mutex trade_dedup_mu_;
-    std::unordered_map<std::string, std::atomic<int64_t>> last_trade_id_per_symbol_;
-    static constexpr size_t kRecentTradeIdCap = 8192;
-    std::unordered_set<int64_t> recent_trade_ids_;
-    std::deque<int64_t> recent_trade_id_fifo_;
+    BinanceUserDataStream::FillDedup fill_dedup_;
+    std::atomic<bool> fill_dedup_unbound_warned_{false};
 
-    bool note_trade_id_seen(int64_t tid) {
-        if (tid <= 0) return true;
-        std::lock_guard<std::mutex> lk(trade_dedup_mu_);
-        if (!recent_trade_ids_.insert(tid).second) return false;
-        recent_trade_id_fifo_.push_back(tid);
-        while (recent_trade_ids_.size() > kRecentTradeIdCap &&
-               !recent_trade_id_fifo_.empty()) {
-            recent_trade_ids_.erase(recent_trade_id_fifo_.front());
-            recent_trade_id_fifo_.pop_front();
+    bool fill_first_seen(uint64_t order_id, const std::string& symbol, int64_t tid) {
+        if (!fill_dedup_) {
+            if (!fill_dedup_unbound_warned_.exchange(true)) {
+                XtLogger::error_m("BinanceUDS",
+                    "fill dedup delegate not bound; live/gap-fill dedup DISABLED "
+                    "(double-count risk) — production wiring must call set_fill_dedup");
+            }
+            return true;
         }
-        return true;
+        return fill_dedup_(order_id, symbol, tid);
     }
+
+    mutable std::mutex trade_highwater_mu_;
+    std::unordered_map<std::string, std::atomic<int64_t>> last_trade_id_per_symbol_;
 
     void update_last_seen_trade_id(const std::string& symbol, int64_t tid) {
         if (tid <= 0 || symbol.empty()) return;
 
-        std::lock_guard<std::mutex> lk(trade_dedup_mu_);
+        std::lock_guard<std::mutex> lk(trade_highwater_mu_);
         auto& slot = last_trade_id_per_symbol_[symbol];
         int64_t prev = slot.load(std::memory_order_relaxed);
         while (tid > prev && !slot.compare_exchange_weak(prev, tid,
@@ -522,6 +524,10 @@ void BinanceUserDataStream::set_unattributed_fill_handler(OnUnattributedFill han
     impl_->set_unattributed_fill_handler(std::move(handler));
 }
 
+void BinanceUserDataStream::set_fill_dedup(FillDedup fn) {
+    impl_->set_fill_dedup(std::move(fn));
+}
+
 bool BinanceUserDataStream::start() { return impl_->start(); }
 void BinanceUserDataStream::stop()  { impl_->stop(); }
 
@@ -534,7 +540,7 @@ void BinanceUserDataStream::request_reconnect() {
 }
 
 int64_t BinanceUserDataStream::last_seen_trade_id(const std::string& symbol) const {
-    std::lock_guard<std::mutex> lk(impl_->trade_dedup_mu_);
+    std::lock_guard<std::mutex> lk(impl_->trade_highwater_mu_);
     auto it = impl_->last_trade_id_per_symbol_.find(symbol);
     return it == impl_->last_trade_id_per_symbol_.end()
         ? 0
@@ -542,7 +548,7 @@ int64_t BinanceUserDataStream::last_seen_trade_id(const std::string& symbol) con
 }
 
 std::vector<std::string> BinanceUserDataStream::tracked_trade_symbols() const {
-    std::lock_guard<std::mutex> lk(impl_->trade_dedup_mu_);
+    std::lock_guard<std::mutex> lk(impl_->trade_highwater_mu_);
     std::vector<std::string> out;
     out.reserve(impl_->last_trade_id_per_symbol_.size());
     for (const auto& kv : impl_->last_trade_id_per_symbol_) out.push_back(kv.first);
@@ -553,11 +559,12 @@ bool BinanceUserDataStream::inject_gap_fill_trade(const XtTradeRecord& tr) {
     int64_t tid = 0;
     try { tid = std::stoll(tr.trade_id); } catch (...) { tid = 0; }
 
-    if (tid > 0 && !impl_->note_trade_id_seen(tid)) {
+    if (!impl_->fill_first_seen(tr.order_id, tr.code, tid)) {
         return false;
     }
     impl_->update_last_seen_trade_id(tr.code, tid);
-    if (impl_->on_trade_) impl_->on_trade_(tr);
+
+    if (impl_->on_trade_) impl_->on_trade_(tr, XtLatencyEligibility::kIneligible);
     return true;
 }
 

@@ -34,6 +34,11 @@ public:
                          std::forward_as_tuple());
     }
 
+    bool is_registered(std::string_view code) const {
+        std::shared_lock lock(map_mu_);
+        return windows_.find(std::string(code)) != windows_.end();
+    }
+
     bool check_and_record(std::string_view code, int64_t qty_fp, int64_t now_ms) {
         if (cfg_.max_qty_per_window_fp <= 0) return true;
 

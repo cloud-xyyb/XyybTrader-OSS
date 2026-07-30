@@ -42,6 +42,21 @@ struct LiveStrategyEntry {
     XtStrategyInitConfig init_cfg;
 };
 
+/// @brief 单个 SEL live 调度任务（顶层 `selector.tasks[]` 解析结果）。
+///
+/// 字段与 BT `xt_bt_sel::SelTaskCfg` 对齐；`XtSelRunner` 启动期逐条转
+/// `SelTaskInfo` 注册进 engine，task↔strategy 不匹配 fail-fast。
+struct XtSelLiveTaskCfg {
+    std::string strategy_id;
+    TaskPeriod  period = TaskPeriod::None;
+    uint32_t    day    = 1;
+    uint32_t    time   = 1500;
+    bool        strict_time = true;
+    std::string trdtpl  = "CHINA";
+    std::string session = "default";
+    std::string name;
+};
+
 /// @brief 保存 live yaml 的直接解析结果。
 ///
 /// 字段尽量贴近 YAML 结构和 provider-specific variant；下游 runner 不应在此层
@@ -62,6 +77,8 @@ struct XtLiveParsedConfig {
     XtStrategyInitConfig strategy_init_cfg;
 
     std::vector<LiveStrategyEntry> strategies;
+
+    std::vector<XtSelLiveTaskCfg> sel_tasks;
 
     bool portfolio_router = true;
 };
@@ -96,6 +113,8 @@ struct XtLiveBootstrapPlan {
 /// `XtControlService` gRPC server。
 struct XtLiveControlGrpcConfig {
     bool        enabled        = false;
+
+    bool        enabled_explicit = false;
     std::string listen_addr    = "0.0.0.0:9095";
     std::string tls_mode       = "mtls";
     std::string tls_ca_path    = "/etc/xtrunner-control-tls/ca.crt";
@@ -103,6 +122,8 @@ struct XtLiveControlGrpcConfig {
     std::string tls_key_path   = "/etc/xtrunner-control-tls/server.key";
     std::string audit_log_path = "/opt/xyybtrader/var/log/control_audit.jsonl";
 };
+
+void fill_control_grpc_cfg(const YAML::Node& runtime_node, XtLiveControlGrpcConfig& cfg);
 
 /// @brief Runner 主循环运行期配置。
 struct XtLiveRuntimePlan {

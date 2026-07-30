@@ -11,7 +11,7 @@
  * 进入策略/撮合热路径前统一转换为 fixed-point `XtTick`。
  */
 struct XtRawTick {
-    static constexpr int DEPTH = 10;
+    static constexpr int DEPTH = 20;
     char exchg[10] = {};
     char code[32] = {};
 

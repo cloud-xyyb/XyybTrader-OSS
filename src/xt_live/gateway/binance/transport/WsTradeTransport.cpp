@@ -37,6 +37,8 @@ uint64_t steady_now_us() noexcept {
     return XtSteadyClock::steady_now_us();
 }
 
+constexpr uint64_t kExecUnknownLogIntervalUs = 5'000'000ULL;
+
 TransportAck make_transport_ack(uint64_t local_id,
                                 TransportAck::Kind kind,
                                 TransportAck::ReqKind req_kind,
@@ -469,7 +471,30 @@ private:
         ack.local_id = entry.local_id;
 
         stamp_ack_req_kind(ack, entry);
+
+        if (ack.req_kind == TransportAck::ReqKind::kSubmit &&
+            ack.kind == TransportAck::Kind::kTransportError_TimeoutAfterSend) {
+            note_submit_exec_unknown(ack);
+        }
         dispatch(ack, entry.trace);
+    }
+
+    void note_submit_exec_unknown(const TransportAck& ack) {
+        const uint64_t total =
+            submit_exec_unknown_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t now = now_us();
+        if (last_exec_unknown_log_us_ == 0 ||
+            now - last_exec_unknown_log_us_ >= kExecUnknownLogIntervalUs) {
+            last_exec_unknown_log_us_ = now;
+            XtLogger::warn_m("BinanceWSTrade",
+                "submit execution-unknown (kept inflight for reconcile): local_id={} "
+                "err_code={} err='{}' total={} suppressed_since_last={}",
+                ack.local_id, ack.err_code, ack.err_msg, total,
+                exec_unknown_suppressed_count_);
+            exec_unknown_suppressed_count_ = 0;
+        } else {
+            ++exec_unknown_suppressed_count_;
+        }
     }
 
     void handle_timeout_tick() {
@@ -594,6 +619,17 @@ private:
 
     uint64_t next_req_id = 1;
     uint64_t test_clock_offset_us = 0;
+
+public:
+    uint64_t submit_exec_unknown_count() const {
+        return submit_exec_unknown_count_.load(std::memory_order_relaxed);
+    }
+
+private:
+
+    std::atomic<uint64_t> submit_exec_unknown_count_{0};
+    uint64_t last_exec_unknown_log_us_ = 0;
+    uint64_t exec_unknown_suppressed_count_ = 0;
 };
 
 WsTradeTransport::WsTradeTransport(Config cfg,
@@ -611,6 +647,9 @@ void WsTradeTransport::bind_ack_handler(AckHandler handler) {
     impl_->bind_ack_handler(std::move(handler));
 }
 ITradeTransport::Health WsTradeTransport::health() const { return impl_->health(); }
+uint64_t WsTradeTransport::submit_exec_unknown_count() const {
+    return impl_->submit_exec_unknown_count();
+}
 void WsTradeTransport::inject_test_message(std::string_view payload) {
     impl_->inject_test_message(payload);
 }

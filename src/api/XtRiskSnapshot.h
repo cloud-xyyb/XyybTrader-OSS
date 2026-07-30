@@ -30,6 +30,6 @@ struct XtRiskSnapshot {
 };
 
 static_assert(sizeof(XtRiskSnapshot) == 96,
-              "XtRiskSnapshot ABI size changed (sync AccountSnapshot.h guard + AccountSnapshotTypesTest)");
+              "XtRiskSnapshot ABI size changed (sync AccountSnapshotTypesTest)");
 static_assert(std::is_trivially_copyable<XtRiskSnapshot>::value,
               "XtRiskSnapshot must stay trivially_copyable (cross-module POD)");

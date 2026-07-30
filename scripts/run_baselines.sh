@@ -1,8 +1,8 @@
 #!/bin/bash
-# HFT 回归基线 runner —— 4 个场景与仓内 golden 做 byte-identical 比对。
+# HFT 回归基线 runner —— 6 个场景与仓内 golden 做 byte-identical 比对。
 #
 # 用法：
-#   bash scripts/run_baselines.sh                # 跑全部 4 个场景
+#   bash scripts/run_baselines.sh                # 跑全部 6 个场景
 #   bash scripts/run_baselines.sh ag2206_only    # 只跑一个
 #
 # 回测器查找顺序：环境变量 XT_RUNNER_BIN > build/XtBackTestRunner > build*/XtBackTestRunner。
@@ -20,15 +20,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+ALL_SCENARIOS=(ag2206_only ag2212_only roll_29col holiday ag2206_vollimit ag2206_vollimit_split)
+
 SCENARIOS=()
 for arg in "$@"; do
     case "$arg" in
-        ag2206_only|ag2212_only|roll_29col|holiday) SCENARIOS+=("$arg") ;;
-        *) echo "unknown scenario: $arg (可选: ag2206_only ag2212_only roll_29col holiday)"; exit 2 ;;
+        ag2206_only|ag2212_only|roll_29col|holiday|ag2206_vollimit|ag2206_vollimit_split)
+            SCENARIOS+=("$arg") ;;
+        *) echo "unknown scenario: $arg (可选: ${ALL_SCENARIOS[*]})"; exit 2 ;;
     esac
 done
 if [ ${#SCENARIOS[@]} -eq 0 ]; then
-    SCENARIOS=(ag2206_only ag2212_only roll_29col holiday)
+    SCENARIOS=("${ALL_SCENARIOS[@]}")
 fi
 
 stamp_ns() { date +%s%N 2>/dev/null || printf '%s000000000' "$(date +%s)"; }
@@ -137,7 +140,9 @@ for scn in "${SCENARIOS[@]}"; do
 done
 
 echo ""
-printf "Results: %sPASS=%d%s  %sDRIFT=%d%s  %sFAIL=%d%s\n" \
+# %b 而非 %s：颜色常量是 '\033[...]' 字面量，%s 会把转义序列原样打出来
+# （2026-07-29 发布预演实测：终判行显示成 "\033[0;32mPASS=6\033[0m"）。
+printf "Results: %bPASS=%d%b  %bDRIFT=%d%b  %bFAIL=%d%b\n" \
     "$GREEN" "$PASS" "$NC" "$YELLOW" "$DRIFT" "$NC" "$RED" "$FAIL" "$NC"
 if [ $FAIL -gt 0 ] || [ $DRIFT -gt 0 ]; then exit 1; fi
 exit 0

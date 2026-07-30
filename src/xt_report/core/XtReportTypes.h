@@ -96,6 +96,21 @@ struct LatencyStats {
     double queue_depth_p99       = 0.0;
 
     uint64_t risk_block_count    = 0;
+
+    double md_gap_ms_peak        = 0.0;
+
+    uint64_t submit_to_ack_us_samples  = 0;
+    uint64_t fill_after_ack_us_samples = 0;
+    uint64_t local_submit_us_samples   = 0;
+
+    uint64_t submit_to_ack_paired_us_samples = 0;
+    uint64_t submit_to_trade_ack_us_samples  = 0;
+    uint64_t uds_first_savings_us_samples    = 0;
+    uint64_t submit_to_fill_us_samples       = 0;
+    uint64_t strategy_us_samples             = 0;
+    uint64_t ack_path_us_samples             = 0;
+    uint64_t event_to_ack_us_samples         = 0;
+    uint64_t event_to_fill_us_samples        = 0;
 };
 
 /// @brief `kpi_1s.csv` 行。

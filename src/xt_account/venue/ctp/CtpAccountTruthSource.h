@@ -4,15 +4,16 @@
 #include <functional>
 #include <mutex>
 
+#include "xt_account/api/IAccountTruthSink.h"
 #include "xt_account/api/IAccountTruthSource.h"
 
-/// @brief CTP account truth 的读侧 source。
+/// @brief CTP account truth 的 source（读）+ sink（写）实现。
 ///
 /// 面向 live control、report 和 metrics 输出 CTP 口径的 AccountTruth。
 /// Source 以 AccountStateStore provider 的聚合账本为主体，并维护 broker overlay
 /// 中的 available / total margin balance。fetch_snapshot() 按值返回快照，
 /// 不写本地 reducer 状态；内部 overlay 状态由 mutex 保护。
-class CtpAccountTruthSource final : public IAccountTruthSource {
+class CtpAccountTruthSource final : public IAccountTruthSource, public IAccountTruthSink {
 public:
 
     using SnapshotProvider = std::function<AccountTruth()>;
@@ -30,7 +31,6 @@ private:
 
     mutable std::mutex mu_;
     int64_t overlay_available_fp_ = 0;
-    int64_t overlay_maint_fp_ = 0;
     int64_t overlay_total_fp_ = 0;
     SnapshotProvider provider_;
 };

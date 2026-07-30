@@ -20,8 +20,9 @@ struct PerSymbolTruth {
 /// @brief gateway 向 read-side 推送的 broker venue-truth overlay（venue-neutral）。
 ///
 /// gateway 在收到 venue 账户/持仓查询回报后构造并经 `ITradeGateway::Callbacks::
-/// on_broker_account_truth` emit；runner 层 bridge 转发进 `IAccountTruthSource::
-/// update_broker_overlay`。**不**经 account_store reducer（与 fill-derived 状态分离，
+/// on_broker_account_truth` emit；runner 层 bridge 转发进写侧 `IAccountTruthSink::
+/// update_broker_overlay`（读侧 IAccountTruthSource 只出快照，不收灌入）。
+/// **不**经 account_store reducer（与 fill-derived 状态分离，
 /// 供 store-vs-broker divergence 交叉校验）。
 ///
 /// 金额字段 fixed-point(1e6)；venue 不提供的字段保持 0。CTP 仅填 available；

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -15,6 +14,7 @@
 #include "xt_core/order/XtOffset.h"
 #include "HFTMatchEngineCfg.h"
 #include "ILatencyModel.h"
+#include "XtLatencyArith.h"
 #include "IQueueModel.h"
 
 namespace YAML {
@@ -39,7 +39,13 @@ public:
 
     void reset_volume_cache();
 
+    void advance_clock(uint64_t tick_idx, int64_t event_now_ns,
+                       uint32_t trading_date, uint32_t action_time_ms);
+
     void advance_clock(uint64_t tick_idx, uint32_t date, uint32_t time_ms);
+
+    void advance_clock_to(int64_t event_now_ns,
+                          uint32_t trading_date, uint32_t action_time_ms);
 
     void advance_clock(uint32_t date, uint32_t time_ms);
 
@@ -54,8 +60,11 @@ public:
 
     bool has_latency_model() const noexcept { return latency_model_ != nullptr; }
 
-    int64_t sample_response_latency_ns() const noexcept {
-        return latency_model_ ? latency_model_->response_latency_ns(0) : 0;
+    int64_t sample_response_latency_ns(int64_t event_ts_ns) const {
+        return latency_model_
+            ? xt_latency::validate_latency_ns(
+                  latency_model_->response_latency_ns(event_ts_ns), "response")
+            : 0;
     }
 
     void set_queue_model(std::unique_ptr<IQueueModel> model) noexcept {
@@ -95,19 +104,19 @@ public:
 
     std::size_t delay_wheel_pending_count() const noexcept;
 
+    void collect_in_transit_order_ids(std::vector<uint64_t>& out) const;
+
     std::uint64_t lost_in_transit_count() const noexcept { return lost_in_transit_count_; }
 
     std::size_t discard_in_transit_orders() noexcept;
 
+    void discard_eof_live_orders();
+
 private:
     /// @brief volume_limit 的 per-symbol 累计成交量缓存槽。
-    ///
-    /// valid=false 表示空槽；volume 保存上一笔 tick.total_volume_fp 的 lot 数量。
-    /// 固定小表容量耗尽时复用首槽，下一笔 tick 从当前累计量重新起算。
     struct VolumeEntry {
         char   code[32] = {};
         double volume   = 0.0;
-        bool   valid    = false;
     };
 
     /// @brief order delay wheel 中等待进入 XtOrderManager 的 submit 参数快照。
@@ -126,6 +135,8 @@ private:
         char user_tag[32];
         XtOffset close_offset;
         bool is_resubmit;
+
+        int64_t lookup_event_ns;
     };
 
     double next_rand01();
@@ -134,11 +145,13 @@ private:
 
     uint32_t sample_ack_delay_ms();
 
-    uint32_t sample_fill_latency_ms();
+    uint32_t sample_fill_latency_ms(int64_t event_ts_ns);
 
-    uint32_t sample_cancel_delay_ms();
+    uint32_t sample_cancel_delay_ms(int64_t event_ts_ns);
 
-    double& find_or_insert_volume(const char* code) noexcept;
+    int64_t query_event_ts_() const;
+
+    double& find_or_insert_volume(const char* code);
 
     void advance_wheel_and_flush_();
 
@@ -156,15 +169,17 @@ private:
     double error_rate_ = 0.0;
     double reject_rate_ = 0.0;
     bool split_fills_ = false;
-    double split_min_qty_ = 1.0;
-    double split_max_qty_ = 100.0;
-    double split_qty_tick_ = 1.0;
+
+    int64_t split_min_fp_  = 1'000'000;
+    int64_t split_max_fp_  = 100'000'000;
+    int64_t split_tick_fp_ = 1'000'000;
     bool volume_limit_ = true;
     bool cancel_latency_enabled_ = false;
     bool price_limit_enabled_ = false;
 
     uint32_t current_date_ = 0;
     uint32_t current_time_ms_ = 0;
+    int64_t  cur_event_ns_ = INT64_MIN;
     uint32_t prev_date_ = 0;
     uint32_t prev_time_ms_ = 0;
 
@@ -180,10 +195,9 @@ private:
     std::unique_ptr<ILatencyModel> latency_model_;
     std::unique_ptr<IQueueModel> queue_model_;
 
-    static constexpr int kMaxVolumeSymbols = 8;
-    std::array<VolumeEntry, kMaxVolumeSymbols> volume_table_{};
+    std::vector<VolumeEntry> volume_table_;
 
-    std::vector<double> parts_buf_;
+    std::vector<int64_t> parts_buf_;
     std::vector<XtTradeRecord> expanded_buf_;
 
     uint32_t order_delay_ticks_ = 0;

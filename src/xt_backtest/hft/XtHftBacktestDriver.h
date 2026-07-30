@@ -25,7 +25,7 @@ public:
     void on_order_detail(const XtOrderDetail& od) override;
     void on_transaction(const XtTransaction& tr) override;
 
-    void on_clock(uint32_t date, uint32_t time_ms) override;
+    void on_clock(uint32_t action_date, uint32_t action_time_ms, uint32_t trading_date) override;
 
     size_t active_orders() const override;
 

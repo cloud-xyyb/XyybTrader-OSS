@@ -1,9 +1,12 @@
 #include "XtOrderManager.h"
 #include <algorithm>
+#include <cstring>
 #include <climits>
+#include <cstdio>
 #include <yaml-cpp/yaml.h>
 #include "xt_util/string/XtCStringUtil.h"
 #include "xt_util/time/XtTime.h"
+#include "XtLatencyArith.h"
 #include "xt_util/time/XtTimeParse.h"
 
 namespace {
@@ -43,6 +46,12 @@ void remove_from_pending(std::vector<uint64_t>& vec, uint64_t id) {
     if (it != vec.end()) vec.erase(it);
 }
 
+inline int64_t ttl_us_to_event_ns(uint64_t ttl_us) noexcept {
+    const __int128 ms = (static_cast<__int128>(ttl_us) + 999) / 1000;
+    const __int128 ns = ms * 1'000'000;
+    return ns > static_cast<__int128>(INT64_MAX) ? INT64_MAX : static_cast<int64_t>(ns);
+}
+
 }
 
 void XtOrderManager::configure_runtime(const RuntimeConfig& cfg) {
@@ -58,14 +67,30 @@ void XtOrderManager::configure_runtime(const RuntimeConfig& cfg) {
     orders_.reserve(kMaxConcurrentOrders);
     clock_scratch_.reserve(kMaxConcurrentOrders);
     id_to_slot_.reserve(kMaxConcurrentOrders);
+    depth_table_.reserve(8);
 }
 
-void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_ms) {
-    cur_tick_ = tick;
-    cur_date_ = date;
-    cur_time_ = XtTimeParse::action_time_to_ms(time_ms);
+int64_t XtOrderManager::clamp_event_now_(int64_t event_now_ns) noexcept {
+    if (cur_event_ns_ != INT64_MIN && event_now_ns < cur_event_ns_) {
 
-    cur_clock_ns_ = xt_time::to_ns(date, time_ms);
+        if (event_clock_clamp_count_++ == 0) {
+            std::fprintf(stderr,
+                         "[XtOrderManager] WARN event clock regression clamped "
+                         "(now=%lld < cur=%lld); 后续同类回退只计数不重复告警\n",
+                         static_cast<long long>(event_now_ns),
+                         static_cast<long long>(cur_event_ns_));
+        }
+        return cur_event_ns_;
+    }
+    return event_now_ns;
+}
+
+void XtOrderManager::advance_clock(uint64_t tick, int64_t event_now_ns,
+                                   uint32_t trading_date, uint32_t action_time_ms) {
+    cur_tick_ = tick;
+    cur_date_ = trading_date;
+    cur_time_ = XtTimeParse::action_time_to_ms(action_time_ms);
+    cur_event_ns_ = clamp_event_now_(event_now_ns);
 
     if (!pending_acks_.empty()) {
         clock_scratch_.clear();
@@ -73,8 +98,8 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
             XtSimOrder* ord = find_live(pid);
             if (!ord || ord->status != XtOrderStatus::Submitted) continue;
 
-            const bool due = ord->ack_due_time_ms != 0
-                             ? cur_time_ >= ord->ack_due_time_ms
+            const bool due = ord->ack_due_event_ns != 0
+                             ? cur_event_ns_ >= ord->ack_due_event_ns
                              : cur_tick_ >= ord->ack_due_tick;
             if (!due) {
                 clock_scratch_.push_back(pid);
@@ -83,10 +108,12 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
 
             ord->status = XtOrderStatus::Accepted;
             push_update(*ord, 0);
-            if (ord->fill_eligible_time_ms != 0 && cur_time_ < ord->fill_eligible_time_ms) {
+            if (ord->fill_eligible_event_ns != 0 && cur_event_ns_ < ord->fill_eligible_event_ns) {
                 pending_fills_.push_back(pid);
-            } else {
-                order_book_.add_order(*ord);
+            } else if (!order_book_.add_order(*ord)) {
+
+                ord->status = XtOrderStatus::Canceled;
+                archive_order(pid,  false,  true, 0);
             }
         }
         pending_acks_.swap(clock_scratch_);
@@ -97,8 +124,12 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
         for (uint64_t pid : pending_fills_) {
             XtSimOrder* ord = find_live(pid);
             if (!ord) continue;
-            if (cur_time_ >= ord->fill_eligible_time_ms) {
-                order_book_.add_order(*ord);
+            if (cur_event_ns_ >= ord->fill_eligible_event_ns) {
+                if (!order_book_.add_order(*ord)) {
+
+                    ord->status = XtOrderStatus::Canceled;
+                    archive_order(pid,  false,  true, 0);
+                }
             } else {
                 clock_scratch_.push_back(pid);
             }
@@ -111,7 +142,7 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
         for (uint64_t pid : pending_cancels_) {
             XtSimOrder* ord = find_live(pid);
             if (!ord || order_status_is_final(ord->status)) continue;
-            if (cur_time_ >= ord->cancel_due_time_ms) {
+            if (cur_event_ns_ >= ord->cancel_due_event_ns) {
                 cancel_now_(pid);
             } else {
                 clock_scratch_.push_back(pid);
@@ -126,15 +157,12 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
         return;
     }
 
-    const uint32_t ttl_ms = use_time_ttl
-                            ? static_cast<uint32_t>((ttl_us_ + 999) / 1000)
-                            : 0;
+    const int64_t ttl_ns = use_time_ttl ? ttl_us_to_event_ns(ttl_us_) : 0;
 
     clock_scratch_.clear();
     for (const auto& ord : orders_) {
         const bool expired = use_time_ttl
-            ? (cur_time_ >= ord.create_time_ms
-               && (cur_time_ - ord.create_time_ms) >= ttl_ms)
+            ? (cur_event_ns_ - ord.create_event_ns) >= ttl_ns
             : (cur_tick_ >= ord.create_tick
                && (cur_tick_ - ord.create_tick) >= ttl_ticks_);
         if (expired) clock_scratch_.push_back(ord.id);
@@ -149,28 +177,62 @@ void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_m
     recompute_earliest_due_();
 }
 
-void XtOrderManager::advance_clock_to(int64_t now_ns) noexcept {
+void XtOrderManager::advance_clock(uint64_t tick, uint32_t date, uint32_t time_ms) {
+    advance_clock(tick, xt_time::to_ns(date, time_ms), date, time_ms);
+}
 
-    if (now_ns < earliest_due_ns_) {
-        cur_clock_ns_ = now_ns;
+void XtOrderManager::advance_clock_to(int64_t event_now_ns,
+                                      uint32_t trading_date, uint32_t action_time_ms) {
+    const int64_t now = clamp_event_now_(event_now_ns);
+    if (now < earliest_due_event_ns_) {
+        cur_event_ns_ = now;
         return;
     }
-    cur_clock_ns_ = now_ns;
+    advance_clock(cur_tick_, now, trading_date, action_time_ms);
+}
+
+void XtOrderManager::advance_clock_to(int64_t event_now_ns) {
+    const int64_t now = clamp_event_now_(event_now_ns);
+    if (now < earliest_due_event_ns_) {
+        cur_event_ns_ = now;
+        return;
+    }
+
     uint32_t d = 0, t = 0;
-    xt_time::from_ns(now_ns, d, t);
-    advance_clock( cur_tick_, d, t);
+    xt_time::from_ns(now, d, t);
+    advance_clock(cur_tick_, now, d, t);
 }
 
 void XtOrderManager::recompute_earliest_due_() noexcept {
-
-    const bool has_pending =
-        !pending_acks_.empty() || !pending_fills_.empty() || !pending_cancels_.empty()
-        || ((ttl_us_ > 0 || ttl_ticks_ > 0) && !orders_.empty());
-    if (has_pending) {
-        earliest_due_ns_ = (cur_clock_ns_ != INT64_MIN) ? cur_clock_ns_ : 0;
-    } else {
-        earliest_due_ns_ = INT64_MAX;
+    int64_t min_ns = INT64_MAX;
+    for (uint64_t pid : pending_acks_) {
+        const XtSimOrder* o = find_live(pid);
+        if (o && o->status == XtOrderStatus::Submitted && o->ack_due_event_ns != 0
+            && o->ack_due_event_ns < min_ns) {
+            min_ns = o->ack_due_event_ns;
+        }
     }
+    for (uint64_t pid : pending_fills_) {
+        const XtSimOrder* o = find_live(pid);
+        if (o && o->fill_eligible_event_ns != 0 && o->fill_eligible_event_ns < min_ns) {
+            min_ns = o->fill_eligible_event_ns;
+        }
+    }
+    for (uint64_t pid : pending_cancels_) {
+        const XtSimOrder* o = find_live(pid);
+        if (o && !order_status_is_final(o->status) && o->cancel_due_event_ns != 0
+            && o->cancel_due_event_ns < min_ns) {
+            min_ns = o->cancel_due_event_ns;
+        }
+    }
+    if (ttl_us_ > 0 && !orders_.empty()) {
+        const int64_t ttl_ns = ttl_us_to_event_ns(ttl_us_);
+        for (const auto& o : orders_) {
+            const int64_t due = o.create_event_ns + ttl_ns;
+            if (due < min_ns) min_ns = due;
+        }
+    }
+    earliest_due_event_ns_ = min_ns;
 }
 
 uint64_t XtOrderManager::submit(uint64_t order_id,
@@ -216,30 +278,33 @@ uint64_t XtOrderManager::submit(uint64_t order_id,
     ord.status                = XtOrderStatus::Submitted;
     ord.tif                   = tif;
     ord.create_tick           = cur_tick_;
-    ord.create_time_ms        = cur_time_;
+    ord.create_event_ns       = event_base_();
     ord.queue_ahead           = 0.0;
     ord.order_date            = order_date;
     ord.order_time            = order_time_ms;
     ord.user_tag              = user_tag;
     ord.close_offset          = close_offset;
     ord.is_resubmit           = is_resubmit;
-    ord.fill_eligible_time_ms = fill_latency_ms_sampled > 0
-                                    ? cur_time_ + fill_latency_ms_sampled
+    ord.fill_eligible_event_ns = fill_latency_ms_sampled > 0
+                                    ? xt_latency::checked_add_event_ns(
+                                          event_base_(),
+                                          static_cast<int64_t>(fill_latency_ms_sampled) * 1'000'000LL)
                                     : 0;
     ord.response_latency_ns   = response_latency_ns_sampled;
 
-    if (last_depth_ > 0) {
+    const DepthSnapshot* snap = find_depth_(code);
+    if (snap && snap->last_depth > 0) {
         const bool aggressive = is_aggressive(
-            is_buy, price_fp, last_bid_px_fp_[0], last_ask_px_fp_[0]);
+            is_buy, price_fp, snap->last_bid_px_fp[0], snap->last_ask_px_fp[0]);
 
         ord.is_passive = !aggressive;
 
         if (!aggressive) {
             if (queue_model_) {
-                const int64_t* px_arr_fp = is_buy ? last_bid_px_fp_ : last_ask_px_fp_;
-                const double*  qty_arr   = is_buy ? last_bid_qty_   : last_ask_qty_;
+                const int64_t* px_arr_fp = is_buy ? snap->last_bid_px_fp : snap->last_ask_px_fp;
+                const double*  qty_arr   = is_buy ? snap->last_bid_qty   : snap->last_ask_qty;
                 const double level_qty = level_qty_at_price(
-                    price_fp, px_arr_fp, qty_arr, last_depth_);
+                    price_fp, px_arr_fp, qty_arr, snap->last_depth);
                 ord.queue_ahead = queue_model_->estimate_queue_ahead(level_qty, is_resubmit);
             }
         }
@@ -249,22 +314,26 @@ uint64_t XtOrderManager::submit(uint64_t order_id,
     id_to_slot_[ord.id] = orders_.size() - 1;
     push_update(orders_.back(), 0);
 
-    if (ttl_us_ > 0 || ttl_ticks_ > 0) {
-        if (cur_clock_ns_ != INT64_MIN && cur_clock_ns_ < earliest_due_ns_) {
-            earliest_due_ns_ = cur_clock_ns_;
-        }
+    if (ttl_us_ > 0) {
+        const int64_t ttl_ns = ttl_us_to_event_ns(ttl_us_);
+        note_event_deadline_(
+            xt_latency::checked_add_event_ns(orders_.back().create_event_ns, ttl_ns));
     }
 
     XtSimOrder* ref = find_live(ord.id);
 
     if (ack_delay_ms_sampled > 0) {
-        ref->ack_due_time_ms = cur_time_ + ack_delay_ms_sampled;
+        ref->ack_due_event_ns = xt_latency::checked_add_event_ns(
+            event_base_(), static_cast<int64_t>(ack_delay_ms_sampled) * 1'000'000LL);
         pending_acks_.push_back(ord.id);
+        note_event_deadline_(ref->ack_due_event_ns);
 
     } else if (ack_delay_us_ > 0) {
-        const uint32_t delay_ms = static_cast<uint32_t>((ack_delay_us_ + 999) / 1000);
-        ref->ack_due_time_ms = cur_time_ + delay_ms;
+        const int64_t delay_ms = static_cast<int64_t>((ack_delay_us_ + 999) / 1000);
+        ref->ack_due_event_ns = xt_latency::checked_add_event_ns(
+            event_base_(), delay_ms * 1'000'000LL);
         pending_acks_.push_back(ord.id);
+        note_event_deadline_(ref->ack_due_event_ns);
 
     } else if (ack_delay_ticks_ > 0) {
         ref->ack_due_tick = cur_tick_ + ack_delay_ticks_;
@@ -274,16 +343,14 @@ uint64_t XtOrderManager::submit(uint64_t order_id,
 
         ref->status = XtOrderStatus::Accepted;
         push_update(*ref, 0);
-        if (ref->fill_eligible_time_ms != 0 && cur_time_ < ref->fill_eligible_time_ms) {
+        if (ref->fill_eligible_event_ns != 0 && event_base_() < ref->fill_eligible_event_ns) {
             pending_fills_.push_back(ref->id);
-        } else {
-            order_book_.add_order(*ref);
-        }
-    }
+            note_event_deadline_(ref->fill_eligible_event_ns);
+        } else if (!order_book_.add_order(*ref)) {
 
-    if ((!pending_acks_.empty() || !pending_fills_.empty() || !pending_cancels_.empty())
-        && cur_clock_ns_ != INT64_MIN && cur_clock_ns_ < earliest_due_ns_) {
-        earliest_due_ns_ = cur_clock_ns_;
+            ref->status = XtOrderStatus::Canceled;
+            archive_order(ref->id,  false,  true, 0);
+        }
     }
 
     return ord.id;
@@ -295,14 +362,11 @@ bool XtOrderManager::cancel(uint64_t id, uint32_t cancel_delay_ms_sampled) {
     XtSimOrder* ord = find_live(id);
     if (!ord || order_status_is_final(ord->status)) return false;
 
-    if (ord->cancel_due_time_ms != 0) return true;
-
-    ord->cancel_due_time_ms = cur_time_ + cancel_delay_ms_sampled;
+    if (ord->cancel_due_event_ns != 0) return true;
+    ord->cancel_due_event_ns = xt_latency::checked_add_event_ns(
+        event_base_(), static_cast<int64_t>(cancel_delay_ms_sampled) * 1'000'000LL);
     pending_cancels_.push_back(id);
-
-    if (cur_clock_ns_ != INT64_MIN && cur_clock_ns_ < earliest_due_ns_) {
-        earliest_due_ns_ = cur_clock_ns_;
-    }
+    note_event_deadline_(ord->cancel_due_event_ns);
     return true;
 }
 
@@ -354,36 +418,58 @@ bool XtOrderManager::reject(uint64_t id, const char* reason_code) {
     return true;
 }
 
-void XtOrderManager::set_depth_snapshot_fp(const int64_t* bid_px_fp,
+const XtOrderManager::DepthSnapshot* XtOrderManager::find_depth_(
+        const char* code) const noexcept {
+
+    for (const auto& s : depth_table_) {
+        if (std::strncmp(s.code, code, sizeof(s.code)) == 0) return &s.snap;
+    }
+    return nullptr;
+}
+
+XtOrderManager::DepthSnapshot& XtOrderManager::find_or_insert_depth_(const char* code) {
+    for (auto& s : depth_table_) {
+        if (std::strncmp(s.code, code, sizeof(s.code)) == 0) return s.snap;
+    }
+
+    depth_table_.emplace_back();
+    std::strncpy(depth_table_.back().code, code, sizeof(depth_table_.back().code) - 1);
+    return depth_table_.back().snap;
+}
+
+void XtOrderManager::set_depth_snapshot_fp(const char* code,
+                                           const int64_t* bid_px_fp,
                                            const int64_t* ask_px_fp,
                                            const int64_t* bid_qty_fp,
                                            const int64_t* ask_qty_fp,
                                            int depth) {
+    if (XtCStringUtil::is_empty(code)) return;
+    DepthSnapshot& s = find_or_insert_depth_(code);
 
     for (int i = 0; i < XtRawTick::DEPTH; ++i) {
-        prev_bid_px_fp_[i] = last_bid_px_fp_[i];
-        prev_ask_px_fp_[i] = last_ask_px_fp_[i];
-        prev_bid_qty_[i]   = last_bid_qty_[i];
-        prev_ask_qty_[i]   = last_ask_qty_[i];
+        s.prev_bid_px_fp[i] = s.last_bid_px_fp[i];
+        s.prev_ask_px_fp[i] = s.last_ask_px_fp[i];
+        s.prev_bid_qty[i]   = s.last_bid_qty[i];
+        s.prev_ask_qty[i]   = s.last_ask_qty[i];
     }
 
-    last_depth_ = std::clamp(depth, 0, XtRawTick::DEPTH);
+    s.last_depth = std::clamp(depth, 0, XtRawTick::DEPTH);
 
     for (int i = 0; i < XtRawTick::DEPTH; ++i) {
-        if (i >= last_depth_) {
-            last_bid_px_fp_[i] = 0;
-            last_ask_px_fp_[i] = 0;
-            last_bid_qty_[i]   = 0.0;
-            last_ask_qty_[i]   = 0.0;
+        if (i >= s.last_depth) {
+            s.last_bid_px_fp[i] = 0;
+            s.last_ask_px_fp[i] = 0;
+            s.last_bid_qty[i]   = 0.0;
+            s.last_ask_qty[i]   = 0.0;
             if (market_impact_enabled_) {
-                consumed_bid_carry_[i] = 0.0;
-                consumed_ask_carry_[i] = 0.0;
+                s.consumed_bid_carry[i] = 0.0;
+                s.consumed_ask_carry[i] = 0.0;
             }
             continue;
         }
 
-        last_bid_px_fp_[i] = bid_px_fp ? bid_px_fp[i] : 0;
-        last_ask_px_fp_[i] = ask_px_fp ? ask_px_fp[i] : 0;
+        s.last_bid_px_fp[i] = bid_px_fp ? bid_px_fp[i] : 0;
+        s.last_ask_px_fp[i] = ask_px_fp ? ask_px_fp[i] : 0;
 
         double adj_bid = bid_qty_fp ? order_exec_from_fp(bid_qty_fp[i]) : 0.0;
         double adj_ask = ask_qty_fp ? order_exec_from_fp(ask_qty_fp[i]) : 0.0;
@@ -391,24 +477,24 @@ void XtOrderManager::set_depth_snapshot_fp(const int64_t* bid_px_fp,
         if (market_impact_enabled_) {
 
             const bool bid_px_unchanged = bid_px_fp
-                && prev_bid_px_fp_[i] > 0
-                && last_bid_px_fp_[i] == prev_bid_px_fp_[i];
+                && s.prev_bid_px_fp[i] > 0
+                && s.last_bid_px_fp[i] == s.prev_bid_px_fp[i];
             const bool ask_px_unchanged = ask_px_fp
-                && prev_ask_px_fp_[i] > 0
-                && last_ask_px_fp_[i] == prev_ask_px_fp_[i];
+                && s.prev_ask_px_fp[i] > 0
+                && s.last_ask_px_fp[i] == s.prev_ask_px_fp[i];
 
-            if (consumed_bid_carry_[i] > 0.0 && bid_px_unchanged)
-                adj_bid = std::max(0.0, adj_bid - consumed_bid_carry_[i]);
+            if (s.consumed_bid_carry[i] > 0.0 && bid_px_unchanged)
+                adj_bid = std::max(0.0, adj_bid - s.consumed_bid_carry[i]);
 
-            if (consumed_ask_carry_[i] > 0.0 && ask_px_unchanged)
-                adj_ask = std::max(0.0, adj_ask - consumed_ask_carry_[i]);
+            if (s.consumed_ask_carry[i] > 0.0 && ask_px_unchanged)
+                adj_ask = std::max(0.0, adj_ask - s.consumed_ask_carry[i]);
 
-            consumed_bid_carry_[i] *= market_impact_decay_;
-            consumed_ask_carry_[i] *= market_impact_decay_;
+            s.consumed_bid_carry[i] *= market_impact_decay_;
+            s.consumed_ask_carry[i] *= market_impact_decay_;
         }
 
-        last_bid_qty_[i] = adj_bid;
-        last_ask_qty_[i] = adj_ask;
+        s.last_bid_qty[i] = adj_bid;
+        s.last_ask_qty[i] = adj_ask;
     }
 }
 
@@ -424,8 +510,9 @@ void XtOrderManager::match_tick(const char* code,
 
     if (orders_.empty()) return;
 
-    refresh_queue_ahead(depth);
-    apply_queue_cancel_erosion(depth);
+    DepthSnapshot& snap = find_or_insert_depth_(code);
+    refresh_queue_ahead(code, snap, depth);
+    apply_queue_cancel_erosion(code, snap, depth);
 
     const auto& res = order_book_.match_tick(
         code, bid_px_fp, ask_px_fp, bid_qty_fp, ask_qty_fp, depth,
@@ -440,16 +527,16 @@ void XtOrderManager::match_tick(const char* code,
 
     apply_fill_updates(res.fills, trades, filled_buf, filled_count);
 
-    accumulate_market_impact(res.fills);
+    accumulate_market_impact(res.fills, snap);
 
     apply_canceled_ids(res.canceled);
     apply_done_ids(res.done);
 
     cancel_ioc_remainders(filled_buf, filled_count);
 
-    const bool buy_frozen = upper_limit_fp_ > 0 && last_bid_px_fp_[0] >= upper_limit_fp_;
-    const bool sell_frozen = lower_limit_fp_ > 0 && last_ask_px_fp_[0] > 0
-                             && last_ask_px_fp_[0] <= lower_limit_fp_;
+    const bool buy_frozen = upper_limit_fp_ > 0 && snap.last_bid_px_fp[0] >= upper_limit_fp_;
+    const bool sell_frozen = lower_limit_fp_ > 0 && snap.last_ask_px_fp[0] > 0
+                             && snap.last_ask_px_fp[0] <= lower_limit_fp_;
     if (buy_frozen || sell_frozen) {
         clock_scratch_.clear();
         for (const auto& ord : orders_) {
@@ -471,9 +558,10 @@ void XtOrderManager::match_tick(const char* code,
     }
 }
 
-void XtOrderManager::refresh_queue_ahead(int depth) {
-    if (last_depth_ <= 0) return;
-    const int d = std::min(depth, last_depth_);
+void XtOrderManager::refresh_queue_ahead(const char* code,
+                                         const DepthSnapshot& snap, int depth) {
+    if (snap.last_depth <= 0) return;
+    const int d = std::min(depth, snap.last_depth);
 
     for (auto& ord : orders_) {
         if (ord.status != XtOrderStatus::Accepted &&
@@ -481,11 +569,13 @@ void XtOrderManager::refresh_queue_ahead(int depth) {
             continue;
         if (ord.queue_ahead <= 0.0) continue;
 
+        if (ord.code != code) continue;
+
         if (is_board_price_(ord.price_fp)) continue;
 
-        const double*  cur_qty    = ord.is_buy ? last_bid_qty_    : last_ask_qty_;
-        const int64_t* cur_px_fp  = ord.is_buy ? last_bid_px_fp_  : last_ask_px_fp_;
-        const int64_t* prev_px_fp = ord.is_buy ? prev_bid_px_fp_  : prev_ask_px_fp_;
+        const double*  cur_qty    = ord.is_buy ? snap.last_bid_qty    : snap.last_ask_qty;
+        const int64_t* cur_px_fp  = ord.is_buy ? snap.last_bid_px_fp  : snap.last_ask_px_fp;
+        const int64_t* prev_px_fp = ord.is_buy ? snap.prev_bid_px_fp  : snap.prev_ask_px_fp;
 
         for (int i = 0; i < d; ++i) {
             if (cur_px_fp[i] <= 0) break;
@@ -504,43 +594,48 @@ void XtOrderManager::refresh_queue_ahead(int depth) {
     if (ofi_queue_scale_ <= 0.0) return;
 
     const double ask0_drain = stable_level_drain(
-        prev_ask_qty_[0], last_ask_qty_[0], prev_ask_px_fp_[0], last_ask_px_fp_[0]);
+        snap.prev_ask_qty[0], snap.last_ask_qty[0],
+        snap.prev_ask_px_fp[0], snap.last_ask_px_fp[0]);
     const double bid0_drain = stable_level_drain(
-        prev_bid_qty_[0], last_bid_qty_[0], prev_bid_px_fp_[0], last_bid_px_fp_[0]);
+        snap.prev_bid_qty[0], snap.last_bid_qty[0],
+        snap.prev_bid_px_fp[0], snap.last_bid_px_fp[0]);
 
     for (auto& ord : orders_) {
         if (ord.status != XtOrderStatus::Accepted &&
             ord.status != XtOrderStatus::PartiallyFilled)
             continue;
         if (ord.queue_ahead <= 0.0) continue;
+        if (ord.code != code) continue;
         if (is_board_price_(ord.price_fp)) continue;
 
         if (!ord.is_buy && ask0_drain > 0.0
-            && last_ask_px_fp_[0] == ord.price_fp) {
+            && snap.last_ask_px_fp[0] == ord.price_fp) {
             ord.queue_ahead = std::max(0.0, ord.queue_ahead - ask0_drain * ofi_queue_scale_);
         }
         if (ord.is_buy && bid0_drain > 0.0
-            && last_bid_px_fp_[0] == ord.price_fp) {
+            && snap.last_bid_px_fp[0] == ord.price_fp) {
             ord.queue_ahead = std::max(0.0, ord.queue_ahead - bid0_drain * ofi_queue_scale_);
         }
     }
 }
 
-void XtOrderManager::apply_queue_cancel_erosion(int depth) {
-    if (queue_cancel_ratio_ <= 0.0 || last_depth_ <= 0) return;
-    const int d = std::min(depth, last_depth_);
+void XtOrderManager::apply_queue_cancel_erosion(const char* code,
+                                                const DepthSnapshot& snap, int depth) {
+    if (queue_cancel_ratio_ <= 0.0 || snap.last_depth <= 0) return;
+    const int d = std::min(depth, snap.last_depth);
 
     for (auto& ord : orders_) {
         if (ord.status != XtOrderStatus::Accepted &&
             ord.status != XtOrderStatus::PartiallyFilled)
             continue;
         if (ord.queue_ahead <= 0.0) continue;
+        if (ord.code != code) continue;
         if (is_board_price_(ord.price_fp)) continue;
 
-        const double*  cur_qty    = ord.is_buy ? last_bid_qty_   : last_ask_qty_;
-        const double*  prev_qty   = ord.is_buy ? prev_bid_qty_   : prev_ask_qty_;
-        const int64_t* cur_px_fp  = ord.is_buy ? last_bid_px_fp_ : last_ask_px_fp_;
-        const int64_t* prev_px_fp = ord.is_buy ? prev_bid_px_fp_ : prev_ask_px_fp_;
+        const double*  cur_qty    = ord.is_buy ? snap.last_bid_qty   : snap.last_ask_qty;
+        const double*  prev_qty   = ord.is_buy ? snap.prev_bid_qty   : snap.prev_ask_qty;
+        const int64_t* cur_px_fp  = ord.is_buy ? snap.last_bid_px_fp : snap.last_ask_px_fp;
+        const int64_t* prev_px_fp = ord.is_buy ? snap.prev_bid_px_fp : snap.prev_ask_px_fp;
 
         for (int i = 0; i < d; ++i) {
             if (cur_px_fp[i] <= 0) break;
@@ -633,7 +728,8 @@ void XtOrderManager::cancel_ioc_remainders(const FillRecord* filled_buf, int fil
     }
 }
 
-void XtOrderManager::accumulate_market_impact(const std::vector<XtOrderBook::Fill>& fills) {
+void XtOrderManager::accumulate_market_impact(const std::vector<XtOrderBook::Fill>& fills,
+                                              DepthSnapshot& snap) {
 
     if (!market_impact_enabled_ || fills.empty()) return;
 
@@ -650,18 +746,18 @@ void XtOrderManager::accumulate_market_impact(const std::vector<XtOrderBook::Fil
 
         const int64_t fill_price_fp = fill.price_fp;
         if (is_buy) {
-            for (int i = 0; i < last_depth_; ++i) {
-                if (last_ask_px_fp_[i] <= 0) break;
-                if (last_ask_px_fp_[i] == fill_price_fp) {
-                    consumed_ask_carry_[i] += order_exec_from_fp(fill.qty_fp);
+            for (int i = 0; i < snap.last_depth; ++i) {
+                if (snap.last_ask_px_fp[i] <= 0) break;
+                if (snap.last_ask_px_fp[i] == fill_price_fp) {
+                    snap.consumed_ask_carry[i] += order_exec_from_fp(fill.qty_fp);
                     break;
                 }
             }
         } else {
-            for (int i = 0; i < last_depth_; ++i) {
-                if (last_bid_px_fp_[i] <= 0) break;
-                if (last_bid_px_fp_[i] == fill_price_fp) {
-                    consumed_bid_carry_[i] += order_exec_from_fp(fill.qty_fp);
+            for (int i = 0; i < snap.last_depth; ++i) {
+                if (snap.last_bid_px_fp[i] <= 0) break;
+                if (snap.last_bid_px_fp[i] == fill_price_fp) {
+                    snap.consumed_bid_carry[i] += order_exec_from_fp(fill.qty_fp);
                     break;
                 }
             }
@@ -706,6 +802,39 @@ const XtSimOrder* XtOrderManager::find(uint64_t id) const {
 
 const std::vector<XtSimOrder>& XtOrderManager::live_orders() const {
     return orders_;
+}
+
+void XtOrderManager::emit_in_transit_canceled(uint64_t order_id, const char* code,
+                                              bool is_buy, int64_t price_fp,
+                                              int64_t qty_fp, XtTimeInForce tif,
+                                              std::string_view user_tag,
+                                              XtOffset close_offset) {
+
+    XtSimOrder ord;
+    ord.id           = order_id;
+    ord.code         = code ? code : "";
+    ord.is_buy       = is_buy;
+    ord.price_fp     = price_fp;
+    ord.qty_fp       = qty_fp;
+    ord.filled_fp    = 0;
+    ord.status       = XtOrderStatus::Canceled;
+    ord.tif          = tif;
+    ord.user_tag     = user_tag;
+    ord.close_offset = close_offset;
+    push_update(ord, 0);
+}
+
+void XtOrderManager::discard_eof_live_orders() {
+
+    if (orders_.empty()) return;
+
+    std::vector<uint64_t> ids;
+    ids.reserve(orders_.size());
+    for (const auto& ord : orders_) ids.push_back(ord.id);
+    for (uint64_t id : ids) {
+        if (!find_live(id)) continue;
+        archive_order(id,  true,  false, 0);
+    }
 }
 
 void XtOrderManager::drain_updates(std::vector<XtOrderExecUpdate>& out) {

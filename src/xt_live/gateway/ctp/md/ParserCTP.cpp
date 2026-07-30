@@ -1,6 +1,7 @@
 #include "ctp/md/ParserCTP.h"
 
 #include "ctp/common/CTPUtil.h"
+#include "ctp/common/CtpExchangeInfer.h"
 #include "xt_util/path/PathUtil.h"
 #include "recording/XtLiveRecorder.h"
 #include "XtLogger.h"
@@ -15,6 +16,7 @@
 #include "xt_metrics/XtMetricRegistry.h"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -45,6 +47,8 @@ void ParserCTP::configure_ctp(const CTPMdCfg& ctp_cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     broker_ = ctp_cfg.broker;
     flow_dir_ = ctp_cfg.flow_dir;
+
+    window_gate_ = ctp_cfg.window_gate;
 }
 
 bool ParserCTP::init(const IMdGateway::Config& cfg) {
@@ -67,18 +71,55 @@ void ParserCTP::stop() {
 
 bool ParserCTP::check_health(uint32_t now_ms) {
 
+    const int64_t wall_epoch_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool in_window =
+        window_gate_.gate_enabled
+            ? ctp_md_session::in_expected_tick_window(window_gate_, wall_epoch_ms)
+            : true;
+
+    if (!prev_in_window_ && in_window) {
+        synthetic_arm_steady_ms_ = (now_ms == 0) ? 1u : now_ms;
+    }
+    prev_in_window_ = in_window;
+
     if (stale_reconnect_ms_ == 0) return true;
 
-    const uint32_t last = last_tick_steady_ms_.load(std::memory_order_relaxed);
-    if (last == 0) return true;
-    const uint32_t elapsed = now_ms - last;
-    if (elapsed < stale_reconnect_ms_) return true;
+    if (window_gate_.gate_enabled && !in_window) return true;
+
+    ctp_md_session::WatchdogInputs wi;
+    wi.gate_enabled = window_gate_.gate_enabled;
+    wi.in_window = in_window;
+    wi.stale_reconnect_ms = stale_reconnect_ms_;
+    wi.now_ms = now_ms;
+    wi.last_tick_ms = last_tick_steady_ms_.load(std::memory_order_relaxed);
+    wi.synth_arm_ms = synthetic_arm_steady_ms_;
+
+    {
+
+        ctp_md_session::WatchdogInputs probe = wi;
+        probe.connected = true;
+        probe.subscribed = true;
+        if (ctp_md_session::decide_watchdog(probe) == ctp_md_session::WatchdogAction::Healthy)
+            return true;
+    }
 
     std::lock_guard<std::mutex> guard(mu_);
-    if (!connected_ || !subscribed_) return true;
+    wi.connected = connected_;
+    wi.subscribed = subscribed_;
 
+    const uint32_t fresh_now_ms = static_cast<uint32_t>(XtSteadyClock::steady_now_ms());
+    const uint32_t fresh_tick_ms = last_tick_steady_ms_.load(std::memory_order_relaxed);
+    if (ctp_md_session::decide_watchdog_relocked(wi, fresh_now_ms, fresh_tick_ms)
+        != ctp_md_session::WatchdogAction::Rebuild)
+        return true;
+    wi.now_ms = fresh_now_ms;
+    wi.last_tick_ms = fresh_tick_ms;
+
+    const auto age = ctp_md_session::min_valid_age(fresh_now_ms, wi.last_tick_ms, wi.synth_arm_ms);
     XtLogger::warn_m("MD", "stale tick detected ({}ms > {}ms), forcing self-reconnect",
-                     elapsed, stale_reconnect_ms_);
+                     age ? *age : 0u, stale_reconnect_ms_);
 
     if (auto* rec = XtLiveRecorder::global()) {
         rec->emit_conn_state(XtSteadyClock::steady_now_ns(), "md", "stale_reconnect", "");
@@ -93,7 +134,7 @@ bool ParserCTP::check_health(uint32_t now_ms) {
     subscribed_ = false;
     ready_emitted_ = false;
 
-    last_tick_steady_ms_.store(now_ms, std::memory_order_relaxed);
+    synthetic_arm_steady_ms_ = (now_ms == 0) ? 1u : now_ms;
     if (!init_locked(saved_cfg_)) {
         XtLogger::error_m("MD", "stale self-reconnect: re-init failed");
         return false;
@@ -209,11 +250,29 @@ void ParserCTP::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* p) {
 
     {
         std::lock_guard<std::mutex> guard(mu_);
-        if (!connected_) return;
+        if (!ctp_md_session::should_accept_tick(connected_, subscribed_)) return;
+        last_tick_steady_ms_.store(
+            static_cast<uint32_t>(XtSteadyClock::steady_now_ms()),
+            std::memory_order_relaxed);
     }
     XtRawTick t;
     XtCStringUtil::copy(t.code, p->InstrumentID);
     XtCStringUtil::copy(t.exchg, p->ExchangeID);
+
+    if (t.exchg[0] == '\0') {
+        const char* inferred = ctp_util::infer_ctp_exchange(p->InstrumentID);
+        if (inferred[0] != '\0') {
+            XtCStringUtil::copy(t.exchg, inferred);
+        } else {
+            char prefix[16];
+            ctp_util::ctp_product_prefix(p->InstrumentID, prefix, sizeof(prefix));
+            if (exchg_enrich_warn_gate_.should_warn(prefix)) {
+                XtLogger::warn_m("MD",
+                                 "exchange_id 为空且品种前缀未收录, code={} → tick.fbs 分片跳过(fail-open)",
+                                 p->InstrumentID);
+            }
+        }
+    }
 
     const double last = ctp_util::normalize_price(p->LastPrice);
     t.price = last;
@@ -245,14 +304,11 @@ void ParserCTP::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* p) {
                           t.trading_date, t.action_date, t.action_time,
                           t.code, t.exchg,
                           last_fp, static_cast<int64_t>(t.total_volume),
-                          bid_px_fp, ask_px_fp, bid_q, ask_q);
+                          bid_px_fp, ask_px_fp, bid_q, ask_q,
+                           5);
     }
 
-    last_tick_steady_ms_.store(
-        static_cast<uint32_t>(XtSteadyClock::steady_now_ms()),
-        std::memory_order_relaxed);
-
-    if (on_tick_) on_tick_(t);
+    if (on_tick_) on_tick_(t,  0);
 }
 
 bool ParserCTP::init_locked(const IMdGateway::Config& cfg) {

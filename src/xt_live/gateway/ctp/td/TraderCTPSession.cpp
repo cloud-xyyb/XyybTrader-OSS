@@ -7,6 +7,7 @@
 
 #include "XtLogger.h"
 #include "common/XtLiveRecoveryError.h"
+#include "ctp/td/CtpLoginBackoff.h"
 #include "xt_util/string/XtCStringUtil.h"
 
 #include <algorithm>
@@ -16,31 +17,6 @@
 namespace {
 
 const char* rc(XtLiveRecoveryError code) { return live_recovery_error_str(code); }
-
-constexpr int kCtpErrLoginForbidden = 75;
-constexpr int kCtpErrNotInited      = 7;
-
-int compute_login_backoff_ms_(int login_retry_base_ms, int err_id, int fails) {
-    constexpr int kCap5min = 5 * 60 * 1000;
-    constexpr int kCap30s  = 30 * 1000;
-    constexpr int kCap1h   = 60 * 60 * 1000;
-
-    if (err_id == kCtpErrLoginForbidden) {
-
-        return kCap1h;
-    }
-
-    const int cap = (err_id == kCtpErrNotInited) ? kCap30s : kCap5min;
-
-    int retry = std::max(1000, login_retry_base_ms);
-    if (fails > 1) {
-
-        const int shift = std::min(fails - 1, 12);
-        const int64_t scaled = static_cast<int64_t>(retry) << shift;
-        retry = (scaled > cap) ? cap : static_cast<int>(scaled);
-    }
-    return retry;
-}
 
 }
 
@@ -70,7 +46,7 @@ void TraderCTP::schedule_login_retry() {
 
     const int err_id = last_login_error_id_.load(std::memory_order_acquire);
     const int fails  = consecutive_login_failures_.load(std::memory_order_acquire);
-    const int retry_ms = compute_login_backoff_ms_(login_retry_ms_, err_id, fails);
+    const int retry_ms = ctp_login::compute_login_backoff_ms(login_retry_ms_, err_id, fails);
     schedule_after_ms(retry_ms, [this, retry_ms]() {
         login_retry_pending_.store(false, std::memory_order_release);
         if (!is_session_alive()) return;

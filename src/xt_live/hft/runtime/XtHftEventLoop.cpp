@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "recording/XtLiveRecorder.h"
+#include "latency/XtLiveLatencyTracker.h"
 #include "XtLogger.h"
 #include "xt_logger/XtCallbackGuard.h"
 #include "xt_core/XtLiveTapContext.h"
@@ -21,6 +22,7 @@
 #include "xt_engine/hft/XtHftEngine.h"
 #include "xt_risk/live/SelfMatchDetector.h"
 #include "xt_live/common/SessionGateUpdate.h"
+#include "xt_live/common/TapAnchorScope.h"
 #include "xt_util/time/XtTime.h"
 
 #if defined(__x86_64__)
@@ -39,19 +41,6 @@ void backoff_pause(int spins) {
         std::this_thread::yield();
     }
 #endif
-}
-
-thread_local uint64_t tl_cached_enqueue_ts_us = 0;
-thread_local uint64_t tl_cached_enqueue_ms = 0;
-
-[[nodiscard]] uint64_t cached_enqueue_ts_us() {
-    const uint64_t now = XtSteadyClock::steady_now_us();
-    const uint64_t now_ms = now / 1000;
-    if (now_ms != tl_cached_enqueue_ms) {
-        tl_cached_enqueue_ms = now_ms;
-        tl_cached_enqueue_ts_us = now;
-    }
-    return tl_cached_enqueue_ts_us;
 }
 
 void update_atomic_peak(std::atomic<uint64_t>& peak_atomic, uint64_t value) {
@@ -136,6 +125,8 @@ XtHftEventLoop::XtHftEventLoop(const Config& cfg, const Deps& deps)
       tick_proc_cnt_(deps.tick_proc_cnt),
       self_match_detector_(deps.self_match_detector),
       blacklist_sink_(deps.blacklist_sink),
+      marshal_overflow_drain_(deps.marshal_overflow_drain),
+      latency_tracker_(deps.latency_tracker),
       live_cost_(deps.live_cost),
       live_fees_(deps.live_fees),
       catalog_(deps.catalog),
@@ -174,12 +165,20 @@ void XtHftEventLoop::stop() {
 }
 
 bool XtHftEventLoop::try_push_tick(const XtRawTick& tick) {
+
+    return try_push_tick(tick,  0);
+}
+
+bool XtHftEventLoop::try_push_tick(const XtRawTick& tick, uint64_t capture_ns) {
     if (reject_enqueue_guard(cfg_.tick_high_watermark, tick_backlog_)) {
         return false;
     }
     TickEvent ev;
     ev.core_tick = xt_tick_convert::to_core(tick);
-    ev.enqueue_ts_us = cached_enqueue_ts_us();
+
+    ev.enqueue_ts_us = XtSteadyClock::steady_now_us();
+
+    ev.capture_ts_us = capture_ns / 1000ULL;
 
     tick_backlog_.fetch_add(1, std::memory_order_relaxed);
     if (!tick_q_.push(ev)) {
@@ -214,8 +213,16 @@ uint64_t XtHftEventLoop::td_event_backlog() const {
     return td_event_backlog_.load(std::memory_order_relaxed);
 }
 
-uint64_t XtHftEventLoop::drain_tick_lag_p99_us() {
-    return tick_lag_us_p99_.exchange(0, std::memory_order_relaxed);
+uint64_t XtHftEventLoop::drain_tick_lag_peak_us() {
+    return tick_lag_us_peak_.exchange(0, std::memory_order_relaxed);
+}
+
+xt_live::XtLagHistogram::Stats XtHftEventLoop::drain_tick_lag_hist_stats() {
+    return tick_lag_hist_.drain();
+}
+
+xt_live::XtLagHistogram::Stats XtHftEventLoop::drain_td_flow_lag_hist_stats() {
+    return td_flow_lag_hist_.drain();
 }
 
 uint64_t XtHftEventLoop::td_event_peak_backlog_val() const {
@@ -229,13 +236,9 @@ uint64_t XtHftEventLoop::td_flow_event_lag_us_max_val() const {
 std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>>
 XtHftEventLoop::drain_all_strategy_metrics() {
     std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>> out;
-    const std::size_t n = engine_.context_count();
-    out.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        auto* c = engine_.context(i);
-        if (!c) continue;
-        out.emplace_back(c->strategy_id(), c->drain_strategy_metrics());
-    }
+    out.reserve(engine_.context_count());
+
+    engine_.drain_all_strategy_metrics(out);
     return out;
 }
 
@@ -247,6 +250,12 @@ uint64_t XtHftEventLoop::engine_dropped_order_update_count() const noexcept {
 }
 uint64_t XtHftEventLoop::engine_orphan_reap_cancel_count() const noexcept {
     return engine_.orphan_reap_cancel_count();
+}
+uint64_t XtHftEventLoop::engine_orphan_reap_suppressed_count() const noexcept {
+    return engine_.orphan_reap_suppressed_count();
+}
+uint64_t XtHftEventLoop::engine_strategy_init_failure_count() const noexcept {
+    return engine_.strategy_init_failure_count();
 }
 uint32_t XtHftEventLoop::engine_open_order_count() const noexcept {
     return engine_.open_order_count();
@@ -284,6 +293,10 @@ bool XtHftEventLoop::enqueue_runner_event(XtHftRunnerEvent ev,
                                                std::atomic<uint64_t>& backlog_counter,
                                                std::atomic<uint64_t>& peak_backlog_counter) {
     const bool no_drop = ev.must_not_drop();
+
+    const auto* pre_ctrl = ev.get_if<XtRunnerControlEvent>();
+    const bool is_worker_task =
+        pre_ctrl && pre_ctrl->type == XtRunnerControlEventType::WorkerTask;
     if (reject_enqueue_guard(high_watermark, backlog_counter, no_drop)) {
         return false;
     }
@@ -296,11 +309,18 @@ bool XtHftEventLoop::enqueue_runner_event(XtHftRunnerEvent ev,
     if (!queue.push(std::move(ev))) {
         backlog_counter.fetch_sub(1, std::memory_order_relaxed);
         if (no_drop) {
+            if (is_worker_task) {
+                XtLogger::error_m("RT",
+                    "runner WorkerTask rejected by physical queue (backlog={} watermark={}) "
+                    "— routed to marshal overflow side-channel",
+                    backlog_counter.load(std::memory_order_relaxed), high_watermark);
+            } else {
 
-            XtLogger::error_m("RT",
-                "CRITICAL runner event DROPPED (physical queue full); backlog={} watermark={} "
-                "— phantom/missed-fill risk",
-                backlog_counter.load(std::memory_order_relaxed), high_watermark);
+                XtLogger::error_m("RT",
+                    "CRITICAL runner event DROPPED (physical queue full); backlog={} watermark={} "
+                    "— phantom/missed-fill risk",
+                    backlog_counter.load(std::memory_order_relaxed), high_watermark);
+            }
         }
         return false;
     }
@@ -425,7 +445,9 @@ bool XtHftEventLoop::dispatch_control_event(const XtRunnerControlEvent& control)
     case XtRunnerControlEventType::ReapRecoveredOrphans:
 
         if (const auto* p = control.get_if<XtRunnerReapOrphansEvent>()) {
-            (void)engine_.reap_recovered_orphans(p->now_ms, p->grace_ms, p->max_cancels);
+            if (p->reap_orphans) {
+                (void)engine_.reap_recovered_orphans(p->now_ms, p->grace_ms, p->max_cancels);
+            }
 
             if (p->reconcile_lost_terminals) {
                 (void)engine_.reconcile_lost_terminals(p->max_cancels);
@@ -447,7 +469,10 @@ bool XtHftEventLoop::handle_exec_order_update_(const XtRunnerOrderUpdateEvent& e
     xt_log::run_guarded("RT", "live.record_order", record_fail_ct_,
                         [&]() { emit_order_update_record(evt); });
 
-    if (!engine_.on_order_update(evt.value)) {
+    const XtLatencyEligibility elig = evt.latency_ineligible
+        ? XtLatencyEligibility::kIneligible
+        : XtLatencyEligibility::kEligible;
+    if (!engine_.on_order_update(evt.value, elig)) {
         request_worker_stop();
         return false;
     }
@@ -473,8 +498,11 @@ bool XtHftEventLoop::handle_exec_trade_(const XtRunnerTradeEvent& evt) {
 
     std::string effective_sid = normalized.strategy_id;
 
+    const XtLatencyEligibility trade_elig = evt.latency_ineligible
+        ? XtLatencyEligibility::kIneligible
+        : XtLatencyEligibility::kEligible;
     const bool engine_ok =
-        engine_.on_trade(normalized, evt.td_state, &realized_fp, &effective_sid);
+        engine_.on_trade(normalized, evt.td_state, &realized_fp, &effective_sid, trade_elig);
 
     const bool self_match_ok =
         run_strategy_guard(StrategyGuardStage::SelfMatch, &stop_requested_, shutdown_flag_,
@@ -650,6 +678,7 @@ bool XtHftEventLoop::drain_runner_queue_([[maybe_unused]] WorkerRuntime& st,
                 const uint64_t lag = now >= batch_buf[i].enqueue_ts_us
                                          ? (now - batch_buf[i].enqueue_ts_us) : 0;
                 update_atomic_peak(td_flow_event_lag_us_max_, lag);
+                td_flow_lag_hist_.record(lag);
             }
             if (!dispatch_strategy_event(batch_buf[i])) return false;
         }
@@ -718,7 +747,18 @@ void XtHftEventLoop::update_tick_session_flags(const XtTick& tick) {
 
 bool XtHftEventLoop::dispatch_tick_to_engine(const TickEvent& ev) {
 
-    xt_core::tap::set_current_tick_ts_ns(ev.enqueue_ts_us * 1000ULL);
+    const uint64_t trigger_us = xt_live::select_trigger_anchor_us(ev.capture_ts_us, ev.enqueue_ts_us);
+    xt_core::tap::set_current_tick_ts_ns(trigger_us * 1000ULL);
+
+    if (ev.core_tick.action_time != 0) {
+        const uint32_t ad = ev.core_tick.action_date != 0 ? ev.core_tick.action_date
+                                                          : ev.core_tick.trading_date;
+        if (ad != 0) {
+            xt_core::tap::publish_event_clock_anchor(
+                xt_time::to_ns(ad, ev.core_tick.action_time),
+                static_cast<int64_t>(XtSteadyClock::steady_now_ns()));
+        }
+    }
     const bool ok = run_strategy_guard(StrategyGuardStage::OnTick,
                                        &stop_requested_,
                                        shutdown_flag_,
@@ -752,6 +792,8 @@ bool XtHftEventLoop::process_ticks(WorkerRuntime& st, bool& progressed) {
         const uint64_t lag = observe_tick_lag_us(ev);
         if (lag > batch_max_lag) batch_max_lag = lag;
 
+        if (ev.enqueue_ts_us != 0) tick_lag_hist_.record(lag);
+
         update_tick_observability(ev.core_tick, batch_steady_ms);
         update_tick_session_flags(ev.core_tick);
         if (!dispatch_tick_to_engine(ev)) return false;
@@ -760,7 +802,7 @@ bool XtHftEventLoop::process_ticks(WorkerRuntime& st, bool& progressed) {
     }
 
     if (batch_max_lag > 0) {
-        update_atomic_peak(tick_lag_us_p99_, batch_max_lag);
+        update_atomic_peak(tick_lag_us_peak_, batch_max_lag);
     }
     return true;
 }
@@ -775,7 +817,23 @@ void XtHftEventLoop::drain_pending_queues() {
     TickEvent tick_ev;
     XtHftRunnerEvent sev;
     while (tick_q_.pop(tick_ev)) {}
-    while (td_event_q_.pop(sev)) {}
+
+    while (td_event_q_.pop(sev)) {
+        if (const auto* ctrl = sev.get_if<XtRunnerControlEvent>()) {
+            if (ctrl->type == XtRunnerControlEventType::WorkerTask) {
+                const auto* p = ctrl->get_if<XtRunnerWorkerTaskEvent>();
+                if (p && p->fn) {
+
+                    try {
+                        p->fn();
+                    } catch (...) {
+                        XtLogger::error_m("RT",
+                            "drain_pending_queues WorkerTask closure threw; swallowed");
+                    }
+                }
+            }
+        }
+    }
     while (flow_event_q_.pop(sev)) {}
     tick_backlog_.store(0, std::memory_order_relaxed);
     td_event_backlog_.store(0, std::memory_order_relaxed);
@@ -794,8 +852,15 @@ void XtHftEventLoop::run() {
         ThreadUtil::set_current_thread_priority(cfg_.worker_priority);
     }
 
+    if (latency_tracker_) latency_tracker_->bind_producer_slot();
+
+    XtHftEngine::StartReport start_report;
     if (!run_strategy_guard(StrategyGuardStage::OnInit, &stop_requested_, shutdown_flag_,
-                            [&]() { engine_.on_init(); })) return;
+                            [&]() { start_report = engine_.start(); })) return;
+    if (!start_report.all_started) {
+        XtLogger::warn_m("RT", "strategy start: {} context(s) fail-closed disabled",
+                         start_report.failures.size());
+    }
     if (initial_param_version_ > 0) {
         if (!run_strategy_guard(StrategyGuardStage::OnParams, &stop_requested_, shutdown_flag_,
                                 [&]() { engine_.on_params_updated(initial_param_version_); })) {
@@ -812,6 +877,8 @@ void XtHftEventLoop::run() {
 
     while (__builtin_expect(!stop_requested_.load(std::memory_order_acquire), 1)) {
         bool progressed = false;
+
+        if (marshal_overflow_drain_) marshal_overflow_drain_();
         update_tick_pending_state(*st);
         if (__builtin_expect(!process_td_events(*st, progressed), 0)) return;
         warn_td_backlog_if_needed(*st);
@@ -837,4 +904,26 @@ void XtHftEventLoop::run() {
     });
 
     if (!no_escape) request_worker_stop();
+
+    {
+        XtHftRunnerEvent ev;
+        while (td_event_q_.pop(ev)) {
+            safe_decrement_backlog(td_event_backlog_, "td_event_backlog");
+            if (const auto* ctrl = ev.get_if<XtRunnerControlEvent>()) {
+                if (ctrl->type == XtRunnerControlEventType::WorkerTask) {
+                    const auto* p = ctrl->get_if<XtRunnerWorkerTaskEvent>();
+                    if (p && p->fn) {
+
+                        try {
+                            p->fn();
+                        } catch (...) {
+                            XtLogger::error_m("RT",
+                                "stop-edge WorkerTask closure threw; swallowed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (marshal_overflow_drain_) marshal_overflow_drain_();
 }

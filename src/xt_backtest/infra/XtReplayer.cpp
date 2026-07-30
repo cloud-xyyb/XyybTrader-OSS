@@ -3,7 +3,6 @@
 #include "xt_core/market/XtTickConvert.h"
 #include "XtLogger.h"
 #include "xt_backtest/data/source/XtMarketDataSource.h"
-#include "xt_backtest/util/TickCsvUtil.h"
 #include "xt_util/time/XtTime.h"
 
 #include <yaml-cpp/yaml.h>
@@ -47,13 +46,10 @@ inline int64_t align_up(int64_t v, int64_t grid) noexcept {
     return ((v + grid - 1) / grid) * grid;
 }
 
-int64_t sort_key_to_ns(uint64_t key) noexcept {
-    if (key == 0) return 0;
-    const uint32_t trading_day = static_cast<uint32_t>(key / kActionTimeDaySpan);
-    const uint64_t shifted     = key % kActionTimeDaySpan;
-    const uint32_t action_time = static_cast<uint32_t>(
-        (shifted + kActionTimeDaySpan - kDefaultNightShiftMs) % kActionTimeDaySpan);
-    return xt_time::to_ns(trading_day, action_time);
+inline int64_t header_event_ns(const XtReplayEventHeader& h) noexcept {
+    const uint32_t d = (h.action_date != 0) ? h.action_date : h.trading_date;
+    if (d == 0 && h.action_time == 0) return 0;
+    return xt_time::to_ns(d, h.action_time);
 }
 }
 
@@ -70,17 +66,17 @@ size_t XtReplayer::run(XtMarketDataSource& source,
 
     while (true) {
 
-        uint64_t next_key = 0;
-        if (!source.peek_next_key(next_key)) break;
+        XtReplayEventHeader next_hdr;
+        if (!source.peek_next_event_header(next_hdr)) break;
+        const int64_t next_ns = header_event_ns(next_hdr);
 
         if (clock_resolution_ns_ > 0
             && last_clock_ns != std::numeric_limits<int64_t>::min()) {
-            const int64_t next_ns = sort_key_to_ns(next_key);
             int64_t next_clock_ns = align_up(last_clock_ns + 1, clock_resolution_ns_);
             while (next_clock_ns < next_ns) {
                 uint32_t d = 0, t = 0;
                 xt_time::from_ns(next_clock_ns, d, t);
-                runtime.on_clock(d, t);
+                runtime.on_clock(d, t, next_hdr.trading_date);
                 last_clock_ns = next_clock_ns;
                 next_clock_ns += clock_resolution_ns_;
             }
@@ -104,7 +100,7 @@ size_t XtReplayer::run(XtMarketDataSource& source,
         }
 
         if (clock_resolution_ns_ > 0) {
-            last_clock_ns = sort_key_to_ns(next_key);
+            last_clock_ns = next_ns;
         }
 
         if (sleep_ms_ > 0) {

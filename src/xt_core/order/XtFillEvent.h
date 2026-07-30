@@ -8,11 +8,12 @@
 #include "XtOrderTypes.h"
 
 /**
- * @brief 热路径成交事件（hot-path fill event）。
+ * @brief 一笔成交的热路径表示。
  *
- * 纯 POD、固定数组、无堆分配；用于策略 on_fill/on_trade 回调和账户/仓位更新。
- * 数值字段统一使用 `kOrderExecFpScale` fixed-point 口径。
- * broker 回报 ID、交易日等审计字段由冷路径 `XtTradeRecord` 承载。
+ * 成交（fill）发生后要立刻喂给策略 on_fill/on_trade 回调并更新账户/仓位，这条路径容不下
+ * 堆分配或字符串开销，所以本结构是纯 POD + 固定数组，数值字段统一走 `kOrderExecFpScale`
+ * fixed-point。只带记账必需的字段；broker 回报 ID、交易日等审计信息由冷路径的
+ * `XtTradeRecord` 承载。
  */
 struct XtFillEvent {
 

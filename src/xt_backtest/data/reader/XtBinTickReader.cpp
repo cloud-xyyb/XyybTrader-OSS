@@ -2,6 +2,7 @@
 
 #include "xt_util/path/PathUtil.h"
 
+#include <cstdio>
 #include <utility>
 
 XtBinTickReader::XtBinTickReader(std::vector<std::string> paths)
@@ -30,6 +31,12 @@ bool XtBinTickReader::next_tick(XtRawTick& out) {
         if (!fmt_inited_) {
 
             if (!xt_tick_bin::detect_stream_format(*in_, fmt_)) {
+                std::fprintf(stderr,
+                             "[XtBinTickReader] skip %s: header/codec-version mismatch "
+                             "(expect CTTKV%u); rebuild from source data\n",
+                             idx_ > 0 && idx_ <= paths_.size() ? paths_[idx_ - 1].c_str()
+                                                               : "<unknown>",
+                             static_cast<unsigned>(xt_tick_bin::kTickBinCodecVersion));
                 in_.reset();
                 continue;
             }

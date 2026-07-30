@@ -25,4 +25,8 @@ struct XTPTdCfg {
     int         init_query_timeout_ms = 8000;
     int         recovery_query_timeout_ms = 8000;
     int         recovery_query_max_timeouts = 6;
+
+    int         position_refresh_ms = 60000;
+
+    std::string local_id_instance;
 };

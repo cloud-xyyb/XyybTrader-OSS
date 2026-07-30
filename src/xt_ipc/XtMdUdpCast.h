@@ -33,8 +33,8 @@ struct UdpMdPacket {
     XtRawTick tick;
 };
 static_assert(std::is_trivially_copyable_v<UdpMdPacket> && std::is_standard_layout_v<UdpMdPacket>);
-static_assert(sizeof(UdpMdPacket) == 536,
-              "UdpMdPacket wire size 钉死（8+4+4+8+512）；任何 framing/element 变更 bump XT_MD_WIRE_VERSION");
+static_assert(sizeof(UdpMdPacket) == 856,
+              "UdpMdPacket wire size 钉死（8+4+4+8+832）；任何 framing/element 变更 bump XT_MD_WIRE_VERSION");
 
 /// @brief UDP 组播发送端。
 class UdpMdSender {

@@ -1,4 +1,5 @@
 #include "InterpolatedLatencyModel.h"
+#include "XtLatencyArith.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -7,6 +8,8 @@
 #include <stdexcept>
 
 namespace {
+
+constexpr const char* kV2Header = "event_ts_local_ns,entry_ns,response_ns";
 
 bool parse_csv_row(const std::string& line, int64_t& ts, int64_t& entry, int64_t& resp) {
     std::stringstream ss(line);
@@ -28,20 +31,30 @@ InterpolatedLatencyModel::InterpolatedLatencyModel(const std::string& csv_path) 
         throw std::runtime_error("InterpolatedLatencyModel: 无法打开 csv: " + csv_path);
     }
     std::string line;
-    bool first = true;
+
+    if (!std::getline(f, line) || line.empty()) {
+        throw std::runtime_error("InterpolatedLatencyModel: csv 空文件: " + csv_path);
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line != kV2Header) {
+        throw std::runtime_error(
+            "InterpolatedLatencyModel: 需要 v2 header '" + std::string(kV2Header) +
+            "'（event-axis 索引），实际首行: '" + line +
+            "'。旧 steady 轴 CSV 请用新 extract_latency.py 重出 v2，或改用 type:cdf");
+    }
     while (std::getline(f, line)) {
         if (line.empty()) continue;
-
-        if (first) {
-            first = false;
-            if (!line.empty() && (line[0] < '0' || line[0] > '9') && line[0] != '-') {
-                continue;
-            }
-        }
         int64_t ts = 0, entry = 0, resp = 0;
         if (!parse_csv_row(line, ts, entry, resp)) {
             throw std::runtime_error(
                 "InterpolatedLatencyModel: csv 行解析失败 (期望 3 列 int64): " + line);
+        }
+
+        xt_latency::validate_latency_ns(entry, "csv entry_ns");
+        xt_latency::validate_latency_ns(resp, "csv response_ns");
+        if (!ts_.empty() && ts == ts_.back()) {
+            throw std::runtime_error(
+                "InterpolatedLatencyModel: 重复 event_ts_local_ns: " + std::to_string(ts));
         }
         ts_.push_back(ts);
         entry_.push_back(entry);
@@ -65,6 +78,14 @@ InterpolatedLatencyModel::InterpolatedLatencyModel(const std::string& csv_path) 
         ts_.swap(ts2);
         entry_.swap(e2);
         resp_.swap(r2);
+
+        for (size_t i = 1; i < ts_.size(); ++i) {
+            if (ts_[i] == ts_[i - 1]) {
+                throw std::runtime_error(
+                    "InterpolatedLatencyModel: 重复 event_ts_local_ns: " +
+                    std::to_string(ts_[i]));
+            }
+        }
     }
 }
 
@@ -85,7 +106,9 @@ int64_t InterpolatedLatencyModel::lookup_(const std::vector<int64_t>& v, int64_t
     const size_t lo = hi - 1;
     const int64_t t0 = ts_[lo],  t1 = ts_[hi];
     const int64_t v0 = v[lo],   v1 = v[hi];
-    if (t1 == t0) return v0;
 
-    return v0 + (v1 - v0) * (ts - t0) / (t1 - t0);
+    const __int128 num = static_cast<__int128>(v1 - v0) * (ts - t0);
+    const __int128 den = t1 - t0;
+    const int64_t out = v0 + static_cast<int64_t>(num / den);
+    return xt_latency::validate_latency_ns(out, "interpolated");
 }

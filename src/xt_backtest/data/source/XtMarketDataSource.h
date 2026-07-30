@@ -44,10 +44,23 @@ struct XtReplayEvent {
     XtTransaction transaction;
 };
 
+/// @brief 下一事件的时间头（non-consuming peek 用）。
+///
+/// sort key 只保证序（夜盘旋转编码，不可反解真实时刻）；event-axis 时间
+/// 一律取自事件 payload 本头：`to_ns(action_date != 0 ? action_date : trading_date,
+/// action_time)`。四类事件 payload 均携带三字段。
+struct XtReplayEventHeader {
+    uint64_t key = 0;
+    uint32_t action_date = 0;
+    uint32_t action_time = 0;
+    uint32_t trading_date = 0;
+};
+
 enum class TickSource : uint8_t {
     None = 0,
     Csv,
     BinStream,
+    ShardStream,
     Fbs,
     EventsParquet,
 };
@@ -71,8 +84,73 @@ public:
 
     bool peek_next_key(uint64_t& out_key);
 
+    bool peek_next_event_header(XtReplayEventHeader& out);
+
     XtReplayMode mode() const { return mode_; }
     bool streaming() const { return use_stream_; }
+
+    uint64_t data_mode_ignored_count() const { return data_mode_ignored_count_; }
+
+    bool has_io_error() const { return stream_io_error_; }
+
+    const std::vector<std::string>& consumed_tick_files() const { return tick_.files; }
+
+    const char* tick_source_name() const {
+        switch (tick_.source) {
+            case TickSource::Csv:           return "csv";
+            case TickSource::BinStream:     return "bin_stream";
+            case TickSource::ShardStream:   return "shard_stream";
+            case TickSource::Fbs:           return "fbs";
+            case TickSource::EventsParquet: return "events_parquet";
+            default:                        return "none";
+        }
+    }
+    bool bin_cache_enabled() const { return tick_.use_bin_cache; }
+
+    bool bin_cache_hit() const { return tick_.bin_cache_hit; }
+
+    std::string bin_cache_path() const {
+        return tick_.bin_paths.empty() ? std::string() : tick_.bin_paths.front();
+    }
+
+    const std::vector<std::string>& shard_cache_paths() const { return tick_.shard_paths; }
+
+    bool shard_cache_hit() const { return tick_.shard_cache_hit; }
+
+    /// @brief RawShardV3 建库的复用/重建分解（增量是否真的生效，看这组数）。
+    struct ShardCacheStats {
+        uint64_t days_required = 0;
+        uint64_t days_reused = 0;
+        uint64_t days_built = 0;
+
+        bool full_rebuild = false;
+
+        uint64_t duplicate_sources = 0;
+
+        uint64_t publish_failed = 0;
+
+        uint64_t manifest_malformed = 0;
+    };
+    const ShardCacheStats& shard_cache_stats() const { return tick_.shard_stats; }
+
+    /// @brief 载入→交付分类丢弃计数（consumed manifest 分解用）。
+    ///
+    /// `rows_loaded` = 交付前总读入行数（-1 = 该来源不可归因）；`window/session/
+    /// skip_last/symbol/bad_row` = 数据源层丢弃分类。CSV/bin 路可精确归因
+    /// （`loaded_trackable=true`）；fbs/parquet reader 内部预筛不可见 → 不可归因。
+    /// 满足（trackable 时）：`rows_loaded == 交付 tick 数 + window + session +
+    /// skip_last + symbol + bad_row`。stream 路在 next_event 消费期间累积，
+    /// 故需在 replay 全部消费后读取。
+    struct DropStats {
+        int64_t rows_loaded = -1;
+        int64_t window   = 0;
+        int64_t session  = 0;
+        int64_t skip_last = 0;
+        int64_t symbol   = 0;
+        int64_t bad_row  = 0;
+        bool loaded_trackable = false;
+    };
+    const DropStats& drop_stats() const { return drop_stats_; }
 
 private:
 
@@ -92,7 +170,12 @@ private:
         TickSource source = TickSource::None;
         std::string cache_dir = "data/ticks/cache";
         bool use_bin_cache = false;
+        bool bin_cache_hit = false;
         std::vector<std::string> bin_paths;
+        std::string cache_format = "v2";
+        std::vector<std::string> shard_paths;
+        bool shard_cache_hit = false;
+        ShardCacheStats shard_stats;
         std::unique_ptr<IMarketDataReader> reader;
         bool reader_is_bar_simtick = false;
 
@@ -134,15 +217,26 @@ private:
     bool load_csvs_to_memory(const std::vector<std::string>& paths);
     bool build_tick_bin_from_csvs(const std::vector<std::string>& csv_paths, const std::string& bin_path);
     bool ensure_tick_bin_cache(const std::vector<std::string>& sources);
+
+    bool ensure_tick_shard_cache(const std::vector<std::string>& all_sources,
+                                 bool allow_undated_sources);
     bool load_tick_bin_into_memory();
+
+    bool load_tick_shards_into_memory();
     bool build_event_stream_cache();
 
     bool next_tick(XtRawTick& out);
     bool read_next_event_uncached_(XtReplayEvent& out);
 
-    bool admit_stream_tick_(XtRawTick& t) const;
+    bool admit_stream_tick_(XtRawTick& t);
 
     bool next_tick_day_buffered_(XtRawTick& out);
+
+    void latch_reader_io_error_();
+
+    void finalize_stream_load_stats_();
+
+    void note_stream_forced_(const char* source_tag);
 
     XtReplayMode mode_      = XtReplayMode::Bar;
     bool         use_stream_ = true;
@@ -158,4 +252,11 @@ private:
     size_t      event_cursor_   = 0;
 
     std::optional<XtReplayEvent> cached_next_event_;
+    bool stream_io_error_ = false;
+    uint64_t data_mode_ignored_count_ = 0;
+    DropStats drop_stats_;
+    int64_t stream_records_read_ = 0;
+    bool stream_stats_finalized_ = false;
+
+    bool at_start_ = false;
 };

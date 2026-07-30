@@ -61,6 +61,13 @@ public:
     using AccountSnapshot       = ITradeGateway::AccountSnapshot;
     using PositionSnapshot      = ITradeGateway::PositionSnapshot;
 
+    enum class QueryKind {
+        Position,
+        AccountState,
+        XtOrder,
+        Trade
+    };
+
     struct QueryControlStats {
         uint64_t query_pos_throttled     = 0;
         uint64_t query_pos_inflight_skip = 0;
@@ -82,6 +89,8 @@ public:
     bool cancel_order(uint64_t local_id);
 
     bool is_local_terminal(uint64_t local_id) const;
+
+    bool lookup_terminal(uint64_t local_id, XtOrderTerminalRecord& out) const;
 
     void set_recovery_enabled(bool enabled) { recovery_.set_recovery_enabled(enabled); }
 
@@ -105,13 +114,59 @@ public:
         return recovery_rearm_scheduled_total_.load(std::memory_order_acquire);
     }
 
+    uint64_t refresh_query_timeout_total() const {
+        return refresh_query_timeout_total_.load(std::memory_order_acquire);
+    }
+
+    bool is_refresh_query_wedged() const {
+        if (refresh_query_wedge_rounds_ <= 0) return false;
+        for (const auto& q : qry_) {
+            if (q.refresh_timeout_count.load(std::memory_order_acquire) >= refresh_query_wedge_rounds_) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint64_t stale_query_row_dropped_total() const {
+        return stale_query_row_dropped_.load(std::memory_order_acquire);
+    }
+
+    uint64_t stale_query_row_unfenceable_total() const {
+        return stale_query_row_unfenceable_.load(std::memory_order_acquire);
+    }
+
+    uint64_t query_session_gen() const {
+        return query_session_gen_.load(std::memory_order_acquire);
+    }
+
     void set_connected_for_test(bool v) { connected_.store(v, std::memory_order_release); }
+
+    void set_active_request_id_for_test(QueryKind kind, int request_id) {
+        qry_[qry_idx(kind)].active_request_id.store(request_id, std::memory_order_release);
+    }
 
     bool identity_mismatch_latched() const {
         return identity_mismatch_latched_.load(std::memory_order_acquire);
     }
 
     void set_expected_investor_id_for_test(std::string v) { expected_investor_id_ = std::move(v); }
+
+    void set_process_start_epoch_us_for_test(int64_t us) { process_start_epoch_us_ = us; }
+
+    void set_recovery_anchor_epoch_us_for_test(int64_t us) {
+        recovery_position_anchor_us_.store(us, std::memory_order_release);
+    }
+
+    const xt_live::gateway::XtExecDeliveryLedger& exec_ledger() const {
+        return state_.exec_ledger();
+    }
+
+    uint64_t watermark_breach_total() const { return state_.watermark_breach_total(); }
+
+    uint64_t synth_cum_filled_total() const { return state_.synth_cum_filled_total(); }
+
+    uint64_t cum_filled_conflict_total() const { return state_.cum_filled_conflict_total(); }
 
     void OnFrontConnected() override;
 
@@ -187,21 +242,18 @@ private:
         FrontDisconnected
     };
 
-    enum class QueryKind {
-        Position,
-        AccountState,
-        XtOrder,
-        Trade
-    };
-
+    static constexpr int kQueryRequestIdInvalidated = -1;
     struct QueryCtrl {
         std::atomic<bool>     inflight{false};
+        std::atomic<int>      active_request_id{0};
         std::atomic<bool>     dirty{false};
         std::atomic<bool>     retry_pending{false};
         std::atomic<int64_t>  next_allowed_ms{0};
         std::atomic<int>      backoff_level{0};
         std::atomic<uint64_t> timeout_token{0};
         std::atomic<int>      timeout_count{0};
+        std::atomic<uint64_t> refresh_timeout_token{0};
+        std::atomic<int>      refresh_timeout_count{0};
         std::atomic<uint64_t> throttled_count{0};
         std::atomic<uint64_t> inflight_skip_count{0};
         std::atomic<uint64_t> dirty_merge_count{0};
@@ -248,6 +300,12 @@ private:
 
     void set_recovery_wedged_(bool wedged);
 
+    void maybe_log_stale_position_frame_(int request_id);
+
+    bool query_row_owned_(QueryKind kind, int request_id);
+
+    void maybe_log_stale_query_row_(QueryKind kind, int request_id);
+
     bool confirm_settlement();
 
     bool request_settlement_confirm_with_timeout();
@@ -278,6 +336,8 @@ private:
 
     void arm_recovery_query_timeout(QueryKind kind);
 
+    void arm_refresh_query_timeout(QueryKind kind);
+
     void clear_recovery_query_timeout(QueryKind kind);
 
     void clear_recovery_query_timeout_states();
@@ -297,11 +357,23 @@ private:
 
     void on_recovery_ready();
 
+    void emit_recovery_finish_sequence_(bool is_cold_start);
+
+    void stage_recovery_positions_(std::vector<PositionSnapshot> out);
+
+    void emit_staged_recovery_positions_(bool is_cold_start);
+
+    void reopen_recovery_window_gate_and_drain_();
+
     void flush_recovery_pending_terminals_();
 
     void on_rtn_trade_(CThostFtdcTradeField* pTrade, bool from_query);
 
-    void flush_recovery_window_trades_();
+    void maybe_emit_cum_filled_completion_(uint64_t local_id, uint64_t local_cb_us);
+
+    bool classify_query_fill_absorbed_(const CThostFtdcTradeField* pTrade) const;
+
+    static int64_t wall_now_epoch_us_();
 
     bool is_error(CThostFtdcRspInfoField* pRspInfo);
 
@@ -339,6 +411,8 @@ private:
     int  recovery_query_max_timeouts_   = 6;
     int  recovery_rearm_backoff_ms_     = 5000;
     int  recovery_rearm_alert_rounds_   = 10;
+    int  refresh_query_timeout_ms_      = 30000;
+    int  refresh_query_wedge_rounds_    = 6;
 
     std::mutex recovery_rearm_mu_;
     int  recovery_rearm_round_    = 0;
@@ -370,6 +444,13 @@ private:
     std::atomic<bool> qry_retry_worker_running_{false};
 
     std::atomic<int64_t> next_global_query_allowed_ms_{0};
+    std::atomic<uint64_t> refresh_query_timeout_total_{0};
+
+    bool query_generation_fence_ = true;
+    std::atomic<uint64_t> query_session_gen_{0};
+    std::atomic<uint64_t> stale_query_row_dropped_{0};
+    std::atomic<uint64_t> stale_query_row_unfenceable_{0};
+    std::atomic<int64_t>  last_stale_query_row_log_ms_{0};
 
     int account_refresh_ms_  = 0;
     int position_refresh_ms_ = 0;
@@ -408,21 +489,34 @@ private:
     uint64_t                          recovery_skipped_foreign_ = 0;
 
     mutable std::mutex recovery_term_mu_;
-    std::unordered_map<uint64_t, XtOrderExecUpdate> recovery_pending_terminals_;
-
-    /// @brief recovery 窗口内 live push 成交的缓冲条目（ready 后 flush 下发）。
-    struct BufferedWindowTrade {
-        XtTradeRecord tr;
-        uint32_t      pos_snap_seq = 0;
+    /// 缓冲终态 + 其构造时 latency eligibility（per-entry 透传，flush 时携带）：
+    /// OnRtnOrder 真实 push buffered 保留原 cb_us = kEligible / cum-filled completion
+    /// 派生 = kIneligible（latency-terminal 批 L-1.2 CTP）。
+    struct RecoveryPendingTerminal {
+        XtOrderExecUpdate    upd;
+        XtLatencyEligibility elig = XtLatencyEligibility::kIneligible;
     };
+    std::unordered_map<uint64_t, RecoveryPendingTerminal> recovery_pending_terminals_;
 
     mutable std::mutex recovery_window_mu_;
-    std::vector<BufferedWindowTrade> recovery_window_trades_;
+    std::vector<XtTradeRecord> recovery_window_trades_;
     bool     recovery_window_gate_closed_ = false;
     uint64_t recovery_window_overflow_    = 0;
 
-    std::atomic<uint32_t> recovery_position_snap_seq_{0};
+    std::atomic<int64_t> last_stale_position_log_ms_{0};
     static constexpr size_t kRecoveryWindowTradeCap = 4096;
+
+    static constexpr int64_t kFillSealMarginUs = 2'000'000;
+
+    std::atomic<int64_t> recovery_position_anchor_us_{0};
+
+    int64_t process_start_epoch_us_ = 0;
+
+    mutable std::mutex recovery_staged_pos_mu_;
+    std::vector<PositionSnapshot> recovery_staged_positions_;
+    bool recovery_staged_pos_valid_ = false;
+
+    bool exec_ledger_query_fill_delivery_ = true;
 
     bool                              is_first_recovery_ = true;
 };

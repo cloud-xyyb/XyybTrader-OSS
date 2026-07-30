@@ -20,6 +20,9 @@ target_include_directories(xt_runtime PUBLIC
 target_link_libraries(xt_runtime PUBLIC
     xt_core
     xt_util_sync_hazard
+    # OrderAttributionStore.h（xt_identity header-only）的 checked journal append 在失败/
+    # 降级时经 XtLogger 限频告警；XtOrderRuntimeBook.cpp ODR-use 该 append → 需 xt_logger。
+    xt_logger
 )
 
 # xt_metrics 是可选观测层；关闭 metrics target 时，runtime book drop 计数保留

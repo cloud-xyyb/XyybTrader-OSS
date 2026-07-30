@@ -1,0 +1,81 @@
+# Baseline: ag2206 单合约 5 天，volume_limit=true + fill.split=true（组合覆盖）。
+# T2.BT-10：覆盖 BT-R5（成交量上限）叠加 BT-R3（split 拆单 fp 整数守恒）两条撮合路径。
+# strategy qty=5 让 fill 大于 split min_qty 才能触发拆单（否则 1 手无可拆）。
+# 注：order_delay_ticks（delay wheel）无 yaml key（test-only，见 XtHftEofFlushTest），
+# 故本组合为 volume_limit + split 二合一；delay-wheel 覆盖留 gtest。
+log:
+  level: info
+  console: false
+commodities:
+  ag:
+    vol_scale: 15.0
+    price_tick: 1.0
+fees:
+  ag: {open: 0, close: 0, close_today: 0, by_volume: false}
+backtest:
+  start_date: 20220527
+  end_date:   20220602
+  report_dir: /tmp/xt_baseline_ag2206_vollimit_split
+  latency_model:
+    type: constant
+    entry_us: 0
+    response_us: 0
+  queue_model:
+    type: ratio
+    ratio: 0.0
+  queue_cancel_ratio: 0.0
+  ack_delay_ticks: 0
+  order_timeout_ticks: 0
+  error_rate: 0.0
+  volume_limit: true
+  match_delay_ticks: 2
+  session_offset_minutes: 300
+  session:
+    enabled: true
+    sections:
+      - "21:00:00-02:30:00"
+      - "09:00:00-10:15:00"
+      - "10:30:00-11:30:00"
+      - "13:30:00-15:00:00"
+  roll:
+    active: false
+    logical_symbol: "ag@main"
+    path: ${PROJECT_DIR}/configs/roll/ag_roll_recon.path
+    dispatch_parallel_ticks: false
+  fill:
+    split: true               # ← 拆单开
+    min_qty: 1.0
+    max_qty: 2.0              # 5 手 fill → [2,2,1] 拆分
+    qty_tick: 1.0
+  account:
+    cash: 100000000
+  cost:
+    slippage: 0
+  risk:
+    max_order_qty: 10000
+    max_order_notional: 0
+    max_pos_qty: 10000
+    allow_short: true
+  datasource:
+    mode: tick
+    data_mode: memory
+    tick:
+      files:
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-27.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-30.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-05-31.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-01.csv
+        - ${PROJECT_DIR}/data/regression/sample_ticks/SHFE/ag/ag2206/2022-06-02.csv
+      symbols:
+        - ag2206
+      volume_mode: cumulative
+      use_bin_cache: false
+  strategies:
+    - id: hft_tick_revert
+      so: ${PROJECT_DIR}/var/plugins/strategies/libhft_tick_revert_strategy.so
+      symbol: ag2206
+      tick_window: 10
+      qty: 5                  # ← 大于 split min_qty 才能触发拆单
+      use_ioc: 0
+      history_ticks: 256
+      history_bars: 64

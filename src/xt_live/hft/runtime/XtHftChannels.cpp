@@ -7,7 +7,7 @@
 #include "xt_core/order/XtTradeRecord.h"
 #include "xt_live/telemetry/latency/XtLiveLatencyTracker.h"
 #include "xt_util/time/XtSteadyClock.h"
-#include "xt_account/api/IAccountTruthSource.h"
+#include "xt_account/api/IAccountTruthSink.h"
 #include "XtFixedPoint.h"
 
 XtHftChannels::XtHftChannels(IMdGateway* md_channel,
@@ -25,7 +25,7 @@ XtHftChannels::XtHftChannels(IMdGateway* md_channel,
 
 void XtHftChannels::wire() {
     IMdGateway::Callbacks md_cb;
-    md_cb.on_tick         = [this](const XtRawTick& tick)           { on_md_tick(tick); };
+    md_cb.on_tick         = [this](const XtRawTick& tick, uint64_t capture_ns) { on_md_tick(tick, capture_ns); };
     md_cb.on_order_queue  = [this](const XtOrderQueue& oq)    { on_md_order_queue(oq); };
     md_cb.on_order_detail = [this](const XtOrderDetail& od)   { on_md_order_detail(od); };
     md_cb.on_transaction  = [this](const XtTransaction& tr)   { on_md_transaction(tr); };
@@ -34,11 +34,17 @@ void XtHftChannels::wire() {
     md_->bind_callbacks(std::move(md_cb));
 
     ITradeGateway::Callbacks td_cb;
-    td_cb.on_order_update     = [this](const XtOrderExecUpdate& upd)                           { on_td_order_update(upd); };
+    td_cb.on_order_update     = [this](const XtOrderExecUpdate& upd, XtLatencyEligibility elig) { on_td_order_update(upd, elig); };
     td_cb.on_account          = [this](const ITradeGateway::AccountSnapshot& snap)             { on_td_account_snapshot(snap); };
-    td_cb.on_position         = [this](const std::vector<ITradeGateway::PositionSnapshot>& ps) { on_td_position_snapshot(ps, td_->state()); };
+    td_cb.on_position         = [this](const std::vector<ITradeGateway::PositionSnapshot>& ps) {
+        on_td_position_snapshot(ps, td_->state(),  false);
+    };
+    td_cb.on_recovery_position = [this](
+        const std::vector<ITradeGateway::PositionSnapshot>& ps, bool is_cold_start) {
+        on_td_position_snapshot(ps, ITradeGateway::TdState::Recovering, is_cold_start);
+    };
     td_cb.on_broker_account_truth = [this](const BrokerVenueTruth& bt)                          { on_td_broker_account_truth(bt); };
-    td_cb.on_trade            = [this](const XtTradeRecord& tr)                                { on_td_trade(tr, td_->state()); };
+    td_cb.on_trade            = [this](const XtTradeRecord& tr, XtLatencyEligibility elig)     { on_td_trade(tr, td_->state(), elig); };
     td_cb.on_daily_settlement = [this](const ITradeGateway::DailySettlementDelta& ev)          { on_td_daily_settlement(ev); };
     td_cb.on_cash_transfer    = [this](const ITradeGateway::CashTransferDelta& ev)             { on_td_cash_transfer(ev); };
     td_cb.on_ready            = [this]()                                                       { on_td_ready(); };
@@ -61,8 +67,8 @@ void XtHftChannels::wire() {
 
 void XtHftChannels::on_td_broker_account_truth(const BrokerVenueTruth& bt) {
 
-    if (auto* truth = truth_source_.load(std::memory_order_acquire)) {
-        truth->update_broker_overlay(bt);
+    if (auto* sink = truth_sink_.load(std::memory_order_acquire)) {
+        sink->update_broker_overlay(bt);
     }
 }
 
@@ -117,7 +123,8 @@ TdDropReason classify_td_drop(const XtHftRunnerEvent& ev) {
     if (auto* ctrl = ev.get_if<XtRunnerControlEvent>()) {
 
         if (ctrl->type == XtRunnerControlEventType::ChannelReady ||
-            ctrl->type == XtRunnerControlEventType::ChannelLost) {
+            ctrl->type == XtRunnerControlEventType::ChannelLost ||
+            ctrl->type == XtRunnerControlEventType::ReverseSyncBatch) {
             return TdDropReason::Control;
         }
         return TdDropReason::Other;
@@ -140,26 +147,84 @@ bool XtHftChannels::enqueue_td_event(XtHftRunnerEvent ev) {
     const bool critical = ev.is_critical();
 
     const TdDropReason drop_reason = classify_td_drop(ev);
-    if (event_loop_->push_td_event(std::move(ev))) {
-        return true;
-    }
-    shared_state_->td_event_drop_cnt.fetch_add(1, std::memory_order_relaxed);
-    if (critical) {
-        shared_state_->critical_td_event_drop_cnt.fetch_add(1, std::memory_order_relaxed);
+
+    auto record_drop = [&]() {
+        shared_state_->td_event_drop_cnt.fetch_add(1, std::memory_order_relaxed);
+        if (critical) {
+            shared_state_->critical_td_event_drop_cnt.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        increment_td_drop_counter(drop_reason, *shared_state_);
+
+        ++td_drop_burst_total_;
+        const int64_t now_ms = steady_now_ms();
+        if (td_drop_last_warn_ms_ == 0 || now_ms - td_drop_last_warn_ms_ >= kDropWarnThrottleMs) {
+            const char* mark = (td_drop_last_warn_ms_ == 0) ? "FIRST" : "BURST";
+            XtLogger::warn_m("RT", "td_event drop {} burst_total={} critical={} (60s throttle)",
+                              mark, td_drop_burst_total_, critical ? 1 : 0);
+            td_drop_last_warn_ms_ = now_ms;
+            td_drop_burst_total_ = 0;
+        }
+    };
+
+    if (!ev.must_not_drop()) {
+
+        if (td_handoff_.in_store_and_forward()) {
+            drain_td_handoff_();
+        }
+        if (event_loop_->push_td_event(std::move(ev))) {
+            return true;
+        }
+        record_drop();
+        return false;
     }
 
-    increment_td_drop_counter(drop_reason, *shared_state_);
+    auto push = [this](XtHftRunnerEvent& e) {
+        XtHftRunnerEvent probe = e;
+        return event_loop_->push_td_event(std::move(probe));
+    };
+    using HandoffOffer = xt_live::TdHandoffRetryBuffer<XtHftRunnerEvent>::Offer;
+    switch (td_handoff_.offer(std::move(ev), push)) {
+        case HandoffOffer::kEnqueued:
+            return true;
+        case HandoffOffer::kBuffered: {
 
-    ++td_drop_burst_total_;
-    const int64_t now_ms = steady_now_ms();
-    if (td_drop_last_warn_ms_ == 0 || now_ms - td_drop_last_warn_ms_ >= kDropWarnThrottleMs) {
-        const char* mark = (td_drop_last_warn_ms_ == 0) ? "FIRST" : "BURST";
-        XtLogger::warn_m("RT", "td_event drop {} burst_total={} critical={} (60s throttle)",
-                          mark, td_drop_burst_total_, critical ? 1 : 0);
-        td_drop_last_warn_ms_ = now_ms;
-        td_drop_burst_total_ = 0;
+            ++td_handoff_burst_total_;
+            const int64_t now_ms = steady_now_ms();
+            if (td_handoff_last_warn_ms_ == 0 ||
+                now_ms - td_handoff_last_warn_ms_ >= kDropWarnThrottleMs) {
+                const auto st = td_handoff_.stats();
+                XtLogger::warn_m("RT",
+                    "td_event handoff buffered (store-and-forward) burst={} depth={} "
+                    "redelivered_total={} (60s throttle)",
+                    td_handoff_burst_total_, st.depth, st.redelivered_total);
+                td_handoff_last_warn_ms_ = now_ms;
+                td_handoff_burst_total_ = 0;
+            }
+            return true;
+        }
+        case HandoffOffer::kOverflow:
+        default:
+
+            record_drop();
+            return false;
     }
-    return false;
+}
+
+size_t XtHftChannels::drain_td_handoff_buffer() {
+    return drain_td_handoff_();
+}
+
+size_t XtHftChannels::drain_td_handoff_() {
+    const size_t n = td_handoff_.try_drain([this](XtHftRunnerEvent& e) {
+
+        XtHftRunnerEvent probe = e;
+        return event_loop_->push_td_event(std::move(probe));
+    });
+    if (n > 0 && !td_handoff_.in_store_and_forward()) {
+        XtLogger::info_m("RT", "td_event handoff drained {} event(s), store-and-forward exit", n);
+    }
+    return n;
 }
 
 bool XtHftChannels::enqueue_flow_event(XtHftRunnerEvent ev) {
@@ -200,13 +265,13 @@ void XtHftChannels::publish_channel_event(std::atomic<bool>* ready_flag,
     }
 }
 
-void XtHftChannels::on_md_tick(const XtRawTick& tick) {
+void XtHftChannels::on_md_tick(const XtRawTick& tick, uint64_t capture_ns) {
     assert(shared_state_ && event_loop_);
     shared_state_->md_in_cnt.fetch_add(1, std::memory_order_relaxed);
 
     if (tick.action_date) shared_state_->last_tick_date.store(tick.action_date, std::memory_order_release);
     if (tick.action_time) shared_state_->last_tick_time.store(tick.action_time, std::memory_order_release);
-    if (!event_loop_->try_push_tick(tick)) {
+    if (!event_loop_->try_push_tick(tick, capture_ns)) {
         shared_state_->drop_cnt.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -235,9 +300,10 @@ void XtHftChannels::on_md_ready() {
     publish_channel_event(&shared_state_->md_ready, true, "MD", 0);
 }
 
-void XtHftChannels::on_td_order_update(const XtOrderExecUpdate& upd) {
+void XtHftChannels::on_td_order_update(const XtOrderExecUpdate& upd, XtLatencyEligibility elig) {
 
-    (void)enqueue_td_event(XtHftRunnerEvent::make_order_update(upd));
+    (void)enqueue_td_event(XtHftRunnerEvent::make_order_update(
+        upd, elig == XtLatencyEligibility::kIneligible));
 }
 
 void XtHftChannels::on_td_account_snapshot(const ITradeGateway::AccountSnapshot& snap) {
@@ -245,17 +311,19 @@ void XtHftChannels::on_td_account_snapshot(const ITradeGateway::AccountSnapshot&
 }
 
 void XtHftChannels::on_td_position_snapshot(const std::vector<ITradeGateway::PositionSnapshot>& positions,
-                                             ITradeGateway::TdState td_state) {
+                                             ITradeGateway::TdState td_state,
+                                             bool is_cold_start) {
 
     (void)enqueue_td_event(XtHftRunnerEvent::make_position_snapshot(
-        positions, td_state,  false,
+        positions, td_state, is_cold_start,
         shared_state_->td_session_gen.load(std::memory_order_acquire)));
 }
 
-void XtHftChannels::on_td_trade(const XtTradeRecord& tr, ITradeGateway::TdState td_state) {
+void XtHftChannels::on_td_trade(const XtTradeRecord& tr, ITradeGateway::TdState td_state,
+                                XtLatencyEligibility elig) {
 
-    if (auto* truth = truth_source_.load(std::memory_order_acquire); truth && tr.fee != 0.0) {
-        truth->note_fill_fee_fp(xt_fp::to_fp(tr.fee), tr.fill_ts_us * 1000ULL);
+    if (auto* sink = truth_sink_.load(std::memory_order_acquire); sink && tr.fee != 0.0) {
+        sink->note_fill_fee_fp(xt_fp::to_fp(tr.fee), tr.fill_ts_us * 1000ULL);
     }
 
     std::string route_status;
@@ -264,11 +332,14 @@ void XtHftChannels::on_td_trade(const XtTradeRecord& tr, ITradeGateway::TdState 
             route_status = status;
         }
     }
-    (void)enqueue_td_event(XtHftRunnerEvent::make_trade(tr, td_state, std::move(route_status)));
+    (void)enqueue_td_event(XtHftRunnerEvent::make_trade(
+        tr, td_state, std::move(route_status), elig == XtLatencyEligibility::kIneligible));
 }
 
 void XtHftChannels::on_td_reverse_sync_batch(const std::vector<AliveInflightOrder>& orders,
                                               bool is_cold_start) {
+
+    if (stp_rearm_sink_) stp_rearm_sink_(orders, is_cold_start);
 
     (void)enqueue_td_event(XtHftRunnerEvent::make_reverse_sync_batch(
         std::vector<AliveInflightOrder>(orders), is_cold_start));

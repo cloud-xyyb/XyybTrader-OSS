@@ -1,6 +1,8 @@
 #include "backtest/XtBacktestRiskGuardContext.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "order/XtOrderRuntimeBook.h"
+#include "xt_risk/engine/XtRiskProjection.h"
 #include "xt_config/catalog/XtCommodityCatalog.h"
 #include "XtFixedPoint.h"
 #include "api/ISTPChecker.h"
@@ -21,7 +23,8 @@ XtBacktestRiskGuardContext::XtBacktestRiskGuardContext(const xt_account::Account
 
 XtRiskSnapshot XtBacktestRiskGuardContext::make_snapshot(const xt_core::XtOrder& req,
                                                         const XtRiskEvalContext&  ) const {
-    XtRiskSnapshot snap = account_.snapshot_risk(req.code ? req.code : "");
+    const auto frame = account_.snapshot_account_and_position(req.code ? req.code : "");
+    XtRiskSnapshot snap = xt_risk::project_risk_snapshot(frame.account, frame.position);
 
     snap.limit_up_fp   = limit_up_fp_;
     snap.limit_down_fp = limit_down_fp_;

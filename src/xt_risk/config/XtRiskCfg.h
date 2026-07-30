@@ -55,3 +55,11 @@ struct XtRiskCfg {
 
     std::unordered_map<std::string, double> per_strategy_liquidate_pct_by_sid_string;
 };
+
+inline bool has_active_per_strategy_daily_loss(const XtRiskCfg& cfg) {
+    for (const auto& kv : cfg.per_strategy_daily_loss_pct)
+        if (kv.second > 0.0) return true;
+    for (const auto& kv : cfg.per_strategy_daily_loss_pct_by_sid_string)
+        if (kv.second > 0.0) return true;
+    return false;
+}

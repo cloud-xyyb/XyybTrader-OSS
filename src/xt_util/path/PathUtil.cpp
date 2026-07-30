@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
 
 namespace PathUtil {
 
@@ -132,6 +133,36 @@ std::string filesystem_error_message(const char* action, const std::error_code& 
     return std::string(action) + ": " + ec.message();
 }
 
+void fsync_parent_dir(const std::string& target);
+
+bool create_directories_with_parent_fsync(const std::filesystem::path& dir,
+                                          std::string* err) {
+    std::vector<std::filesystem::path> missing;
+    std::filesystem::path cur = dir;
+    std::error_code ec;
+    while (!cur.empty() && !std::filesystem::exists(cur, ec) && !ec) {
+        missing.push_back(cur);
+        const auto parent = cur.parent_path();
+        if (parent == cur) break;
+        cur = parent;
+    }
+    if (ec) {
+        set_path_error(err, filesystem_error_message("directory exists check failed", ec));
+        return false;
+    }
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        ec.clear();
+        if (std::filesystem::create_directory(*it, ec)) {
+            fsync_parent_dir(it->string());
+        } else if (ec) {
+            set_path_error(err, filesystem_error_message("create directory failed", ec));
+            return false;
+        }
+
+    }
+    return true;
+}
+
 }
 
 bool ensure_directory(const std::string& dir, std::string* err) {
@@ -149,11 +180,7 @@ bool ensure_directory(const std::string& dir, std::string* err) {
         return false;
     }
     if (!exists) {
-        std::filesystem::create_directories(p, ec);
-        if (ec) {
-            set_path_error(err, filesystem_error_message("create directory failed", ec));
-            return false;
-        }
+        if (!create_directories_with_parent_fsync(p, err)) return false;
     }
 
     ec.clear();
@@ -248,8 +275,12 @@ std::string make_tmp_path(const std::string& target) {
 }
 
 void fsync_parent_dir(const std::string& target) {
-    const std::string parent = parent_dir(target);
-    if (parent.empty()) return;
+    if (target.empty()) return;
+    std::string parent = parent_dir(target);
+    if (parent.empty()) {
+
+        parent = (target.front() == '/') ? "/" : ".";
+    }
     int oflags = O_RDONLY;
 #ifdef O_DIRECTORY
     oflags |= O_DIRECTORY;

@@ -387,35 +387,45 @@ bool SafetyStateStore::save(const std::filesystem::path& target, const SafetySta
     return true;
 }
 
-std::optional<SafetyState> SafetyStateStore::load(const std::filesystem::path& source) {
+LoadResult SafetyStateStore::load_checked(const std::filesystem::path& source) {
     std::error_code ec;
-    if (!std::filesystem::exists(source, ec) || ec) return std::nullopt;
+    const bool present = std::filesystem::exists(source, ec);
+
+    if (ec) return {LoadStatus::Invalid, std::nullopt};
+    if (!present) return {LoadStatus::Missing, std::nullopt};
+
     const auto fsz_raw = std::filesystem::file_size(source, ec);
-    if (ec) return std::nullopt;
-    if (fsz_raw < kFileSizeV1) return std::nullopt;
+    if (ec) return {LoadStatus::Invalid, std::nullopt};
+    if (fsz_raw < kFileSizeV1) return {LoadStatus::Invalid, std::nullopt};
     const size_t fsz = static_cast<size_t>(fsz_raw);
 
     std::ifstream in(source, std::ios::binary);
-    if (!in.is_open()) return std::nullopt;
+    if (!in.is_open()) return {LoadStatus::Invalid, std::nullopt};
 
     std::vector<uint8_t> buf(fsz);
     in.read(reinterpret_cast<char*>(buf.data()), fsz);
-    if (static_cast<size_t>(in.gcount()) != fsz) return std::nullopt;
+    if (static_cast<size_t>(in.gcount()) != fsz) return {LoadStatus::Invalid, std::nullopt};
 
-    if (fsz < 8) return std::nullopt;
+    if (fsz < 8) return {LoadStatus::Invalid, std::nullopt};
     const int32_t format = get_i32(&buf[0x04]);
+    std::optional<SafetyState> decoded;
     if (format == kFormatVersionV1 && fsz == kFileSizeV1) {
-        return decode_v1(buf.data());
+        decoded = decode_v1(buf.data());
     } else if (format == kFormatVersionV2) {
-        return decode_v2(buf.data(), fsz);
+        decoded = decode_v2(buf.data(), fsz);
     } else if (format == kFormatVersionV3) {
-        return decode_v3(buf.data(), fsz);
+        decoded = decode_v3(buf.data(), fsz);
     } else if (format == kFormatVersionV4) {
-        return decode_v4(buf.data(), fsz);
+        decoded = decode_v4(buf.data(), fsz);
     } else if (format == kFormatVersionV5) {
-        return decode_v5(buf.data(), fsz);
+        decoded = decode_v5(buf.data(), fsz);
     }
-    return std::nullopt;
+    if (!decoded.has_value()) return {LoadStatus::Invalid, std::nullopt};
+    return {LoadStatus::Ok, std::move(decoded)};
+}
+
+std::optional<SafetyState> SafetyStateStore::load(const std::filesystem::path& source) {
+    return load_checked(source).state;
 }
 
 }

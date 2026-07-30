@@ -28,16 +28,25 @@
 #include "api/IMdGateway.h"
 #include "GatewayFactory.h"
 #include "ctp/md/CTPMdCfg.h"
+#include "ctp/md/CtpMdSessionGate.h"
 #include "binance/md/BinanceMdCfg.h"
 #include "xt_backtest/data/reader/XtBinTickReader.h"
 #include "xt_core/market/XtRawTick.h"
+#include "xt_ipc/XtMdSidecarPath.h"
 #include "xt_ipc/XtMdWireContract.h"
 #include "xt_ipc/XtShmRing.h"
 #include "xt_metrics/XtMdConnectorExporter.h"
 
 namespace {
 
-using Ring = xt_ipc::XtShmRing<XtRawTick>;
+using Ring = xt_ipc::XtShmRing<xt_ipc::XtMdWireSlot>;
+
+int64_t capture_now_ns() {
+
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 std::atomic<bool> g_stop{false};
 std::string g_shm_name;
@@ -66,6 +75,11 @@ struct ConnectorOptions {
     std::vector<std::string> symbols;
     std::string ctp_user;
     std::string ctp_password;
+
+    std::string trading_windows_raw;
+    bool trading_windows_explicit = false;
+    bool disable_trading_window_gate = false;
+    ctp_md_session::TradingWindowGate window_gate;
 
     std::string base_ws_url = "wss://fstream.binance.com";
     std::string base_rest_url = "https://fapi.binance.com";
@@ -104,22 +118,21 @@ std::vector<std::string> split_csv(const std::string& s) {
     return out;
 }
 
-bool acquire_single_instance_lock(const std::string& ring_name,
-                                  const std::string& lock_dir_opt) {
-    std::string dir = lock_dir_opt;
-    if (dir.empty()) {
-        dir = "/run/xyybtrader";
-        if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
-            std::fprintf(stderr,
-                         "xt_md_connector: mkdir %s 失败 (%s)，锁目录回退 /tmp（注意："
-                         "/tmp 可能被 tmpfiles 按龄清理，长跑单实例互斥可能失效）\n",
-                         dir.c_str(), std::strerror(errno));
-            dir = "/tmp";
-        }
+std::string resolve_sidecar_dir(const std::string& lock_dir_opt) {
+    if (!lock_dir_opt.empty()) return lock_dir_opt;
+    std::string dir = "/run/xyybtrader";
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::fprintf(stderr,
+                     "xt_md_connector: mkdir %s 失败 (%s)，sidecar 目录回退 /tmp（注意："
+                     "/tmp 可能被 tmpfiles 按龄清理，长跑单实例互斥可能失效）\n",
+                     dir.c_str(), std::strerror(errno));
+        dir = "/tmp";
     }
-    std::string lock_path = dir + "/xt_md_connector";
-    for (char c : ring_name) lock_path += (c == '/') ? '_' : c;
-    lock_path += ".lock";
+    return dir;
+}
+
+bool acquire_single_instance_lock(const std::string& ring_name, const std::string& sidecar_dir) {
+    const std::string lock_path = xt_ipc::md_sidecar_path(sidecar_dir, ring_name, ".lock");
     int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
     if (fd < 0) {
         std::fprintf(stderr, "xt_md_connector: 打不开锁文件 %s: %s\n",
@@ -136,6 +149,32 @@ bool acquire_single_instance_lock(const std::string& ring_name,
     }
     g_lock_fd = fd;
     return true;
+}
+
+void write_subs_sidecar(const std::string& sidecar_dir, const std::string& ring_name,
+                        const std::vector<std::string>& symbols) {
+    const std::string path = xt_ipc::md_sidecar_path(sidecar_dir, ring_name, ".subs");
+    const std::string tmp = path + ".tmp";
+    int fd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::fprintf(stderr, "xt_md_connector: 写 subs sidecar 失败（open %s: %s），"
+                     "reader 侧 declared⊆subs 校验将降级\n", tmp.c_str(), std::strerror(errno));
+        return;
+    }
+    std::string body;
+    for (const auto& s : symbols) { body += s; body += '\n'; }
+    const ssize_t wn = write(fd, body.data(), body.size());
+    close(fd);
+    if (wn != static_cast<ssize_t>(body.size())) {
+        std::fprintf(stderr, "xt_md_connector: 写 subs sidecar %s 短写，放弃 rename\n", tmp.c_str());
+        unlink(tmp.c_str());
+        return;
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        std::fprintf(stderr, "xt_md_connector: rename subs sidecar %s→%s 失败: %s\n",
+                     tmp.c_str(), path.c_str(), std::strerror(errno));
+        unlink(tmp.c_str());
+    }
 }
 
 bool parse_options(int argc, char** argv, ConnectorOptions& opt) {
@@ -165,6 +204,16 @@ bool parse_options(int argc, char** argv, ConnectorOptions& opt) {
             opt.stale_reconnect_ms = static_cast<uint32_t>(arg_i64(next()));
         else if (a == "--metrics-port") opt.metrics_port = static_cast<uint16_t>(arg_i64(next()));
         else if (a == "--metrics-addr") opt.metrics_addr = next();
+        else if (a == "--trading-windows") {
+
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--trading-windows 需一个值 \"HHMM-HHMM[,...]\"\n");
+                return false;
+            }
+            opt.trading_windows_raw = argv[++i];
+            opt.trading_windows_explicit = true;
+        }
+        else if (a == "--disable-trading-window-gate") opt.disable_trading_window_gate = true;
         else if (a == "--symbols") {
             for (auto& s : split_csv(next())) opt.symbols.push_back(s);
         }
@@ -294,6 +343,38 @@ void cleanup_owner_segment(void* base, uint64_t bytes, const std::string& ring_n
     shm_unlink(ring_name.c_str());
 }
 
+void resolve_trading_window_gate(ConnectorOptions& opt) {
+    if (opt.provider != "ctp") {
+        opt.window_gate.gate_enabled = false;
+        return;
+    }
+    if (opt.disable_trading_window_gate) {
+        opt.window_gate.gate_enabled = false;
+        std::printf("xt_md_connector: trading-window gate disabled（--disable-trading-window-gate），"
+                    "stale watchdog 全时段运行（现行行为）\n");
+        return;
+    }
+    if (opt.trading_windows_explicit) {
+        const auto r = ctp_md_session::parse_trading_windows(opt.trading_windows_raw);
+        if (!r.ok) {
+
+            opt.window_gate.gate_enabled = false;
+            std::fprintf(stderr,
+                         "xt_md_connector: --trading-windows 非法（%s）→ fail-open：gate disabled、"
+                         "stale watchdog 全时段运行\n",
+                         r.error.c_str());
+            return;
+        }
+        opt.window_gate = r.gate;
+        std::printf("xt_md_connector: trading-window gate enabled（%zu 窗，来自 --trading-windows）\n",
+                    opt.window_gate.windows.size());
+        return;
+    }
+    opt.window_gate = ctp_md_session::built_in_ctp_gate();
+    std::printf("xt_md_connector: trading-window gate enabled（内置 CTP 默认窗 "
+                "0900-1015,1030-1130,1330-1500,2100-0230）\n");
+}
+
 void build_live_gateway_config(const ConnectorOptions& opt,
                                IMdGateway::Config& common,
                                gateway_factory::MdProviderCfg& cfg) {
@@ -309,6 +390,7 @@ void build_live_gateway_config(const ConnectorOptions& opt,
         CTPMdCfg ctp;
         ctp.broker = opt.broker;
         ctp.flow_dir = opt.flow_dir;
+        ctp.window_gate = opt.window_gate;
         cfg.extra = ctp;
     }
 #endif
@@ -333,6 +415,11 @@ uint32_t steady_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+int64_t wall_epoch_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 int run_live_source(const ConnectorOptions& opt,
                     Ring& ring,
                     void* base,
@@ -353,7 +440,13 @@ int run_live_source(const ConnectorOptions& opt,
     }
 
     IMdGateway::Callbacks cbs;
-    cbs.on_tick = [&ring](const XtRawTick& tk) { ring.publish(tk); };
+
+    cbs.on_tick = [&ring](const XtRawTick& tk, uint64_t  ) {
+        xt_ipc::XtMdWireSlot slot;
+        slot.capture_ns = capture_now_ns();
+        slot.tick = tk;
+        ring.publish(slot);
+    };
     cbs.on_ready = []() { std::fprintf(stderr, "xt_md_connector: md ready\n"); };
     cbs.on_front = [](bool connected, int reason) {
         std::fprintf(stderr, "xt_md_connector: md front connected=%d reason=%d\n",
@@ -385,6 +478,8 @@ int run_live_source(const ConnectorOptions& opt,
 
     const uint32_t start_ms = steady_ms();
     uint32_t last_health_ms = start_ms;
+
+    int prev_watchdog = -1;
     while (!g_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const uint32_t now_ms = steady_ms();
@@ -394,9 +489,21 @@ int run_live_source(const ConnectorOptions& opt,
             if (!healthy)
                 std::fprintf(stderr, "xt_md_connector: %s md check_health=false（stale/重连中）\n",
                              opt.provider.c_str());
+
+            const bool watchdog_active =
+                ctp_md_session::watchdog_active(opt.window_gate, wall_epoch_ms());
+            if (static_cast<int>(watchdog_active) != prev_watchdog) {
+                std::fprintf(stderr,
+                             "xt_md_connector: %s stale watchdog %s（expected-tick 窗%s）\n",
+                             opt.provider.c_str(),
+                             watchdog_active ? "ARMED" : "SUPPRESSED",
+                             watchdog_active ? "内" : "外");
+                prev_watchdog = static_cast<int>(watchdog_active);
+            }
             if (exporter.is_running()) {
                 exporter.update_ring_head(ring.head());
                 exporter.set_check_health(healthy);
+                exporter.set_stale_watchdog_active(watchdog_active);
                 exporter.set_uptime_seconds(static_cast<double>(now_ms - start_ms) / 1000.0);
             }
         }
@@ -422,7 +529,11 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
         std::fprintf(dump, "price,action_time,bid0,ask0\n");
     }
     auto emit = [&](const XtRawTick& tk) {
-        ring.publish(tk);
+
+        xt_ipc::XtMdWireSlot slot;
+        slot.capture_ns = capture_now_ns();
+        slot.tick = tk;
+        ring.publish(slot);
         if (dump) std::fprintf(dump, "%.6f,%u,%.6f,%.6f\n", tk.price, tk.action_time,
                                tk.bid_prices[0], tk.ask_prices[0]);
         if (opt.interval_us > 0)
@@ -475,12 +586,17 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, opt)) return 2;
     if (!validate_options(opt)) return 2;
 
+    resolve_trading_window_gate(opt);
+
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    if (!acquire_single_instance_lock(opt.ring_name, opt.lock_dir)) return 1;
+    const std::string sidecar_dir = resolve_sidecar_dir(opt.lock_dir);
+    if (!acquire_single_instance_lock(opt.ring_name, sidecar_dir)) return 1;
 
     const OwnerRingMapping mapping = create_owner_ring_segment(opt);
+
+    write_subs_sidecar(sidecar_dir, opt.ring_name, opt.symbols);
     Ring ring(mapping.base);
 
     std::printf("xt_md_connector: ring=%s capacity=%llu segment=%llu bytes slot_stride=%llu epoch=%llu\n",

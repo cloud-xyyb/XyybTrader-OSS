@@ -5,6 +5,7 @@
 #include "xt_config/yaml/ConfigYamlUtil.h"
 #include "xt_util/path/PathUtil.h"
 #include "xt_report/util/XtCsvReportUtil.h"
+#include "xt_util/time/XtTime.h"
 
 #include <algorithm>
 #include <cctype>
@@ -230,6 +231,9 @@ void XtEventStreamSink::on_order_submit(int64_t ts,
     const double qty = order_exec_from_fp(qty_fp);
 
     if (latency_map_.size() >= max_latency_map_entries_) {
+        sweep_terminal_latency_();
+    }
+    if (latency_map_.size() >= max_latency_map_entries_) {
         if (!latency_map_full_logged_) {
             XtLogger::warn_m("REPORT", "latency_map full ({} entries), skipping order {}",
                              max_latency_map_entries_, order_id);
@@ -298,24 +302,71 @@ void XtEventStreamSink::on_order_update(int64_t ts, const XtOrderExecUpdate& u) 
     if (u.status == XtOrderStatus::Filled ||
         u.status == XtOrderStatus::Canceled ||
         u.status == XtOrderStatus::Rejected) {
-        write_latency_if_ready(u.id, it->second, ts);
-        latency_map_.erase(it);
+
+        it->second.terminal_seen = true;
+        it->second.terminal_ts   = ts;
+
+        const bool trade_expected =
+            (u.status == XtOrderStatus::Filled) || (it->second.fill_ts != 0);
+        const bool legs_already_stamped = it->second.match_ts != 0;
+        if (!trade_expected || legs_already_stamped) {
+            write_latency_if_ready(u.id, it->second, ts);
+            latency_map_.erase(it);
+        }
     }
+}
+
+size_t XtEventStreamSink::sweep_terminal_latency_() {
+
+    size_t swept = 0;
+    for (auto it = latency_map_.begin(); it != latency_map_.end();) {
+        if (it->second.terminal_seen) {
+            write_latency_if_ready(it->first, it->second, it->second.terminal_ts);
+            it = latency_map_.erase(it);
+            ++swept;
+        } else {
+            ++it;
+        }
+    }
+    latency_terminal_no_trade_ += swept;
+    return swept;
 }
 
 void XtEventStreamSink::on_trade(int64_t ts, const XtTradeRecord& tr) {
     if (!enabled()) return;
 
+    int64_t visible_packed = 0;
+    if (tr.sim_visible_at_ns >= 0) {
+        uint32_t vis_date = 0, vis_time_ms = 0;
+        xt_time::from_ns(tr.sim_visible_at_ns, vis_date, vis_time_ms);
+        visible_packed = xt_time::packed_ts(vis_date, vis_time_ms);
+    }
+
+    if (auto it = latency_map_.find(tr.order_id); it != latency_map_.end()) {
+        if (it->second.match_ts == 0)
+            it->second.match_ts = xt_time::packed_ts(tr.trade_date, tr.trade_time);
+
+        if (it->second.model_visible_ts == 0 && visible_packed != 0)
+            it->second.model_visible_ts = visible_packed;
+
+        if (it->second.terminal_seen) {
+            write_latency_if_ready(tr.order_id, it->second, it->second.terminal_ts);
+            latency_map_.erase(it);
+        }
+    }
+
     const double qty_d = order_exec_from_fp(tr.qty_fp);
     const double slip_cost = (tr.exec_price - tr.price) * (tr.is_buy ? 1.0 : -1.0) * qty_d;
     int n = std::snprintf(fmt_buf_, sizeof(fmt_buf_),
                           "order_id=%llu,code=%s,side=%s,qty=%.6f"
-                          ",price=%.6f,exec_price=%.6f,fee=%.6f,slippage=%.6f,slippage_cost=%.6f",
+                          ",price=%.6f,exec_price=%.6f,fee=%.6f,slippage=%.6f,slippage_cost=%.6f"
+                          ",visible_at=%lld",
                           static_cast<unsigned long long>(tr.order_id),
                           tr.code.c_str(),
                           tr.is_buy ? "BUY" : "SELL",
                           qty_d, tr.price, tr.exec_price,
-                          tr.fee, tr.slippage, slip_cost);
+                          tr.fee, tr.slippage, slip_cost,
+                          static_cast<long long>(visible_packed));
     append_ring_event(ts, "trade", fmt_buf_, n);
 }
 
@@ -343,9 +394,11 @@ void XtEventStreamSink::write_latency_if_ready(uint64_t order_id, const LatencyI
                       static_cast<unsigned long long>(info.symbol_id));
         code_str = sym_buf;
     }
+
     int n = std::snprintf(fmt_buf_, sizeof(fmt_buf_),
                           "order_id=%llu,code=%s,side=%s"
-                          ",signal_ts=%lld,order_ts=%lld,ack_ts=%lld,fill_ts=%lld,last_status=%s",
+                          ",signal_ts=%lld,order_ts=%lld,ack_ts=%lld,fill_ts=%lld,last_status=%s"
+                          ",match_ts=%lld,visible_at=%lld",
                           static_cast<unsigned long long>(order_id),
                           code_str,
                           info.is_buy ? "BUY" : "SELL",
@@ -353,11 +406,20 @@ void XtEventStreamSink::write_latency_if_ready(uint64_t order_id, const LatencyI
                           static_cast<long long>(info.order_ts),
                           static_cast<long long>(info.ack_ts),
                           static_cast<long long>(info.fill_ts),
-                          order_status_to_str(info.last_status));
+                          order_status_to_str(info.last_status),
+                          static_cast<long long>(info.match_ts),
+                          static_cast<long long>(info.model_visible_ts));
     append_ring_event(ts, "latency", fmt_buf_, n);
 }
 
 void XtEventStreamSink::flush() {
     if (!enabled()) return;
+
+    const size_t swept = sweep_terminal_latency_();
+    if (swept > 0) {
+        XtLogger::info_m("REPORT",
+                         "latency sweep at flush: {} order(s) had a terminal report "
+                         "but no trade", swept);
+    }
     if (full_events_.is_open()) full_events_.flush();
 }

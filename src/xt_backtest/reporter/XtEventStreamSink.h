@@ -58,7 +58,11 @@ private:
         int64_t order_ts = 0;
         int64_t ack_ts = 0;
         int64_t fill_ts = 0;
+        int64_t match_ts = 0;
+        int64_t model_visible_ts = 0;
         XtOrderStatus last_status = XtOrderStatus::Submitted;
+        bool terminal_seen = false;
+        int64_t terminal_ts = 0;
     };
 
     /** @brief 单行事件（event row）。 */
@@ -79,6 +83,8 @@ private:
 
     void compute_micro_metrics(const XtRawTick& t, double& spread, double& depth, double& ofi);
 
+    size_t sweep_terminal_latency_();
+
     void write_latency_if_ready(uint64_t order_id, const LatencyInfo& info, int64_t ts);
 
     Config::TraceMode trace_mode_ = Config::TraceMode::Off;
@@ -94,6 +100,7 @@ private:
     bool full_row_cap_logged_      = false;
     bool full_bytes_cap_logged_    = false;
     bool latency_map_full_logged_  = false;
+    size_t latency_terminal_no_trade_ = 0;
     size_t sys_stats_sample_n_ticks_ = 100;
     size_t sys_stats_call_seq_ = 0;
 

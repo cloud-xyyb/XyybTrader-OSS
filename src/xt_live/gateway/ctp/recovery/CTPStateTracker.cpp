@@ -8,7 +8,6 @@
 #include "xt_util/time/XtTimeParse.h"
 
 #include <algorithm>
-#include <cmath>
 
 namespace {
 
@@ -34,7 +33,8 @@ void CtpStateTracker::register_order(uint64_t local_id,
                                      bool is_close,
                                      bool is_today,
                                      uint64_t submit_begin_us,
-                                     uint64_t submit_end_us) {
+                                     uint64_t submit_end_us,
+                                     int64_t absorbed_watermark_fp) {
     LocalOrderState state;
     state.ref = order_ref ? order_ref : "";
     state.code = code ? code : "";
@@ -46,11 +46,45 @@ void CtpStateTracker::register_order(uint64_t local_id,
     state.is_today = is_today;
     state.submit_begin_us = submit_begin_us;
     state.submit_end_us = submit_end_us;
-    std::lock_guard<std::mutex> guard(mu_);
+    {
+        std::lock_guard<std::mutex> guard(mu_);
 
-    deduper_.forget(local_id);
-    clear_terminal_local(local_id);
-    local_[local_id] = state;
+        deduper_.forget(local_id);
+        clear_terminal_local(local_id);
+        local_[local_id] = state;
+    }
+
+    if (local_id != 0) {
+        xt_live::gateway::XtExecDeliveryLedger::OrderIdentity ident;
+        ident.sid_id =
+            xt_identity::OrderAttributionStore::lookup_order_strategy_sid(local_id).raw();
+        ident.code = state.code;
+        ident.qty_fp = qty_fp;
+        ident.is_buy = is_buy;
+        ident.close_offset =
+            is_close ? (is_today ? XtOffset::CloseToday : XtOffset::CloseYesterday)
+                     : XtOffset::Open;
+        ident.absorbed_watermark_fp = absorbed_watermark_fp;
+        exec_ledger_.register_order(local_id, std::move(ident));
+    }
+}
+
+void CtpStateTracker::rollback_register(uint64_t local_id) {
+    if (local_id == 0) return;
+    {
+        std::lock_guard<std::mutex> guard(mu_);
+        local_.erase(local_id);
+
+        deduper_.forget(local_id);
+    }
+    exec_ledger_.rollback_register(local_id);
+}
+
+void CtpStateTracker::note_submit_end(uint64_t local_id, uint64_t submit_end_us) {
+    std::lock_guard<std::mutex> guard(mu_);
+    auto it = local_.find(local_id);
+    if (it == local_.end()) return;
+    it->second.submit_end_us = submit_end_us;
 }
 
 bool CtpStateTracker::get_order_ref(uint64_t local_id, std::string& out_ref) const {
@@ -96,13 +130,6 @@ bool CtpStateTracker::is_local_terminal(uint64_t local_id) const {
     return terminal_local_ids_.find(local_id) != terminal_local_ids_.end();
 }
 
-void CtpStateTracker::on_recovery_begin() {
-    std::lock_guard<std::mutex> guard(mu_);
-
-    trade_seen_.clear();
-    trade_seen_fifo_.clear();
-}
-
 bool CtpStateTracker::on_order_insert_reject(const CThostFtdcInputOrderField* pInputOrder,
                                              const CThostFtdcRspInfoField* pRspInfo,
                                              uint64_t local_cb_us,
@@ -131,6 +158,7 @@ bool CtpStateTracker::on_order_insert_reject(const CThostFtdcInputOrderField* pI
         apply_local_to_update(state, upd);
     }
     mark_terminal(id, has_state ? &state : nullptr);
+    record_terminal_projection(id, upd, xt_live::gateway::TerminalProvenance::kVenuePush);
     if (!should_emit(id, upd)) return false;
     out = std::move(upd);
     return true;
@@ -174,6 +202,7 @@ bool CtpStateTracker::on_order(const CThostFtdcOrderField* pOrder,
     bool newly_terminal = false;
     if (order_status_is_final(upd.status)) {
         newly_terminal = mark_terminal(id, has_state ? &state : nullptr);
+        record_terminal_projection(id, upd, xt_live::gateway::TerminalProvenance::kVenuePush);
     }
     if (!should_emit(id, upd)) {
 
@@ -189,7 +218,10 @@ bool CtpStateTracker::on_order(const CThostFtdcOrderField* pOrder,
 
 bool CtpStateTracker::on_trade(const CThostFtdcTradeField* pTrade,
                                uint64_t local_cb_us,
-                               XtTradeRecord& out) {
+                               XtTradeRecord& out,
+                               xt_live::gateway::FillSource fill_source,
+                               bool absorbed,
+                               uint32_t query_gen) {
     if (!pTrade) return false;
     const uint64_t id = parse_local_id(pTrade->OrderRef);
     XtTradeRecord tr;
@@ -230,23 +262,31 @@ bool CtpStateTracker::on_trade(const CThostFtdcTradeField* pTrade,
     tkey.append(pTrade->OrderSysID);
     tkey.push_back('|');
     tkey.append(pTrade->OrderRef);
-    {
-        std::lock_guard<std::mutex> guard(mu_);
-        if (trade_seen_.find(tkey) != trade_seen_.end()) {
-            return false;
-        }
-        trade_seen_.insert(tkey);
-        trade_seen_fifo_.push_back(tkey);
 
-        constexpr size_t kTradeSeenCap = 200000;
-        while (trade_seen_fifo_.size() > kTradeSeenCap) {
-            const std::string& old = trade_seen_fifo_.front();
-            trade_seen_.erase(old);
-            trade_seen_fifo_.pop_front();
+    {
+        xt_live::gateway::XtExecDeliveryLedger::FillArgs fill;
+        fill.fill_key = std::move(tkey);
+        fill.qty_fp = tr.qty_fp;
+        fill.source = fill_source;
+        fill.absorbed = absorbed;
+        fill.query_gen = query_gen;
+        if (!exec_ledger_.record_fill(id, std::move(fill))) return false;
+    }
+
+    if (!absorbed && fill_source == xt_live::gateway::FillSource::kQueryReplay &&
+        id != 0) {
+        xt_live::gateway::XtExecDeliveryLedger::ExecOrderRecord rec;
+        if (exec_ledger_.get_record(id, rec) && rec.absorbed_watermark_fp > 0) {
+            int64_t absorbed_sum = 0;
+            for (const auto& f : rec.fills) {
+                if (f.absorbed) absorbed_sum += f.qty_fp;
+            }
+            if (absorbed_sum < rec.absorbed_watermark_fp) {
+                watermark_breach_total_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     out = std::move(tr);
-    accumulate_local_trade_qty(id, order_exec_from_fp(out.qty_fp));
     LocalOrderState state;
     if (try_get_local(id, state)) apply_local_to_trade(state, out);
     return true;
@@ -270,20 +310,61 @@ bool CtpStateTracker::on_cancel_action_error(const char* order_ref,
     upd.is_buy = state.is_buy;
     upd.price_fp = order_exec_to_fp(state.price);
     upd.qty_fp = state.qty_fp;
-    const double qty = xt_fp::from_fp(state.qty_fp);
-    const double filled = std::min(std::max(0.0, state.traded_qty), qty);
-    const double remaining = std::max(0.0, qty - filled);
-    upd.filled_fp = order_exec_to_fp(filled);
-    upd.leaves_fp = order_exec_to_fp(remaining);
+
+    const int64_t filled_fp =
+        std::min(std::max<int64_t>(0, ledger_effective_filled_fp_(id)), state.qty_fp);
+    const int64_t leaves_fp = state.qty_fp - filled_fp;
+    upd.filled_fp = filled_fp;
+    upd.leaves_fp = leaves_fp;
     upd.last_fill_fp = 0;
     upd.close_offset = state.is_close ? (state.is_today ? XtOffset::CloseToday : XtOffset::CloseYesterday)
                                       : XtOffset::Open;
     upd.local_cb_us = local_cb_us;
-    upd.status = (remaining <= 1e-8) ? XtOrderStatus::Filled : XtOrderStatus::Canceled;
+    upd.status = (state.qty_fp > 0 && leaves_fp <= 0) ? XtOrderStatus::Filled
+                                                      : XtOrderStatus::Canceled;
     apply_local_to_update(state, upd);
 
     mark_terminal(id, &state);
+    record_terminal_projection(id, upd,
+                               xt_live::gateway::TerminalProvenance::kSynthCancelNoTarget);
     if (!should_emit(id, upd)) return false;
+    out = std::move(upd);
+    return true;
+}
+
+bool CtpStateTracker::make_cum_filled_completion(uint64_t local_id,
+                                                 uint64_t local_cb_us,
+                                                 XtOrderExecUpdate& out) {
+    if (local_id == 0) return false;
+    {
+
+        xt_live::gateway::XtExecDeliveryLedger::TerminalRecord existing;
+        if (exec_ledger_.terminal_record(local_id, existing)) return false;
+    }
+    LocalOrderState state;
+    if (!try_get_local(local_id, state)) return false;
+    if (state.qty_fp <= 0) return false;
+
+    if (ledger_effective_filled_fp_(local_id) < state.qty_fp) return false;
+
+    XtOrderExecUpdate upd;
+    upd.id = local_id;
+    upd.sid_id = xt_identity::OrderAttributionStore::lookup_order_strategy_sid(local_id).raw();
+    upd.is_buy = state.is_buy;
+    upd.status = XtOrderStatus::Filled;
+    upd.price_fp = order_exec_to_fp(state.price);
+    upd.qty_fp = state.qty_fp;
+    upd.filled_fp = state.qty_fp;
+    upd.leaves_fp = 0;
+    upd.last_fill_fp = 0;
+    upd.local_cb_us = local_cb_us;
+    apply_local_to_update(state, upd);
+
+    mark_terminal(local_id, &state);
+    record_terminal_projection(local_id, upd,
+                               xt_live::gateway::TerminalProvenance::kSynthCumFilled);
+    synth_cum_filled_total_.fetch_add(1, std::memory_order_relaxed);
+    if (!should_emit(local_id, upd)) return false;
     out = std::move(upd);
     return true;
 }
@@ -316,17 +397,23 @@ void CtpStateTracker::apply_local_to_trade(const LocalOrderState& state, XtTrade
 
 void CtpStateTracker::update_local_cancel_fields(uint64_t local_id, const CThostFtdcOrderField* pOrder) {
     if (local_id == 0 || !pOrder) return;
-    std::lock_guard<std::mutex> guard(mu_);
-    auto it = local_.find(local_id);
-    if (it == local_.end()) return;
-    LocalOrderState& state = it->second;
-    if (pOrder->OrderRef[0] != '\0') state.ref = pOrder->OrderRef;
-    if (pOrder->InstrumentID[0] != '\0') state.code = pOrder->InstrumentID;
-    if (pOrder->ExchangeID[0] != '\0') state.exchange_id = pOrder->ExchangeID;
-    if (pOrder->OrderSysID[0] != '\0') state.order_sys_id = pOrder->OrderSysID;
+    std::string venue_key;
+    {
+        std::lock_guard<std::mutex> guard(mu_);
+        auto it = local_.find(local_id);
+        if (it == local_.end()) return;
+        LocalOrderState& state = it->second;
+        if (pOrder->OrderRef[0] != '\0') state.ref = pOrder->OrderRef;
+        if (pOrder->InstrumentID[0] != '\0') state.code = pOrder->InstrumentID;
+        if (pOrder->ExchangeID[0] != '\0') state.exchange_id = pOrder->ExchangeID;
+        if (pOrder->OrderSysID[0] != '\0') state.order_sys_id = pOrder->OrderSysID;
 
-    if (pOrder->FrontID != 0) state.front_id = pOrder->FrontID;
-    if (pOrder->SessionID != 0) state.session_id = pOrder->SessionID;
+        if (pOrder->FrontID != 0) state.front_id = pOrder->FrontID;
+        if (pOrder->SessionID != 0) state.session_id = pOrder->SessionID;
+        venue_key = build_terminal_order_key(state.exchange_id, state.order_sys_id);
+    }
+
+    if (!venue_key.empty()) exec_ledger_.set_venue_key(local_id, venue_key);
 }
 
 void CtpStateTracker::backfill_cancel_routing(uint64_t local_id,
@@ -335,38 +422,46 @@ void CtpStateTracker::backfill_cancel_routing(uint64_t local_id,
                                               int front_id,
                                               int session_id) {
     if (local_id == 0) return;
-    std::lock_guard<std::mutex> guard(mu_);
-    auto it = local_.find(local_id);
-    if (it == local_.end()) return;
-    LocalOrderState& state = it->second;
-    if (!exchange_id.empty()) state.exchange_id = exchange_id;
-    if (!order_sys_id.empty()) state.order_sys_id = order_sys_id;
-    if (front_id != 0) state.front_id = front_id;
-    if (session_id != 0) state.session_id = session_id;
+    std::string venue_key;
+    {
+        std::lock_guard<std::mutex> guard(mu_);
+        auto it = local_.find(local_id);
+        if (it == local_.end()) return;
+        LocalOrderState& state = it->second;
+        if (!exchange_id.empty()) state.exchange_id = exchange_id;
+        if (!order_sys_id.empty()) state.order_sys_id = order_sys_id;
+        if (front_id != 0) state.front_id = front_id;
+        if (session_id != 0) state.session_id = session_id;
+        venue_key = build_terminal_order_key(state.exchange_id, state.order_sys_id);
+    }
+
+    if (!venue_key.empty()) exec_ledger_.set_venue_key(local_id, venue_key);
 }
 
-void CtpStateTracker::accumulate_local_trade_qty(uint64_t local_id, double qty) {
-    if (local_id == 0 || !std::isfinite(qty) || qty <= 0.0) return;
-    std::lock_guard<std::mutex> guard(mu_);
-    auto it = local_.find(local_id);
-    if (it == local_.end()) return;
-    it->second.traded_qty += qty;
+int64_t CtpStateTracker::ledger_effective_filled_fp_(uint64_t local_id) const {
+    xt_live::gateway::XtExecDeliveryLedger::ExecOrderRecord rec;
+    if (!exec_ledger_.get_record(local_id, rec)) return 0;
+
+    int64_t filled = rec.absorbed_watermark_fp;
+    for (const auto& f : rec.fills) {
+        if (!f.absorbed) filled += f.qty_fp;
+    }
+    return filled;
+}
+
+uint64_t CtpStateTracker::fill_epoch_us(const CThostFtdcTradeField* pTrade) {
+    if (!pTrade) return 0;
+
+    const uint32_t date = XtTimeParse::parse_fixed_date_yyyymmdd(pTrade->TradeDate);
+    const uint32_t time_ms = XtTimeParse::parse_fixed_time_hms_ms(pTrade->TradeTime, 0);
+    return xt_time::cst_wall_to_epoch_us(date, time_ms);
 }
 
 bool CtpStateTracker::should_emit(uint64_t local_id, const XtOrderExecUpdate& upd) {
     if (local_id == 0) return true;
     std::lock_guard<std::mutex> guard(mu_);
 
-    if (!deduper_.should_emit(local_id, upd, ctp_util::status_rank)) {
-        return false;
-    }
-    if (order_lifecycle::is_final_update(upd)) {
-        auto lit = local_.find(local_id);
-        if (lit != local_.end()) {
-            local_.erase(lit);
-        }
-    }
-    return true;
+    return deduper_.should_emit(local_id, upd, ctp_util::status_rank);
 }
 
 std::string CtpStateTracker::build_terminal_order_key(const std::string& exchange_id,
@@ -390,6 +485,8 @@ bool CtpStateTracker::mark_terminal(uint64_t local_id, const LocalOrderState* st
         while (terminal_local_fifo_.size() > kTerminalLocalCap) {
             const uint64_t old = terminal_local_fifo_.front();
             terminal_local_ids_.erase(old);
+
+            local_.erase(old);
             terminal_local_fifo_.pop_front();
         }
     }
@@ -403,7 +500,6 @@ bool CtpStateTracker::mark_terminal(uint64_t local_id, const LocalOrderState* st
     if (it != local_.end()) {
         const std::string key = build_terminal_order_key(it->second.exchange_id, it->second.order_sys_id);
         remember_terminal_key_unlocked(key);
-        local_.erase(it);
     }
     return newly_terminal;
 }
@@ -427,5 +523,27 @@ void CtpStateTracker::remember_terminal_key_unlocked(const std::string& key) {
         const std::string& old = terminal_order_key_fifo_.front();
         terminal_order_keys_.erase(old);
         terminal_order_key_fifo_.pop_front();
+    }
+}
+
+void CtpStateTracker::record_terminal_projection(uint64_t local_id,
+                                                 const XtOrderExecUpdate& upd,
+                                                 xt_live::gateway::TerminalProvenance prov) {
+    if (local_id == 0) return;
+    xt_live::gateway::XtExecDeliveryLedger::TerminalRecord term;
+    term.status = upd.status;
+    term.filled_fp = upd.filled_fp;
+    term.prov = prov;
+    term.seen_us = upd.local_cb_us;
+
+    if (exec_ledger_.record_terminal(local_id, term)) return;
+
+    xt_live::gateway::XtExecDeliveryLedger::TerminalRecord existing;
+    if (exec_ledger_.terminal_record(local_id, existing) &&
+        existing.status == XtOrderStatus::Filled &&
+        existing.prov == xt_live::gateway::TerminalProvenance::kSynthCumFilled &&
+        upd.status != XtOrderStatus::Filled &&
+        upd.filled_fp < upd.qty_fp) {
+        cum_filled_conflict_total_.fetch_add(1, std::memory_order_relaxed);
     }
 }

@@ -72,7 +72,7 @@ public:
                         int64_t price_fp, const char* tag, XtOffset offset,
                         uint32_t date, uint32_t time_ms);
 
-    int flush_session_end(uint32_t date, uint32_t time_ms);
+    int flush_session_end(uint32_t date, uint32_t time_ms, bool allow_market_fill = true);
 
     void update_price(const char* code, int64_t price_fp) {
         last_price_fp_[code] = price_fp;
@@ -132,7 +132,9 @@ private:
                   uint64_t order_id = 0);
 
     void enqueue_delayed_trade_(const XtTradeRecord& tr, int64_t now_ns);
-    void enqueue_delayed_update_(const PendingOrderUpdate& upd, int64_t now_ns);
+
+    void enqueue_delayed_update_(const PendingOrderUpdate& upd, int64_t now_ns,
+                                 int64_t latency_ns);
     int  promote_due_(int64_t now_ns);
     void recompute_earliest_due_();
 

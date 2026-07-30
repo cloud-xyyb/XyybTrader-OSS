@@ -76,7 +76,8 @@ void XtBacktestDailyBreakdown::on_day_account(uint32_t trading_date, double equi
 
 bool XtBacktestDailyBreakdown::write_json(const std::string& out_path,
                                           uint32_t cfg_start_date,
-                                          uint32_t cfg_end_date) const {
+                                          uint32_t cfg_end_date,
+                                          bool shared_execution_counters) const {
     if (daily_stats_.empty()) return true;
 
     std::error_code ec;
@@ -94,23 +95,20 @@ bool XtBacktestDailyBreakdown::write_json(const std::string& out_path,
     out << "  \"start_date\": " << cfg_start_date << ",\n";
     out << "  \"end_date\": " << cfg_end_date << ",\n";
     out << "  \"days\": " << daily_stats_.size() << ",\n";
+
+    if (shared_execution_counters) {
+        out << "  \"shared_execution_counters\": true,\n";
+    }
     out << "  \"breakdown\": [\n";
 
     size_t i = 0;
     for (const auto& [date, st] : daily_stats_) {
-        const double fill_rate = st.submit_count > 0
-            ? static_cast<double>(st.fill_count) / static_cast<double>(st.submit_count)
-            : 0.0;
-        char fill_rate_buf[32];
-        std::snprintf(fill_rate_buf, sizeof(fill_rate_buf), "%.6f", fill_rate);
-
         out << "    {";
         out << "\"date\": " << date;
         out << ", \"ticks\": " << st.tick_count;
         out << ", \"submits\": " << st.submit_count;
         out << ", \"fills\": " << st.fill_count;
         out << ", \"risk_rejects\": " << st.risk_reject_count;
-        out << ", \"fill_rate\": " << fill_rate_buf;
         if (!st.rejects_by_reason.empty()) {
             out << ", \"risk_rejects_by_reason\": {";
             size_t j = 0;

@@ -219,6 +219,10 @@ public:
         return conditional_orders_enabled_ && !stop_book_.empty();
     }
 
+    [[nodiscard]] bool conditional_orders_enabled() const noexcept {
+        return conditional_orders_enabled_;
+    }
+
     void on_order(const XtOrderExecUpdate& upd) override;
 
     void on_fill(const XtFillEvent& fill) override;

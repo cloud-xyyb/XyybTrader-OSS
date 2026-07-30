@@ -1,7 +1,7 @@
 log:
   level: info
   console: true
-  file: var/logs/ct.log
+  file: var/logs/xt.log
   max_size: 52428800
   max_files: 10
   queue_size: 8192

@@ -102,6 +102,11 @@ public:
         log_impl_mod_throttle(LogLevel::Warn, module, key, fmt, args...);
     }
 
+    template <typename... Args>
+    static void error_mt(const char* module, const char* key, const char* fmt, const Args&... args) {
+        log_impl_mod_throttle(LogLevel::Error, module, key, fmt, args...);
+    }
+
     static void shutdown();
 
 private:

@@ -2,6 +2,9 @@
 
 #include "xt_util/string/XtCStringUtil.h"
 
+#include <atomic>
+#include <climits>
+
 namespace xt_core::tap {
 
 namespace {
@@ -11,6 +14,8 @@ constexpr size_t kReasonCap = 48;
 thread_local uint64_t tls_current_tick_ts_ns = 0;
 thread_local char     tls_reason[kReasonCap] = {};
 thread_local uint64_t tls_intent_trace_id = 0;
+
+std::atomic<int64_t> g_event_minus_steady_ns{INT64_MIN};
 
 }
 
@@ -36,6 +41,25 @@ void clear_next_order_reason() noexcept {
 
 uint64_t current_intent_trace_id() noexcept {
     return tls_intent_trace_id;
+}
+
+void publish_event_clock_anchor(int64_t event_ns, int64_t steady_now_ns) noexcept {
+    const __int128 off = static_cast<__int128>(event_ns) - steady_now_ns;
+    if (off > INT64_MAX || off <= INT64_MIN) return;
+    g_event_minus_steady_ns.store(static_cast<int64_t>(off), std::memory_order_release);
+}
+
+bool project_event_ts_ns(int64_t steady_now_ns, int64_t& out_event_ts_ns) noexcept {
+    const int64_t off = g_event_minus_steady_ns.load(std::memory_order_acquire);
+    if (off == INT64_MIN) return false;
+    const __int128 v = static_cast<__int128>(steady_now_ns) + off;
+    if (v > INT64_MAX || v < 0) return false;
+    out_event_ts_ns = static_cast<int64_t>(v);
+    return true;
+}
+
+void clear_event_clock_anchor() noexcept {
+    g_event_minus_steady_ns.store(INT64_MIN, std::memory_order_release);
 }
 
 ScopedIntentTraceId::ScopedIntentTraceId(uint64_t trace_id) noexcept

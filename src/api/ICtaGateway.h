@@ -1,10 +1,13 @@
 #pragma once
 
 #include "api/IExecutionGateway.h"
+#include "api/XtOrderTerminalRecord.h"
 #include "xt_core/order/XtTradeRecord.h"
 #include "xt_core/order/XtOrderTypes.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace xt_runtime {
@@ -24,13 +27,17 @@ public:
 
     virtual void advance_clock(uint32_t  , uint32_t  ) {}
 
-    virtual int flush_session(uint32_t  , uint32_t  ) {
+    virtual int flush_session(uint32_t  , uint32_t  ,
+                              bool   = true) {
         return 0;
     }
 
     [[nodiscard]] virtual size_t active_orders() const { return 0; }
 
-    virtual void notify_order_terminal(const char*  , bool  ) {}
+    virtual void notify_order_terminal(uint64_t  ) {}
+
+    virtual void rearm_active_order(const std::string&  , uint64_t  ,
+                                    bool  , int64_t  ) {}
 
     virtual void record_order_terminal(XtOrderStatus  ) {}
 
@@ -39,9 +46,14 @@ public:
     virtual size_t drain_fills(uint32_t  , uint32_t  ,
                                std::vector<XtTradeRecord>&  ) { return 0; }
 
-    virtual size_t drain_all_fills(std::vector<XtTradeRecord>&  ) { return 0; }
-
     virtual size_t drain_order_updates(std::vector<XtOrderExecUpdate>&  ) { return 0; }
+
+    [[nodiscard]] virtual bool is_order_terminal(uint64_t  ) const { return false; }
+
+    [[nodiscard]] virtual bool lookup_terminal(uint64_t  ,
+                                               XtOrderTerminalRecord&  ) const {
+        return false;
+    }
 };
 
 }

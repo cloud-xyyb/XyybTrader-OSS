@@ -26,6 +26,47 @@ constexpr int64_t days_from_civil(int y, unsigned m, unsigned d) noexcept {
     return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 
+constexpr void civil_from_days(int64_t z, int& y, unsigned& m, unsigned& d) noexcept {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    y = static_cast<int>(yoe) + static_cast<int>(era) * 400;
+    const unsigned doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    const unsigned mp  = (5u * doy + 2u) / 153u;
+    d = doy - (153u * mp + 2u) / 5u + 1u;
+    m = mp + (mp < 10u ? 3u : -9u);
+    y += (m <= 2);
+}
+
+constexpr int64_t days_from_yyyymmdd(uint32_t yyyymmdd) noexcept {
+    return days_from_civil(static_cast<int>(yyyymmdd / 10000u),
+                           (yyyymmdd / 100u) % 100u,
+                           yyyymmdd % 100u);
+}
+
+constexpr uint32_t yyyymmdd_from_days(int64_t z) noexcept {
+    int y = 0;
+    unsigned m = 0, d = 0;
+    civil_from_days(z, y, m, d);
+    return static_cast<uint32_t>(y) * 10000u + m * 100u + d;
+}
+
+constexpr uint32_t yyyymmdd_add_days(uint32_t yyyymmdd, int64_t days) noexcept {
+    return yyyymmdd_from_days(days_from_yyyymmdd(yyyymmdd) + days);
+}
+
+constexpr int64_t yyyymmdd_diff_days(uint32_t a, uint32_t b) noexcept {
+    return days_from_yyyymmdd(b) - days_from_yyyymmdd(a);
+}
+
+constexpr bool is_valid_yyyymmdd(uint32_t yyyymmdd) noexcept {
+    const unsigned m = (yyyymmdd / 100u) % 100u;
+    const unsigned d = yyyymmdd % 100u;
+    if (m < 1u || m > 12u || d < 1u || d > 31u) return false;
+    return yyyymmdd_from_days(days_from_yyyymmdd(yyyymmdd)) == yyyymmdd;
+}
+
 int64_t to_ns(uint32_t date, uint32_t time_ms) noexcept;
 
 void from_ns(int64_t ns, uint32_t& out_date, uint32_t& out_time_ms) noexcept;

@@ -47,3 +47,7 @@ target_link_libraries(xt_metrics PUBLIC
     prometheus-cpp::core
     prometheus-cpp::pull
 )
+# XtLogger 仅在 .cpp 内使用（PnL state quarantine 的 error 日志）；PRIVATE 不外泄给 consumer。
+target_link_libraries(xt_metrics PRIVATE
+    xt_logger
+)

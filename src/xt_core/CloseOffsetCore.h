@@ -8,11 +8,13 @@
 #include "xt_core/order/XtOffset.h"
 
 /// @file
-/// @brief 平仓今昨路由与单笔限额切片 helper。
+/// @brief 期货平仓今昨路由与单笔限额切片。
 ///
-/// 本文件提供 venue-neutral 的 close slice 计算入口：
-/// - `resolve_close_slices()` 负责按合约/今昨可平量生成平仓切片
-/// - `chunk_slices_by_max_qty()` 负责按单笔限额拆分
+/// SHFE/INE 等交易所把持仓拆成平今、平昨两个独立仓位，平仓单必须显式指定
+/// 今昨方向；同一次平仓意图还可能超过单笔最大委托量，需要拆成多笔发送。
+/// 本文件把这两步收敛成两个纯函数：`resolve_close_slices()` 决定今昨怎么分配，
+/// `chunk_slices_by_max_qty()` 把分配结果按上限切片。只做数量与方向的计算，
+/// 不涉及下单、风控或账户状态；BT 和 live 网关共用同一份实现。
 
 namespace close_offset_core {
 

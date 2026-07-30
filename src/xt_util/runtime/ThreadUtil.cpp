@@ -1,6 +1,8 @@
 #include "xt_util/runtime/ThreadUtil.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
@@ -8,6 +10,7 @@
 #include <sys/mman.h>
 #endif
 #if defined(__linux__)
+#include <dirent.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -46,19 +49,40 @@ bool mlock_process_memory() {
 #endif
 }
 
+int numa_node_of_cpu(int cpu_id, const char* cpu_sysfs_root) {
+#if defined(__linux__)
+    if (cpu_id < 0 || cpu_sysfs_root == nullptr) return -1;
+    char dir_path[192];
+    const int n =
+        std::snprintf(dir_path, sizeof(dir_path), "%s/cpu%d", cpu_sysfs_root, cpu_id);
+    if (n < 0 || n >= static_cast<int>(sizeof(dir_path))) return -1;
+    DIR* d = ::opendir(dir_path);
+    if (!d) return -1;
+    int node = -1;
+    while (const dirent* e = ::readdir(d)) {
+
+        if (std::strncmp(e->d_name, "node", 4) != 0) continue;
+        char* endp = nullptr;
+        const long v = std::strtol(e->d_name + 4, &endp, 10);
+        if (endp == e->d_name + 4 || *endp != '\0' || v < 0) continue;
+        node = static_cast<int>(v);
+        break;
+    }
+    ::closedir(d);
+    return node;
+#else
+    (void)cpu_id;
+    (void)cpu_sysfs_root;
+    return -1;
+#endif
+}
+
 bool bind_current_thread_numa(int cpu_id) {
 #if defined(__linux__)
     if (cpu_id < 0) return true;
+    const int node = numa_node_of_cpu(cpu_id);
 
-    char path[128];
-    std::snprintf(path, sizeof(path),
-                  "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu_id);
-    FILE* f = std::fopen(path, "r");
-    if (!f) return false;
-    int node = -1;
-    if (std::fscanf(f, "%d", &node) != 1) node = -1;
-    std::fclose(f);
-    if (node < 0) return false;
+    if (node < 0 || node >= static_cast<int>(sizeof(unsigned long) * 8)) return false;
 
     constexpr int MPOL_BIND = 2;
     constexpr int MPOL_F_STATIC_NODES = (1 << 15);

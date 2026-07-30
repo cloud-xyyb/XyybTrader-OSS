@@ -3,8 +3,9 @@
 /// @file
 /// @brief 从共享内存 ring 读行情的 IMdGateway 实现。
 ///
-/// 把外部 connector 发布的 `XtShmRing<XtRawTick>` 包成 `IMdGateway`：
-/// reader 线程 attach/validate 共享内存段，按本进程订阅集过滤后触发 `on_tick`；
+/// 把外部 connector 发布的 `XtShmRing<XtMdWireSlot>` 包成 `IMdGateway`：
+/// reader 线程 attach/validate 共享内存段，按本进程订阅集过滤后触发 `on_tick`
+/// （随 tick 传 connector stamp 的 capture_ns）；
 /// 就绪、断连和健康检查复用 `IMdGateway` 的 on_ready/on_front/check_health 语义。
 ///
 /// 线程归属：reader 线程是 `on_tick`/`on_ready`/`on_front` 的触发线程，
@@ -14,11 +15,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
 #include <unordered_set>
 
 #include "api/IMdGateway.h"
+
+struct XtRawTick;
 
 namespace xt_ipc {
 
@@ -54,7 +58,32 @@ public:
 
     void bind_callbacks(Callbacks callbacks) override;
 
+    void set_md_tap(std::function<void(const XtRawTick&)> tap);
+
     bool check_health(uint32_t now_ms) override;
+
+    uint64_t subs_checks_total() const noexcept {
+        return subs_checks_total_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t subs_mismatch_total() const noexcept {
+        return subs_mismatch_total_.load(std::memory_order_relaxed);
+    }
+
+    uint32_t attach_failing() const noexcept {
+        return attach_failing_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t attach_fail_count() const noexcept {
+        return attach_fail_count_.load(std::memory_order_relaxed);
+    }
+
+    const char* attach_last_reason() const noexcept {
+        const char* p = attach_last_reason_.load(std::memory_order_relaxed);
+        return p ? p : "";
+    }
+
+    const std::string& ring_name() const noexcept { return ring_name_; }
 
 private:
 
@@ -70,11 +99,20 @@ private:
 
     void mark_ready();
 
+    void validate_declared_subset_();
+
+    bool read_subs_sidecar_(std::unordered_set<std::string>& out) const;
+
+    void note_attach_fail_(const char* reason);
+
+    void note_attach_ok_();
+
     const std::string ring_name_;
     const std::unordered_set<std::string> declared_;
     const uint32_t stale_md_ms_;
 
     Callbacks cbs_;
+    std::function<void(const XtRawTick&)> md_tap_;
 
     void* mmap_base_ = nullptr;
     uint64_t mapped_bytes_ = 0;
@@ -88,6 +126,18 @@ private:
 
     std::atomic<uint32_t> last_head_advance_ms_{0};
     std::atomic<bool> health_disconnected_{false};
+
+    std::atomic<uint64_t> subs_checks_total_{0};
+    std::atomic<uint64_t> subs_mismatch_total_{0};
+    bool subs_missing_warned_ = false;
+
+    std::atomic<uint32_t> attach_failing_{0};
+    std::atomic<uint64_t> attach_fail_count_{0};
+    std::atomic<const char*> attach_last_reason_{nullptr};
+
+    const char* attach_log_last_reason_ = nullptr;
+    uint32_t attach_log_last_ms_ = 0;
+    bool attach_logged_once_ = false;
 };
 
 }

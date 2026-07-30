@@ -7,11 +7,11 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "api/IHftGateway.h"
 #include "api/IHftEngineObserver.h"
-#include "api/IKillSwitchSink.h"
 #include "api/IOrderIdTranslator.h"
 #include "api/ITradeGateway.h"
 #include "xt_core/market/XtL2MarketStructs.h"
@@ -21,13 +21,13 @@
 #include "xt_strategy_engine/view/XtRuntimeView.h"
 #include "xt_strategy_engine/IStrategyExecSink.h"
 #include "xt_strategy_engine/XtStrategyContext.h"
-#include "xt_strategy_engine/XtStrategyInitConfig.h"
 #include "xt_strategy_engine/XtDeclaredSymbolRegistry.h"
 #include "xt_core/market/XtRollEngine.h"
 #include "xt_core/session/XtSessionFilter.h"
 #include "xt_core/session/XtTradingDateInfer.h"
 #include "HftLifecycleTelemetry.h"
 #include "XtHftEngineStats.h"
+#include "XtHftReplayExt.h"
 
 struct AliveInflightOrder;
 
@@ -37,10 +37,6 @@ class AccountStateStore;
 
 class XtCommodityCatalog;
 class XtStrategyBase;
-
-namespace xt_backtest::hft {
-struct XtHftBacktestExtConfig;
-}
 
 namespace xt_runtime::order {
 class XtOrderRuntimeBook;
@@ -57,36 +53,7 @@ class XtOrderRuntimeBook;
 class XtHftEngine {
 public:
 
-    /// @brief 配置 HFT engine 的 gateway、runtime view 和 domain 依赖。
-    ///
-    /// gateway 与 view 为必填；其余指针为空时，engine 跳过依赖该组件的路径。
-    /// 执行回调 sink 不走 Config；启动期统一经 `set_exec_sinks()` 注入。
-    struct Config {
-        xt_runtime::IHftGateway* gateway = nullptr;
-        xt_strategy_engine::XtRuntimeView* view = nullptr;
-        xt_core::Config session = {};
-        XtRollEngine::Config roll = {};
-        std::string strategy_id;
-        size_t history_ticks = 2048;
-        size_t history_bars = 512;
-        XtStrategyContext::IParamPort* param_port = nullptr;
-        const XtStrategyInitConfig* init_config = nullptr;
-
-        std::function<void(uint64_t  )> on_params_extra;
-
-        xt_account::AccountStateStore* account_store = nullptr;
-        xt_runtime::order::XtOrderRuntimeBook* order_book = nullptr;
-        const XtCommodityCatalog* catalog = nullptr;
-        xt_runtime::IOrderIdTranslator* order_id_translator = nullptr;
-
-        xt_strategy_engine::XtDeclaredSymbolRegistry* declared_registry = nullptr;
-
-        xt_runtime::IKillSwitchSink* kill_switch_sink = nullptr;
-
-        bool strict_unmatched_routing = false;
-
-        bool conditional_orders_enabled = false;
-    };
+    using ReplayExt = xt_engine::hft::XtHftReplayExt;
 
     using PositionLifecycleEvent    = xt_engine::hft::PositionLifecycleEvent;
     using PositionLifecycleCallback = xt_engine::hft::PositionLifecycleCallback;
@@ -107,7 +74,88 @@ public:
                                                       int64_t after_avg_fp,
                                                       int64_t realized_fp)>;
 
-    explicit XtHftEngine(XtStrategyBase* stra, const Config& cfg);
+    enum class UnmatchedRoutingPolicy {
+        WarnAndDrop,
+        DropAndAlert,
+        FailFast,
+    };
+
+    /// @brief engine 的 non-owning 依赖（required + optional）。
+    ///
+    /// gateway 与 view 为必填（构造期 fail-fast）；其余指针为空时，engine 跳过依赖
+    /// 该组件的路径。
+    struct Dependencies {
+        xt_runtime::IHftGateway* gateway = nullptr;
+        xt_strategy_engine::XtRuntimeView* view = nullptr;
+        xt_account::AccountStateStore* account_store = nullptr;
+        xt_runtime::order::XtOrderRuntimeBook* order_book = nullptr;
+        const XtCommodityCatalog* catalog = nullptr;
+        xt_runtime::IOrderIdTranslator* order_id_translator = nullptr;
+
+        xt_strategy_engine::XtDeclaredSymbolRegistry* declared_registry = nullptr;
+    };
+
+    /// @brief engine 行为选项（值语义，构造期拷入）。
+    struct Options {
+        xt_core::Config session = {};
+        XtRollEngine::Config roll = {};
+        UnmatchedRoutingPolicy unmatched_routing = UnmatchedRoutingPolicy::WarnAndDrop;
+
+        bool conditional_orders_enabled = false;
+
+        ReplayExt replay = {};
+    };
+
+    /// @brief 构造期一次性注入的 observer 与 callback 集合（注入即封口）。
+    ///
+    /// 各 callback 空值表示禁用对应输出。
+    ///
+    /// 生命周期：全部成员为 non-owning 引用/闭包，owner 归组合根，必须**覆盖 engine 的
+    /// 事件派发期**（首次事件入口调用起，到 producer 停止/teardown quiesce 止；observer
+    /// 指针、以及 callback 捕获的对象都是）。engine 析构本身不回调任何 hook（~XtHftEngine
+    /// = default，只析构成员），故 owner 与 engine 的**对象析构序不受此约束**——两生产组合
+    /// 根即为 engine 成员先于部分 hook owner 声明（反序析构 owner 先亡），在 quiesce 后
+    /// 合法。engine 不做存活性检查。
+    ///
+    /// 异常契约：**engine 不给 observer/callback 加吞异常 guard**（区别于策略回调——策略侧
+    /// 走 run_guarded）。observer 与本结构各 callback 均按 `noexcept` 期望调用，抛出即违约，
+    /// 异常会沿事件入口向上穿透到组合根。理由：报表/遥测 hook 静默吞异常 = 产物静默残缺，
+    /// 比 crash 更难发现。需要容错的 hook 自行在实现内 try/catch。
+    struct Hooks {
+
+        std::vector<xt_runtime::IHftEngineObserver*> observers;
+        LifecycleTelemetryInit lifecycle = {};
+
+        FillRealizedCallback fill_realized;
+
+        CashReanchorProbe cash_reanchor;
+
+        MarkTickCallback mark_tick;
+
+        TradeExcursionCallback trade_excursion;
+
+        std::function<void(uint64_t  )> on_params_extra;
+
+        std::function<void(uint32_t  , const std::string&  )>
+            on_strategy_init_failure;
+    };
+
+    /// @brief 单个策略启动失败记录。
+    struct StrategyStartFailure {
+        uint32_t sid_id = 0;
+        std::string strategy_id;
+    };
+
+    /// @brief start() 的结构化结果。
+    struct StartReport {
+        bool all_started = false;
+        std::vector<StrategyStartFailure> failures;
+    };
+
+    XtHftEngine(Dependencies deps,
+                Options opts,
+                std::vector<std::unique_ptr<XtStrategyContext>> contexts,
+                Hooks hooks);
 
     ~XtHftEngine();
 
@@ -116,22 +164,39 @@ public:
     XtHftEngine(XtHftEngine&&) = delete;
     XtHftEngine& operator=(XtHftEngine&&) = delete;
 
-    void on_init();
+    StartReport start();
 
-    void configure_backtest_ext(const xt_backtest::hft::XtHftBacktestExtConfig& ext);
+    /// @brief engine 级（replayer 交付之后）丢弃计数；live/backtest 两端同口径自增。
+    ///
+    /// 计数只在既有 early-return 丢弃分支自增（accepted 热路径零新增指令）。
+    /// roll = roll should_dispatch 拒绝；session = session gate + pre-session 非
+    /// preopen 拒绝；calendar = 节假日过滤拒绝。
+    /// @note 当前唯一消费者是 backtest consumed manifest；live 自增但无人读。
+    struct EngineDropCounters {
+        uint64_t roll     = 0;
+        uint64_t session  = 0;
+        uint64_t calendar = 0;
+    };
+    const EngineDropCounters& engine_drop_counters() const noexcept {
+        return drops_;
+    }
 
-    void set_exec_sinks(xt_strategy_engine::IStrategyExecSink* fallback,
-                        std::vector<xt_strategy_engine::IStrategyExecSink*> sinks);
-
-    void add_context(std::unique_ptr<XtStrategyContext> ctx);
-
-    void reserve_contexts(std::size_t n) { contexts_.reserve(n); }
-
-    std::size_t context_count() const noexcept { return contexts_.size(); }
-
-    XtStrategyContext*       context(std::size_t idx) noexcept;
+    std::size_t context_count() const noexcept { return slots_.size(); }
 
     const XtStrategyContext* context(std::size_t idx) const noexcept;
+
+    bool set_strategy_control_enabled(const std::string& strategy_id, bool enabled);
+
+    void restore_strategy_userdata(
+        const std::function<bool(const std::string& strategy_id,
+                                 std::unordered_map<std::string, std::string>& out)>& loader);
+
+    void dump_strategy_userdata(
+        const std::function<void(const std::string& strategy_id,
+                                 std::unordered_map<std::string, std::string> kv)>& writer) const;
+
+    void drain_all_strategy_metrics(
+        std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>>& out);
 
     void on_tick(const XtTick& tick);
 
@@ -149,9 +214,11 @@ public:
 
     bool on_trade(const XtTradeRecord& trade, ITradeGateway::TdState td_state,
                   int64_t* out_realized_fp = nullptr,
-                  std::string* out_effective_sid = nullptr);
+                  std::string* out_effective_sid = nullptr,
+                  XtLatencyEligibility elig = XtLatencyEligibility::kEligible);
 
-    bool on_order_update(const XtOrderExecUpdate& upd);
+    bool on_order_update(const XtOrderExecUpdate& upd,
+                         XtLatencyEligibility elig = XtLatencyEligibility::kEligible);
 
     void on_reverse_sync_batch(const std::vector<AliveInflightOrder>& orders,
                                bool is_cold_start);
@@ -203,31 +270,27 @@ public:
         return orphan_reap_cancel_total_.load(std::memory_order_relaxed);
     }
 
+    uint64_t orphan_reap_suppressed_count() const noexcept {
+        return orphan_reap_suppressed_total_.load(std::memory_order_relaxed);
+    }
+
     uint64_t lost_terminal_reconcile_count() const noexcept {
         return lost_terminal_reconcile_total_.load(std::memory_order_relaxed);
     }
 
+    uint64_t strategy_init_failure_count() const noexcept {
+        return strategy_init_failure_total_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t strategy_callback_exception_count() const noexcept {
+        return strategy_exception_total_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t pre_start_dropped_count() const noexcept {
+        return pre_start_dropped_total_.load(std::memory_order_relaxed);
+    }
+
     uint32_t open_order_count() const noexcept;
-
-    void add_observer(xt_runtime::IHftEngineObserver* observer) {
-        if (observer) observers_.push_back(observer);
-    }
-
-    void init_lifecycle_telemetry(LifecycleTelemetryInit init);
-
-    void set_fill_realized_callback(FillRealizedCallback cb) noexcept {
-        fill_realized_cb_ = std::move(cb);
-    }
-
-    void set_cash_reanchor_probe(CashReanchorProbe cb) noexcept {
-        cash_reanchor_probe_ = std::move(cb);
-    }
-
-    void set_mark_tick_callback(MarkTickCallback cb) noexcept { mark_tick_cb_ = std::move(cb); }
-
-    void set_trade_excursion_callback(TradeExcursionCallback cb) noexcept {
-        trade_excursion_cb_ = std::move(cb);
-    }
 
 private:
     struct FillPositionBefore {
@@ -235,7 +298,11 @@ private:
         int64_t avg_price_fp = 0;
     };
 
-    void init_(const Config& cfg);
+    void apply_replay_ext_(const ReplayExt& ext);
+
+    void validate_assembly_(const Options& opts, const Hooks& hooks) const;
+
+    void note_pre_start_drop_(const char* entry) noexcept;
 
     void apply_strategy_tick_state_(const XtTick& tick);
 
@@ -281,16 +348,14 @@ private:
                                const FillPositionBefore& pos_before,
                                int64_t fill_realized_fp);
 
-    bool dispatch_fill_to_strategy_(const XtTradeRecord& tr);
+    bool dispatch_fill_to_strategy_(const XtTradeRecord& tr,
+                                    uint64_t* out_logical_order_id = nullptr);
 
     uint32_t resolve_fill_sid_id_(const std::string& strategy_id) const;
 
     bool handle_unmatched_fill_(const XtTradeRecord& tr);
 
     XtFillEvent build_strategy_fill_event_(const XtTradeRecord& tr) const;
-
-    std::string prefetch_terminal_order_code_(const XtOrderExecUpdate& upd,
-                                              bool is_terminal);
 
     void apply_order_update_state_(const XtOrderExecUpdate& applied_upd,
                                    bool is_terminal);
@@ -302,13 +367,20 @@ private:
 
     bool handle_unmatched_order_update_(const XtOrderExecUpdate& strategy_upd);
 
-    void finish_terminal_order_update_(const XtOrderExecUpdate& applied_upd,
-                                       const std::string& stp_code);
+    void finish_terminal_order_update_(const XtOrderExecUpdate& applied_upd);
 
     void emit_resume_for_recovery_(
         const std::vector<ITradeGateway::PositionSnapshot>& positions);
 
+    bool is_ctx_disabled_(std::size_t i) const noexcept {
+        return i < slots_.size() && slots_[i].disabled;
+    }
+
+    void disable_context_(std::size_t i);
+
     std::size_t find_ctx_idx_by_sid_id_(uint32_t sid_id) const noexcept;
+
+    xt_strategy_engine::IStrategyExecSink* sink_at_(std::size_t i) const noexcept;
 
     xt_strategy_engine::IStrategyExecSink* select_routing_sink_(uint32_t sid_id,
                                           bool& skip_unmatched) const noexcept;
@@ -321,18 +393,22 @@ private:
 
     void build_code_to_sid_();
 
-    XtStrategyBase* stra_ = nullptr;
     xt_runtime::IHftGateway* gateway_ = nullptr;
     xt_strategy_engine::XtRuntimeView* runtime_view_ = nullptr;
 
-    std::vector<std::unique_ptr<XtStrategyContext>> contexts_;
-    XtStrategyContext* active_ctx_ = nullptr;
-    std::vector<xt_strategy_engine::IStrategyExecSink*> exec_sinks_;
+    /// @brief engine 拥有的 strategy context 及其 fail-closed 状态。
+    struct ContextSlot {
+        std::unique_ptr<XtStrategyContext> ctx;
+        bool disabled = false;
+    };
+
+    std::vector<ContextSlot> slots_;
 
     xt_core::Config session_;
     XtRollEngine roll_;
     XtTradingDateInfer td_infer_;
     std::function<bool(uint32_t)> calendar_filter_;
+    EngineDropCounters drops_;
 
     std::string last_primary_symbol_;
     uint32_t last_roll_check_date_ = 0;
@@ -345,9 +421,7 @@ private:
     xt_account::AccountStateStore* account_store_ = nullptr;
     xt_runtime::order::XtOrderRuntimeBook* order_book_ = nullptr;
     const XtCommodityCatalog* catalog_ = nullptr;
-    xt_strategy_engine::IStrategyExecSink* exec_sink_ = nullptr;
     xt_strategy_engine::XtDeclaredSymbolRegistry* declared_registry_ = nullptr;
-    xt_runtime::IKillSwitchSink* kill_switch_sink_ = nullptr;
     xt_runtime::IOrderIdTranslator* order_id_translator_ = nullptr;
 
     xt_engine::hft::HftLifecycleTelemetry lifecycle_;
@@ -360,6 +434,7 @@ private:
     std::vector<xt_runtime::IHftEngineObserver*> observers_;
 
     std::function<void(uint64_t)> on_params_extra_;
+    std::function<void(uint32_t, const std::string&)> on_strategy_init_failure_;
 
     std::atomic<uint64_t> dropped_fill_empty_sid_count_{0};
     std::atomic<uint64_t> dropped_fill_unknown_sid_count_{0};
@@ -368,13 +443,19 @@ private:
     std::atomic<uint64_t> exec_dispatch_count_{0};
     std::atomic<uint64_t> unmatched_sid_recovered_count_{0};
     std::atomic<uint64_t> orphan_reap_cancel_total_{0};
+    std::atomic<uint64_t> orphan_reap_suppressed_total_{0};
     std::atomic<uint64_t> lost_terminal_reconcile_total_{0};
+    std::atomic<uint64_t> strategy_init_failure_total_{0};
+    std::atomic<uint64_t> strategy_exception_total_{0};
+    std::atomic<uint64_t> pre_start_dropped_total_{0};
     int64_t last_reverse_sync_steady_ms_ = 0;
 
     std::unordered_map<std::string, std::string> code_to_sid_;
     bool code_to_sid_built_ = false;
 
-    bool strict_unmatched_routing_ = false;
+    UnmatchedRoutingPolicy unmatched_routing_ = UnmatchedRoutingPolicy::WarnAndDrop;
 
     bool conditional_orders_enabled_ = false;
+
+    bool started_ = false;
 };

@@ -86,8 +86,11 @@ XtAppliedTradeCost apply(double base_price,
     XtAppliedTradeCost out;
     out.exec_price = base_price;
     if (sim_slippage) {
-        out.slippage = cost.slippage;
-        out.exec_price += tr.is_buy ? out.slippage : -out.slippage;
+
+        const double slip = (comm && comm->slippage != 0.0) ? comm->slippage
+                                                            : cost.slippage;
+        out.slippage = slip;
+        out.exec_price += tr.is_buy ? slip : -slip;
     }
 
     const double tr_qty = order_exec_from_fp(tr.qty_fp);

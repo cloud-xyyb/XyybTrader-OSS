@@ -12,6 +12,13 @@
 #include "api/AliveInflightOrder.h"
 #include "api/ExecFlags.h"
 #include "api/BrokerVenueTruth.h"
+#include "api/XtOrderTerminalRecord.h"
+
+enum class XtLatencyEligibility : uint8_t {
+    kEligible   = 0,
+    kIneligible = 1,
+
+};
 
 /**
  * @brief 实盘 TD 网关抽象接口（provider-neutral）。
@@ -68,8 +75,8 @@ public:
         uint64_t query_pos_dirty_merged = 0;
     };
 
-    using OrderUpdateHandler = std::function<void(const XtOrderExecUpdate&)>;
-    using TradeHandler = std::function<void(const XtTradeRecord&)>;
+    using OrderUpdateHandler = std::function<void(const XtOrderExecUpdate&, XtLatencyEligibility)>;
+    using TradeHandler = std::function<void(const XtTradeRecord&, XtLatencyEligibility)>;
     using ReadyHandler = std::function<void()>;
     using FrontHandler = std::function<void(bool connected, int reason)>;
     struct DailySettlementDelta {
@@ -101,6 +108,9 @@ public:
     };
     using AccountHandler = std::function<void(const AccountSnapshot&)>;
     using PositionHandler = std::function<void(const std::vector<PositionSnapshot>&)>;
+
+    using RecoveryPositionHandler =
+        std::function<void(const std::vector<PositionSnapshot>& positions, bool is_cold_start)>;
 
     using BrokerVenueTruthHandler = std::function<void(const BrokerVenueTruth&)>;
 
@@ -137,6 +147,7 @@ public:
         UdsArrivalHandler on_uds_arrival;
         TransportAckUnavailableHandler on_transport_ack_unavailable;
         ReverseSyncBatchHandler on_reverse_sync_batch;
+        RecoveryPositionHandler on_recovery_position;
     };
 
     [[nodiscard]] virtual bool init(const Config& cfg) = 0;
@@ -187,4 +198,13 @@ public:
     }
 
     [[nodiscard]] virtual bool query_wallet_balance_sync(double&  ) { return false; }
+
+    [[nodiscard]] virtual bool lookup_terminal(uint64_t  ,
+                                               XtOrderTerminalRecord&  ) const {
+        return false;
+    }
+
+    [[nodiscard]] virtual bool collect_open_delivery_ids(std::vector<uint64_t>&  ) const {
+        return false;
+    }
 };

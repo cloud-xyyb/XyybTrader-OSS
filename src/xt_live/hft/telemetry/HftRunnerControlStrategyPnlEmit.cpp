@@ -113,7 +113,8 @@ StrategyPnlEmitResult emit_strategy_pnl_metrics(
         if (result.baseline_ready) {
             bool is_new = false;
             const auto base = baseline->get(sid, r.code, &is_new);
-            if (is_new) {
+
+            if (is_new && baseline->mark_new_reported(sid, r.code)) {
                 ct::metrics::XtMetricRegistry::instance().inc_strategy_baseline_new_total(
                     sid, cfg.venue_label);
             }

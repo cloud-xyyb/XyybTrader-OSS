@@ -13,9 +13,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "api/BrokerVenueTruth.h"
 #include "api/ITradeGateway.h"
 #include "api/StrategySid.h"
-#include "xt_account/venue/binance/BinanceAccountTruthSource.h"
 
 namespace binance_u {
 
@@ -25,7 +25,7 @@ struct AccountTruthDetail {
     int64_t maint_margin_fp = 0;
     int64_t available_balance_fp = 0;
     int64_t total_margin_balance_fp = 0;
-    std::vector<BinanceAccountTruthSource::Position> per_symbol;
+    std::vector<PerSymbolTruth> per_symbol;
 };
 
 /// @brief gap-fill userTrades 反查本地订单归属的结果。

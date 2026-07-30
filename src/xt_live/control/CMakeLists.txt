@@ -4,8 +4,9 @@ set(CMAKE_CXX_STANDARD 17)
 
 # ── xt_live_control: 跨引擎 runner 控制操作 lib ────────────────────────────
 # PanelHelpers（cancel_all / flatten_all / force_exit / manual_order 等控制操作
-# + wire_per_strategy_risk_state / overlap 校验装配 helper）与 XtKillSwitchState
-# （kill-switch trip 因果链 + audit log）的唯一编译点（TU 单一所有权）。
+# + wire_per_strategy_risk_state / overlap 校验装配 helper）、XtKillSwitchState
+# （kill-switch trip 因果链 + audit log）与 SafetyStateWire（safety.bin
+# collect/apply/bootstrap/save 跨引擎实现）的唯一编译点（TU 单一所有权）。
 # 调用方：3 个 runner composition root + HftRunnerControl（closeout/watchdog
 # 非 gRPC 路径）+ xt_panel（gRPC handler 绑定层，单向 xt_panel → 本 lib）。
 # 注：HFT 专属 runner control（HftRunnerControl / closeout / reconcile / emit）已归位
@@ -14,6 +15,7 @@ add_library(xt_live_control STATIC
     AdvanceRiskFrame.cpp
     PanelHelpers.cpp
     RunnerFrameLoop.cpp
+    SafetyStateWire.cpp
     XtKillSwitchState.cpp
 )
 

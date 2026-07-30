@@ -557,10 +557,6 @@ public:
     void handle_agg_trade(SymbolState& st, const nlohmann::json& data) {
         uint64_t ts_exch_ms = 0;
         try {
-            const double p = std::stod(data["p"].get<std::string>());
-            const double q = std::stod(data["q"].get<std::string>());
-
-            if (!std::isfinite(p) || !std::isfinite(q)) return;
 
             const int64_t agg_id = static_cast<int64_t>(data.value("a", 0LL));
             const int64_t missed = agg_gap_missed(st.last_agg_id_, agg_id);
@@ -570,9 +566,19 @@ public:
                 if (st.reconnect_pending_) launch_agg_backfill_(st, st.last_agg_id_ + 1, agg_id);
             }
             st.reconnect_pending_ = false;
+            if (agg_id > st.last_agg_id_) st.last_agg_id_ = agg_id;
+            const double p = std::stod(data["p"].get<std::string>());
+            const double q = std::stod(data["q"].get<std::string>());
+
+            if (!std::isfinite(p) || !std::isfinite(q)) {
+                ++cnt_aggtrade_dropped_;
+                XtLogger::warn_m("BinanceMD",
+                    "aggTrade non-finite p/q dropped sym={} agg_id={} (total={})",
+                    st.symbol, agg_id, cnt_aggtrade_dropped_);
+                return;
+            }
             st.last_price = p;
             st.total_volume += q;
-            if (agg_id > st.last_agg_id_) st.last_agg_id_ = agg_id;
             ts_exch_ms = data.value("E", 0ULL);
         } catch (...) { return; }
         if (st.depth_.is_live()) push_tick(st, "aggTrade", ts_exch_ms);
@@ -760,11 +766,13 @@ public:
                               t.action_date, t.action_date, t.action_time,
                               t.code, t.exchg,
                               last_fp, xt_live_recorder_util::to_recorder_fp(st.total_volume),
-                              bid_px_fp, ask_px_fp, bid_q, ask_q);
+                              bid_px_fp, ask_px_fp, bid_q, ask_q,
+                               kRecDepth);
         }
 
         st.freshness_.note_tick(static_cast<uint32_t>(ts_local_ns / 1'000'000));
-        if (cb.on_tick) cb.on_tick(t);
+
+        if (cb.on_tick) cb.on_tick(t,  0);
     }
 
     void enqueue_snapshot_(SymbolState& st) {
@@ -899,6 +907,7 @@ public:
     uint64_t cnt_aggtrade_   = 0;
     uint64_t cnt_depth_      = 0;
     uint64_t cnt_tick_push_  = 0;
+    uint64_t cnt_aggtrade_dropped_ = 0;
     int64_t  rate_log_last_ms_ = 0;
     int64_t  last_unknown_symbol_log_ms_ = 0;
 
@@ -921,6 +930,15 @@ public:
 
     int test_backfill_inflight() const {
         return backfill_gate_->inflight.load(std::memory_order_acquire);
+    }
+
+    bool test_agg_state(const std::string& symbol, int64_t& out_last_agg_id,
+                        uint64_t& out_dropped) {
+        SymbolState* st = state_for_ptr(to_upper(symbol));
+        if (st == nullptr) return false;
+        out_last_agg_id = st->last_agg_id_;
+        out_dropped = cnt_aggtrade_dropped_;
+        return true;
     }
 #endif
 };
@@ -964,6 +982,18 @@ void md_binance_test_disconnect(void* impl_void) {
 int md_binance_test_backfill_inflight(void* impl_void) {
     auto* impl = static_cast<MdBinanceUGateway::Impl*>(impl_void);
     return impl->test_backfill_inflight();
+}
+
+bool md_binance_test_agg_state(void* impl_void, const char* symbol,
+                               long long* out_last_agg_id,
+                               unsigned long long* out_dropped) {
+    auto* impl = static_cast<MdBinanceUGateway::Impl*>(impl_void);
+    int64_t last_agg_id = 0;
+    uint64_t dropped = 0;
+    if (!impl->test_agg_state(symbol, last_agg_id, dropped)) return false;
+    if (out_last_agg_id) *out_last_agg_id = static_cast<long long>(last_agg_id);
+    if (out_dropped) *out_dropped = static_cast<unsigned long long>(dropped);
+    return true;
 }
 #endif
 

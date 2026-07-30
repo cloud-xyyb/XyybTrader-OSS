@@ -4,15 +4,16 @@
 #include <functional>
 #include <mutex>
 
+#include "xt_account/api/IAccountTruthSink.h"
 #include "xt_account/api/IAccountTruthSource.h"
 #include "xt_core/session/XtTradingDay.h"
 
-/// @brief AccountStateStore-backed account truth 的通用读侧 source。
+/// @brief AccountStateStore-backed account truth 的通用 source（读）+ sink（写）实现。
 ///
 /// 面向没有专用 broker day-policy 的 venue，输出由 store 聚合出的 AccountTruth。
 /// Source 只维护 broker overlay 和 trading-day fallback policy。fetch_snapshot()
 /// 按值返回快照，不写本地 reducer 状态；内部 overlay 状态由 mutex 保护。
-class StoreBackedAccountTruthSource final : public IAccountTruthSource {
+class StoreBackedAccountTruthSource final : public IAccountTruthSource, public IAccountTruthSink {
 public:
     using SnapshotProvider = std::function<AccountTruth()>;
 

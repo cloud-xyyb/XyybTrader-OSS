@@ -73,9 +73,9 @@ def main() -> int:
     ap.add_argument("--emit-config", help="顺手生成可跑的回测 config（单合约时可用）")
     args = ap.parse_args()
 
-    ticks: dict[tuple[str, int], list[tuple[int, str]]] = defaultdict(list)
+    ticks: dict[tuple[str, int], list[tuple[tuple[int, int, int], str]]] = defaultdict(list)
     dropped = 0
-    for path in args.jsonl:
+    for file_seq, path in enumerate(args.jsonl):
         with open(path, encoding="utf-8") as f:
             for line in f:
                 try:
@@ -88,7 +88,11 @@ def main() -> int:
                 if args.code and e.get("code") != args.code:
                     continue
                 key = (e["code"], int(e["action_date"]))
-                ticks[key].append((int(e["ts_local_ns"]), tick_row(e)))
+                # 排序主键 = action_time（venue 时间轴）；ts_local_ns 是 steady 时钟，
+                # 跨进程 boot（rotation 文件间）不可比，只作同文件内 tie-break；
+                # file_seq = 输入文件序（调用方按 rotation 后缀 epoch 序传入）。
+                ticks[key].append(((int(e["action_time"]), file_seq,
+                                    int(e["ts_local_ns"])), tick_row(e)))
     if not ticks:
         print("no MD_TICK found — 检查 --jsonl 路径 / --code 过滤", file=sys.stderr)
         return 1
@@ -98,7 +102,7 @@ def main() -> int:
     dates: set[int] = set()
     codes: set[str] = set()
     for (code, day), rows in sorted(ticks.items()):
-        rows.sort(key=lambda r: r[0])  # 录制本身单调, 排序兜底多文件归并
+        rows.sort(key=lambda r: r[0])  # (action_time, file_seq, ts_local_ns) 多文件归并
         p = out_root / code / f"{day}.csv"
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8", newline="\n") as f:

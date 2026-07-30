@@ -73,6 +73,7 @@ public:
         int64_t  md_ask_prices_fp[kMdDepth] = {};
         int64_t  md_bid_qty[kMdDepth]       = {};
         int64_t  md_ask_qty[kMdDepth]       = {};
+        int32_t  md_depth_levels = 0;
 
         char     sd_strat_id[32]      = {};
         char     sd_code[32]          = {};
@@ -99,6 +100,8 @@ public:
         char     os_account_id[32]    = {};
         char     os_user_tag[32]      = {};
         uint64_t os_decision_mono_ns  = 0;
+        bool     os_event_clock_valid = false;
+        int64_t  os_event_ts_local_ns = 0;
 
         uint64_t or_logical_id        = 0;
         uint64_t or_phys_id           = 0;
@@ -261,7 +264,8 @@ public:
                       const int64_t bid_prices_fp[kMdDepth],
                       const int64_t ask_prices_fp[kMdDepth],
                       const int64_t bid_qty[kMdDepth],
-                      const int64_t ask_qty[kMdDepth]);
+                      const int64_t ask_qty[kMdDepth],
+                      int depth_levels);
 
     void set_event_store(ct::data::IEventStore* store) noexcept;
 
@@ -294,6 +298,8 @@ public:
         const char* account_id       = nullptr;
         const char* user_tag         = nullptr;
         uint64_t    decision_mono_ns = 0;
+        bool        event_clock_valid = false;
+        int64_t     event_ts_local_ns = 0;
     };
 
     void emit_order_submit(const OrderSubmitParams& p);

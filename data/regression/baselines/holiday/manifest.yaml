@@ -66,8 +66,8 @@ inputs:
 golden:
   output: fills.csv
   expected: data/regression/baselines/holiday/expected_fills.csv
-  sha256: b4c2f3019fb67edce8197595bf5194feeb336fbea4cb3f15758f68d6d25c3830
-  bytes: 1639090
-  lines: 9002
+  sha256: 5758042b6093861cc3521b553332204e4ee606ae8bc2551344e49a92c343ed7c
+  bytes: 1097950
+  lines: 6024
   tolerance: bit-exact
 driver: bash scripts/run_baselines.sh holiday

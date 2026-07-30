@@ -47,6 +47,8 @@ struct XtRunnerTransactionEvent {
 /// @brief TD 订单状态回报事件。
 struct XtRunnerOrderUpdateEvent {
     XtOrderExecUpdate value;
+
+    bool latency_ineligible = false;
 };
 
 /// @brief TD 成交回报事件。
@@ -54,6 +56,7 @@ struct XtRunnerTradeEvent {
     XtTradeRecord value;
     ITradeGateway::TdState td_state = ITradeGateway::TdState::Unknown;
     std::string route_status;
+    bool latency_ineligible = false;
 };
 
 using XtRunnerExecPayload = std::variant<XtRunnerOrderQueueEvent,
@@ -152,12 +155,15 @@ struct XtRunnerParamsUpdatedEvent {
     uint64_t param_version = 0;
 };
 
-/// @brief 孤儿回收 sweep 参数；HftRunnerControl 按节拍产生，worker 线程执行。
+/// @brief 孤儿回收 / lost-terminal 对账 sweep 参数；HftRunnerControl 按节拍产生，worker 线程执行。
+/// @note reap_orphans 与 reconcile_lost_terminals 两个能力各自独立门控（HFT-D6 解耦）：
+///       只开 reconcile 时事件仍推送，worker 只跑 reconcile 不跑 orphan reap。
 struct XtRunnerReapOrphansEvent {
     int64_t now_ms = 0;
     int64_t grace_ms = 0;
     uint32_t max_cancels = 0;
     bool reconcile_lost_terminals = false;
+    bool reap_orphans = true;
 };
 
 /// @brief Worker 闭包任务；构造方保证 fn 非空，worker 线程直接执行。
@@ -232,7 +238,9 @@ struct XtHftRunnerEvent {
         }
         if (const auto* ctrl = std::get_if<XtRunnerControlEvent>(&payload)) {
             return ctrl->type == XtRunnerControlEventType::ChannelLost
-                || ctrl->type == XtRunnerControlEventType::ChannelReady;
+                || ctrl->type == XtRunnerControlEventType::ChannelReady
+                || ctrl->type == XtRunnerControlEventType::ReverseSyncBatch
+                || ctrl->type == XtRunnerControlEventType::WorkerTask;
         }
         return false;
     }
@@ -264,17 +272,20 @@ struct XtHftRunnerEvent {
             XtRunnerExecEventType::Transaction, XtRunnerTransactionEvent{value}}};
     }
 
-    static XtHftRunnerEvent make_order_update(const XtOrderExecUpdate& value) {
+    static XtHftRunnerEvent make_order_update(const XtOrderExecUpdate& value,
+                                              bool latency_ineligible = false) {
         return XtHftRunnerEvent{XtRunnerExecEvent{
-            XtRunnerExecEventType::XtOrderExecUpdate, XtRunnerOrderUpdateEvent{value}}};
+            XtRunnerExecEventType::XtOrderExecUpdate,
+            XtRunnerOrderUpdateEvent{value, latency_ineligible}}};
     }
 
     static XtHftRunnerEvent make_trade(const XtTradeRecord& value,
                                      ITradeGateway::TdState td_state,
-                                     std::string route_status = {}) {
+                                     std::string route_status = {},
+                                     bool latency_ineligible = false) {
         return XtHftRunnerEvent{XtRunnerExecEvent{
             XtRunnerExecEventType::Trade,
-            XtRunnerTradeEvent{value, td_state, std::move(route_status)}}};
+            XtRunnerTradeEvent{value, td_state, std::move(route_status), latency_ineligible}}};
     }
 
     static XtHftRunnerEvent make_daily_settlement(const ITradeGateway::DailySettlementDelta& delta) {
@@ -320,10 +331,12 @@ struct XtHftRunnerEvent {
     static XtHftRunnerEvent make_reap_recovered_orphans(int64_t now_ms,
                                                         int64_t grace_ms,
                                                         uint32_t max_cancels,
-                                                        bool reconcile_lost_terminals = false) {
+                                                        bool reconcile_lost_terminals = false,
+                                                        bool reap_orphans = true) {
         return XtHftRunnerEvent{XtRunnerControlEvent{
             XtRunnerControlEventType::ReapRecoveredOrphans,
-            XtRunnerReapOrphansEvent{now_ms, grace_ms, max_cancels, reconcile_lost_terminals}}};
+            XtRunnerReapOrphansEvent{now_ms, grace_ms, max_cancels,
+                                     reconcile_lost_terminals, reap_orphans}}};
     }
 
     static XtHftRunnerEvent make_worker_task(std::function<void()> fn) {

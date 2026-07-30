@@ -32,6 +32,16 @@ inline uint64_t lat_now_us() noexcept {
     return XtSteadyClock::steady_now_us();
 }
 
+int parse_rest_error_code(const std::string& body) noexcept {
+    auto j = nlohmann::json::parse(body, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return 0;
+    auto it = j.find("code");
+    if (it == j.end() || !it->is_number_integer()) return 0;
+    return it->get<int>();
+}
+
+constexpr uint64_t kExecUnknownLogIntervalUs = 5'000'000ULL;
+
 struct ReqSubmit {
     TransportSubmitReq req;
     TransportLatencyTrace trace;
@@ -56,6 +66,21 @@ using Req = std::variant<ReqSubmit, ReqCancel>;
 bool rest_cancel_error_retryable(long http_status, int err_code) {
     if (http_status == 429 || http_status == 418) return true;
     return err_code == -1015 || err_code == -1003;
+}
+
+RestSubmitFailureClass classify_rest_submit_failure(long http_status,
+                                                    int err_code) noexcept {
+
+    if (http_status == 0) return RestSubmitFailureClass::kExecutionUnknown;
+
+    if (http_status >= 300 && http_status < 400) return RestSubmitFailureClass::kExecutionUnknown;
+
+    if (http_status >= 500) return RestSubmitFailureClass::kExecutionUnknown;
+
+    if (err_code == -1007 || err_code == -1006 || err_code == -1001)
+        return RestSubmitFailureClass::kExecutionUnknown;
+
+    return RestSubmitFailureClass::kBusinessReject;
 }
 
 uint64_t rest_cancel_backoff_ms(int tries_done, long retry_after_sec,
@@ -144,6 +169,8 @@ public:
         return h;
     }
 
+    bool is_running() const { return running.load(std::memory_order_acquire); }
+
 private:
     void worker_loop() {
 
@@ -215,7 +242,8 @@ private:
 
     void reject_before_wire_on_stop(ReqCancel& r) {
         r.trace.t1_us = lat_now_us();
-        dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kTransportError_Disconnect),
+        dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kTransportError_Disconnect,
+                                 TransportAck::TimingOrigin::kLocalFailure),
                  r.trace);
     }
 
@@ -254,14 +282,31 @@ private:
                          resp.curl_err);
 
         if (!resp.ok()) {
-            XtLogger::warn_m("BinanceTD",
-                             "submit REST failed: http={} body={} curl_err={}",
-                             resp.http_status, resp.body, resp.curl_err);
+            const int err_code = parse_rest_error_code(resp.body);
             const std::string reject_reason =
                 resp.curl_err.empty() ? resp.body : resp.curl_err;
-            const char* reject_code =
-                has_http_response ? "RestSubmitFailed" : "RestTransportError";
-            emit_wire_reject_trace(r.req, reject_code, reject_reason.c_str());
+
+            if (classify_rest_submit_failure(resp.http_status, err_code) ==
+                RestSubmitFailureClass::kExecutionUnknown) {
+                note_submit_exec_unknown(r.req.local_id, resp.http_status, err_code,
+                                         reject_reason);
+                emit_wire_reject_trace(r.req, "RestSubmitExecUnknown",
+                                       reject_reason.c_str());
+
+                dispatch(make_submit_transport_error(
+                             r.req.local_id,
+                             TransportAck::Kind::kTransportError_TimeoutAfterSend,
+                             has_http_response ? TransportAck::TimingOrigin::kVenueResponse
+                                               : TransportAck::TimingOrigin::kLocalFailure,
+                             reject_reason),
+                         r.trace);
+                return;
+            }
+
+            XtLogger::warn_m("BinanceTD",
+                             "submit REST rejected: http={} code={} body={} curl_err={}",
+                             resp.http_status, err_code, resp.body, resp.curl_err);
+            emit_wire_reject_trace(r.req, "RestSubmitFailed", reject_reason.c_str());
             dispatch(make_submit_reject(r.req.local_id, resp.body, 0), r.trace);
             return;
         }
@@ -276,6 +321,7 @@ private:
 
         TransportAck ack;
         ack.kind = TransportAck::Kind::kAccepted;
+        ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;
         ack.local_id = r.req.local_id;
         ack.raw_status = j.value("status", std::string("NEW"));
         if (j.contains("orderId")) ack.sys_id = std::to_string(j.value("orderId", 0LL));
@@ -306,7 +352,8 @@ private:
                                   ? j["code"].get<int>() : 0;
             if (code == -2011) {
 
-                dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kCancelNoop),
+                dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kCancelNoop,
+                                         TransportAck::TimingOrigin::kVenueResponse),
                          r.trace);
                 return;
             }
@@ -320,7 +367,8 @@ private:
                              resp.http_status, resp.body, resp.curl_err);
             return;
         }
-        dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kCanceled), r.trace);
+        dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kCanceled,
+                                 TransportAck::TimingOrigin::kVenueResponse), r.trace);
     }
 
     void schedule_cancel_retry(ReqCancel&& r, long http_status, int err_code,
@@ -353,6 +401,8 @@ private:
                                            int err_code) {
         TransportAck ack;
         ack.kind = TransportAck::Kind::kRejected;
+
+        ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;
         ack.local_id = local_id;
         ack.err_msg = std::move(err_msg);
         ack.err_code = err_code;
@@ -361,19 +411,23 @@ private:
 
     static TransportAck make_submit_transport_error(uint64_t local_id,
                                                     TransportAck::Kind kind,
+                                                    TransportAck::TimingOrigin origin,
                                                     std::string err_msg) {
         TransportAck ack;
         ack.kind = kind;
         ack.req_kind = TransportAck::ReqKind::kSubmit;
+        ack.timing_origin = origin;
         ack.local_id = local_id;
         ack.err_msg = std::move(err_msg);
         return ack;
     }
 
-    static TransportAck make_cancel_ack(uint64_t local_id, TransportAck::Kind kind) {
+    static TransportAck make_cancel_ack(uint64_t local_id, TransportAck::Kind kind,
+                                        TransportAck::TimingOrigin origin) {
         TransportAck ack;
         ack.kind = kind;
         ack.req_kind = TransportAck::ReqKind::kCancel;
+        ack.timing_origin = origin;
         ack.local_id = local_id;
         return ack;
     }
@@ -389,8 +443,37 @@ private:
                                    TransportAck::Kind kind) {
         emit_wire_reject_trace(r.req, reject_code, reason);
         r.trace.t1_us = lat_now_us();
-        dispatch(make_submit_transport_error(r.req.local_id, kind, reason), r.trace);
+
+        dispatch(make_submit_transport_error(r.req.local_id, kind,
+                                             TransportAck::TimingOrigin::kLocalFailure, reason),
+                 r.trace);
     }
+
+    void note_submit_exec_unknown(uint64_t local_id, long http_status, int err_code,
+                                  const std::string& reason) {
+        const uint64_t total =
+            submit_exec_unknown_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t now_us = lat_now_us();
+        if (last_exec_unknown_log_us_ == 0 ||
+            now_us - last_exec_unknown_log_us_ >= kExecUnknownLogIntervalUs) {
+            last_exec_unknown_log_us_ = now_us;
+            XtLogger::warn_m("BinanceTD",
+                "submit execution-unknown (kept inflight for reconcile): local_id={} "
+                "http={} code={} reason='{}' total={} suppressed_since_last={}",
+                local_id, http_status, err_code, reason, total,
+                exec_unknown_suppressed_count_);
+            exec_unknown_suppressed_count_ = 0;
+        } else {
+            ++exec_unknown_suppressed_count_;
+        }
+    }
+
+public:
+    uint64_t submit_exec_unknown_count() const {
+        return submit_exec_unknown_count_.load(std::memory_order_relaxed);
+    }
+
+private:
 
     BinanceRestClient& rest;
     AckHandler ack_handler;
@@ -407,6 +490,10 @@ private:
 
     std::atomic<uint32_t> inflight_count{0};
     std::atomic<uint64_t> last_ack_us{0};
+
+    std::atomic<uint64_t> submit_exec_unknown_count_{0};
+    uint64_t last_exec_unknown_log_us_ = 0;
+    uint64_t exec_unknown_suppressed_count_ = 0;
 };
 
 RestTradeTransport::RestTradeTransport(BinanceRestClient& rest,
@@ -432,6 +519,14 @@ void RestTradeTransport::bind_ack_handler(AckHandler handler) {
 
 ITradeTransport::Health RestTradeTransport::health() const {
     return impl_->health();
+}
+
+bool RestTradeTransport::is_running() const {
+    return impl_->is_running();
+}
+
+uint64_t RestTradeTransport::submit_exec_unknown_count() const {
+    return impl_->submit_exec_unknown_count();
 }
 
 }

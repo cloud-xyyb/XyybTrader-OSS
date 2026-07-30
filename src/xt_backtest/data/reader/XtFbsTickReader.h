@@ -15,7 +15,8 @@ class IEventIterator;
 /// @brief 从 FBS event store 查询 MdTick 并输出 `XtRawTick` 的回测 reader。
 ///
 /// 按 `fbs_root`、trading day 范围和可选 symbol 过滤创建 event-store iterator，顺序遍历
-/// MdTick 并转换 fixed-point 字段。FBS v1 只提供 L1-L5，`XtRawTick` 的 L6-L10 保持默认 0。
+/// MdTick 并转换 fixed-point 字段。盘口按 `depth_levels_real`（1..kEventStoreMdDepth）
+/// 回放真实档数，更深槽位保持 `XtRawTick` 默认 0。
 /// 本类 owns `IEventStore` / `IEventIterator` 游标；`reset()` 重建 iterator 并清空 per-symbol
 /// cumulative volume 派生状态。单线程顺序读取。
 class XtFbsTickReader : public IMarketDataReader {

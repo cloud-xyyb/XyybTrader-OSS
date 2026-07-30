@@ -25,6 +25,14 @@ bool rest_cancel_error_retryable(long http_status, int err_code);
 uint64_t rest_cancel_backoff_ms(int tries_done, long retry_after_sec,
                                 const RestCancelRetryCfg& cfg);
 
+enum class RestSubmitFailureClass {
+    kBusinessReject,
+    kExecutionUnknown,
+};
+
+RestSubmitFailureClass classify_rest_submit_failure(long http_status,
+                                                    int err_code) noexcept;
+
 /// @brief Binance TD 的 REST 下单发送器，实现 ITradeTransport
 ///
 /// - TraderBinanceUGateway 把报单/撤单交给RestTradeTransport
@@ -48,6 +56,10 @@ public:
     void bind_ack_handler(AckHandler handler) override;
 
     Health health() const override;
+
+    bool is_running() const;
+
+    uint64_t submit_exec_unknown_count() const;
 
 private:
     class Impl;

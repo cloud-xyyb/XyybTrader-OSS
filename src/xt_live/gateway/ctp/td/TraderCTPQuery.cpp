@@ -31,26 +31,31 @@ int TraderCTP::request_query(QueryKind kind) {
         XtCStringUtil::copy(req.BrokerID, broker_.c_str());
         XtCStringUtil::copy(req.InvestorID, user_.c_str());
     };
+
+    const int rid = next_req_id();
+    qry_[qry_idx(kind)].active_request_id.store(rid, std::memory_order_release);
     switch (kind) {
         case QueryKind::Position: {
             CThostFtdcQryInvestorPositionField req;
             prepare_req(req);
-            return api_->ReqQryInvestorPosition(&req, next_req_id());
+
+            recovery_.begin_position_query(rid);
+            return api_->ReqQryInvestorPosition(&req, rid);
         }
         case QueryKind::AccountState: {
             CThostFtdcQryTradingAccountField req;
             prepare_req(req);
-            return api_->ReqQryTradingAccount(&req, next_req_id());
+            return api_->ReqQryTradingAccount(&req, rid);
         }
         case QueryKind::XtOrder: {
             CThostFtdcQryOrderField req;
             prepare_req(req);
-            return api_->ReqQryOrder(&req, next_req_id());
+            return api_->ReqQryOrder(&req, rid);
         }
         case QueryKind::Trade: {
             CThostFtdcQryTradeField req;
             prepare_req(req);
-            return api_->ReqQryTrade(&req, next_req_id());
+            return api_->ReqQryTrade(&req, rid);
         }
     }
     return -1;
@@ -84,17 +89,25 @@ void TraderCTP::reset_query_control_states() {
     for (auto& q : qry_) {
         q.inflight.store(false, std::memory_order_release);
         q.dirty.store(false, std::memory_order_release);
+
+        q.active_request_id.store(0, std::memory_order_release);
         q.next_allowed_ms.store(0, std::memory_order_release);
         q.backoff_level.store(0, std::memory_order_release);
         q.throttled_count.store(0, std::memory_order_release);
         q.inflight_skip_count.store(0, std::memory_order_release);
         q.dirty_merge_count.store(0, std::memory_order_release);
+
+        q.refresh_timeout_token.fetch_add(1, std::memory_order_acq_rel);
+        q.refresh_timeout_count.store(0, std::memory_order_release);
     }
 }
 
 void TraderCTP::on_query_response_done(QueryKind kind, bool success) {
     auto& q = qry_[qry_idx(kind)];
     q.inflight.store(false, std::memory_order_release);
+
+    q.refresh_timeout_token.fetch_add(1, std::memory_order_acq_rel);
+    q.refresh_timeout_count.store(0, std::memory_order_release);
     if (success) {
         q.backoff_level.store(0, std::memory_order_release);
         q.next_allowed_ms.store(0, std::memory_order_release);
@@ -151,7 +164,9 @@ void TraderCTP::query_once(QueryKind kind) {
             XtLogger::debug_m("TD", "query {} start", meta.name);
         q.backoff_level.store(0, std::memory_order_release);
         q.next_allowed_ms.store(0, std::memory_order_release);
+
         arm_recovery_query_timeout(kind);
+        arm_refresh_query_timeout(kind);
         return;
     }
 

@@ -98,4 +98,4 @@ target_include_directories(xt_td PUBLIC
     ${CMAKE_SOURCE_DIR}/xt_logger
     ${CMAKE_SOURCE_DIR}/xt_account
 )
-target_link_libraries(xt_td PUBLIC xt_core xt_config xt_logger xt_engine_common xt_live_telemetry xt_util CTP::Trader)  # Plan v1.4 Z6
+target_link_libraries(xt_td PUBLIC xt_core xt_config xt_logger xt_engine_common xt_live_telemetry xt_util xt_gateway_common CTP::Trader)  # Plan v1.4 Z6; xt_gateway_common: XtExecDeliveryLedger

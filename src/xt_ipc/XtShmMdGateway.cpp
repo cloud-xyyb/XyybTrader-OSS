@@ -6,9 +6,14 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <unordered_set>
 
 #include "xt_core/market/XtRawTick.h"
+#include "xt_ipc/XtMdSidecarPath.h"
 #include "xt_ipc/XtMdWireContract.h"
 #include "xt_ipc/XtShmRing.h"
 #include "xt_util/time/XtSteadyClock.h"
@@ -16,7 +21,7 @@
 namespace xt_ipc {
 
 namespace {
-using Ring = XtShmRing<XtRawTick>;
+using Ring = XtShmRing<XtMdWireSlot>;
 
 uint32_t steady_ms_lo() {
     return static_cast<uint32_t>(XtSteadyClock::steady_now_ms());
@@ -66,6 +71,10 @@ IMdGateway::Capabilities XtShmMdGateway::capabilities() const {
 
 void XtShmMdGateway::bind_callbacks(Callbacks callbacks) { cbs_ = std::move(callbacks); }
 
+void XtShmMdGateway::set_md_tap(std::function<void(const XtRawTick&)> tap) {
+    md_tap_ = std::move(tap);
+}
+
 bool XtShmMdGateway::check_health(uint32_t now_ms) {
     if (!attached_.load(std::memory_order_acquire)) return false;
     const uint32_t last = last_head_advance_ms_.load(std::memory_order_acquire);
@@ -87,23 +96,112 @@ void XtShmMdGateway::mark_disconnected(int reason) {
     }
 }
 
+bool XtShmMdGateway::read_subs_sidecar_(std::unordered_set<std::string>& out) const {
+
+    static const char* const kCandidateDirs[] = {"/run/xyybtrader", "/tmp"};
+    for (const char* dir : kCandidateDirs) {
+        std::ifstream in(md_sidecar_path(dir, ring_name_, ".subs"));
+        if (!in.is_open()) continue;
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t b = line.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) continue;
+            const size_t e = line.find_last_not_of(" \t\r\n");
+            out.insert(line.substr(b, e - b + 1));
+        }
+        return true;
+    }
+    return false;
+}
+
+void XtShmMdGateway::validate_declared_subset_() {
+    if (declared_.empty()) return;
+
+    subs_checks_total_.fetch_add(1, std::memory_order_relaxed);
+
+    std::unordered_set<std::string> subs;
+    if (!read_subs_sidecar_(subs)) {
+
+        if (!subs_missing_warned_) {
+            subs_missing_warned_ = true;
+            std::fprintf(stderr,
+                         "xt_ipc XtShmMdGateway(%s): subs sidecar 缺失/不可读，跳过 declared⊆subs "
+                         "校验（旧 connector 或滚动窗口；向后兼容不阻塞 attach）\n",
+                         ring_name_.c_str());
+        }
+        return;
+    }
+
+    std::string missing;
+    for (const auto& d : declared_) {
+        if (subs.count(d) == 0) {
+            if (!missing.empty()) missing += ',';
+            missing += d;
+        }
+    }
+    if (!missing.empty()) {
+        subs_mismatch_total_.fetch_add(1, std::memory_order_relaxed);
+
+        std::fprintf(stderr,
+                     "xt_ipc XtShmMdGateway(%s): declared 合约不在 connector subs 集内: [%s]"
+                     "（这些合约的 tick 将永不到达；初始 ready 门已 fail-closed 兜底）\n",
+                     ring_name_.c_str(), missing.c_str());
+    }
+}
+
+void XtShmMdGateway::note_attach_fail_(const char* reason) {
+    attach_fail_count_.fetch_add(1, std::memory_order_relaxed);
+    attach_failing_.store(1, std::memory_order_relaxed);
+    attach_last_reason_.store(reason, std::memory_order_relaxed);
+
+    const uint32_t now = steady_ms_lo();
+    const bool reason_changed =
+        (attach_log_last_reason_ == nullptr) ||
+        (std::strcmp(attach_log_last_reason_, reason) != 0);
+    if (!attach_logged_once_ || reason_changed ||
+        static_cast<uint32_t>(now - attach_log_last_ms_) >= 60000u) {
+        std::fprintf(stderr,
+                     "xt_ipc XtShmMdGateway(%s): shm attach 失败 [%s]（reader 线程持续重试；"
+                     "md_ready 初始门已 fail-closed 兜住交易）\n",
+                     ring_name_.c_str(), reason);
+        attach_logged_once_ = true;
+        attach_log_last_reason_ = reason;
+        attach_log_last_ms_ = now;
+    }
+}
+
+void XtShmMdGateway::note_attach_ok_() {
+    attach_failing_.store(0, std::memory_order_relaxed);
+    attach_log_last_reason_ = nullptr;
+    attach_logged_once_ = false;
+}
+
 bool XtShmMdGateway::attach_segment() {
     int fd = shm_open(ring_name_.c_str(), O_RDONLY, 0);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        note_attach_fail_("shm_open");
+        return false;
+    }
 
     struct stat st {};
     if (fstat(fd, &st) != 0) {
         close(fd);
+        note_attach_fail_("fstat");
         return false;
     }
     const uint64_t mapped = static_cast<uint64_t>(st.st_size);
     void* base = mmap(nullptr, mapped, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
-    if (base == MAP_FAILED) return false;
+    if (base == MAP_FAILED) {
+        note_attach_fail_("mmap");
+        return false;
+    }
 
     const auto* ctrl = reinterpret_cast<const RingControlBlock*>(base);
-    if (validate_ring(ctrl, mapped, Ring::kSlotStride) != nullptr) {
+    if (const char* err = validate_ring(ctrl, mapped, Ring::kSlotStride, Ring::kElementSize);
+        err != nullptr) {
         munmap(base, mapped);
+        note_attach_fail_(err);
         return false;
     }
 
@@ -112,6 +210,7 @@ bool XtShmMdGateway::attach_segment() {
     seg_ino_ = static_cast<uint64_t>(st.st_ino);
     seg_dev_ = static_cast<uint64_t>(st.st_dev);
     seg_epoch_ = read_seg_epoch(base);
+    note_attach_ok_();
     return true;
 }
 
@@ -148,6 +247,8 @@ void XtShmMdGateway::reader_loop() {
     Ring::Reader* reader = nullptr;
     uint32_t last_seg_check_ms = 0;
 
+    bool initial_tick_seen = false;
+
     auto release_segment = [&] {
         delete reader;
         reader = nullptr;
@@ -156,17 +257,19 @@ void XtShmMdGateway::reader_loop() {
         detach_segment();
     };
 
-    XtRawTick tick{};
+    XtMdWireSlot slot{};
     while (!stop_.load(std::memory_order_acquire)) {
 
         if (!attached_.load(std::memory_order_acquire)) {
             if (attach_segment()) {
                 ring = new Ring(mmap_base_);
                 reader = new Ring::Reader(ring->make_reader());
+                initial_tick_seen = false;
 
                 last_head_advance_ms_.store(steady_ms_lo(), std::memory_order_release);
                 attached_.store(true, std::memory_order_release);
-                mark_ready();
+                validate_declared_subset_();
+
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
@@ -174,20 +277,28 @@ void XtShmMdGateway::reader_loop() {
         }
 
         bool got_any = false;
-        for (int i = 0; reader && i < 256 && reader->next(tick); ++i) {
+        bool accepted_any = false;
+        for (int i = 0; reader && i < 256 && reader->next(slot); ++i) {
             got_any = true;
+            const XtRawTick& tick = slot.tick;
 
             if (declared_.empty() ||
                 declared_.count(std::string(tick.code,
                                             ::strnlen(tick.code, sizeof(tick.code)))) != 0) {
-                if (cbs_.on_tick) cbs_.on_tick(tick);
+                accepted_any = true;
+
+                if (md_tap_) md_tap_(tick);
+
+                if (cbs_.on_tick) cbs_.on_tick(tick, static_cast<uint64_t>(slot.capture_ns));
             }
         }
+        if (accepted_any) initial_tick_seen = true;
 
         const uint32_t now = steady_ms_lo();
         if (got_any) {
             last_head_advance_ms_.store(now, std::memory_order_release);
-            mark_ready();
+
+            if (initial_tick_seen) mark_ready();
             continue;
         }
 

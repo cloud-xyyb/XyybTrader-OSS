@@ -149,7 +149,8 @@ void maybe_push_orphan_reap(XtHftRunnerControlContext& ctx,
                             int64_t now_ms,
                             ControlLoopState& st) {
     const XtLiveOrderGatewayCfg* gw_cfg = ctx.order_gateway_cfg;
-    if (!gw_cfg || !gw_cfg->orphan_reap_enabled) return;
+    if (!gw_cfg) return;
+    if (!gw_cfg->orphan_reap_enabled && !gw_cfg->lost_terminal_reconcile_enabled) return;
     if (st.last_orphan_reap_push_ms != 0
         && now_ms - st.last_orphan_reap_push_ms < gw_cfg->orphan_reap_interval_ms) {
         return;
@@ -159,7 +160,8 @@ void maybe_push_orphan_reap(XtHftRunnerControlContext& ctx,
         XtHftRunnerEvent::make_reap_recovered_orphans(
             now_ms, gw_cfg->orphan_reap_grace_ms,
             static_cast<uint32_t>(gw_cfg->orphan_reap_max_per_sweep),
-            gw_cfg->lost_terminal_reconcile_enabled));
+            gw_cfg->lost_terminal_reconcile_enabled,
+            gw_cfg->orphan_reap_enabled));
 }
 
 void process_consistency_policy(std::atomic<bool>& shutdown,
@@ -294,12 +296,15 @@ void log_control_stats(const ControlSnapshot& s, uint64_t latency_sla_breach_tot
     const uint64_t blocked_not_ready = reject_count_by_reason(s.risk_stats, "TRADING_NOT_READY");
     const uint64_t blocked_recovering = reject_count_by_reason(s.risk_stats, "TD_RECOVERING");
     XtLogger::info_m("RT",
-                     "tick md_in={} enq={} proc={} drop={} tick_lag_p99_us={} td_peak={} event_reject={} lag_max_us={} submit_ok={}/{} trades={} reject_top={} blocked_not_ready={} blocked_recovering={} query_pos(throttle/skip/merge)={}/{}/{} lat_ack_p99/p999_us={}/{} lat_fill_p99/p999_us={}/{} lat_ack_fill_p99/p999_us={}/{} lat_cb_strategy_p99/p999_us={}/{} lat_inflight={} lat_sla_breach_total={} param_ver={}",
+                     "tick md_in={} enq={} proc={} drop={} tick_lag_p50/p99/peak_us={}/{}/{} td_flow_lag_p99_us={} td_peak={} event_reject={} lag_max_us={} submit_ok={}/{} trades={} reject_top={} blocked_not_ready={} blocked_recovering={} query_pos(throttle/skip/merge)={}/{}/{} lat_ack_p99/p999_us={}/{} lat_fill_p99/p999_us={}/{} lat_ack_fill_p99/p999_us={}/{} lat_cb_strategy_p99/p999_us={}/{} lat_inflight={} lat_sla_breach_total={} param_ver={}",
                      s.md_in,
                      s.enq,
                      s.proc,
                      s.tick_drop,
+                     s.tick_lag_p50_us,
                      s.tick_lag_p99_us,
+                     s.tick_lag_peak_us,
+                     s.td_flow_lag_p99_us,
                      s.td_event_peak_backlog,
                      s.td_flow_event_rejected,
                      s.td_flow_event_lag_us_max,

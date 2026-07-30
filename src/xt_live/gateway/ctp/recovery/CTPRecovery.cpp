@@ -70,6 +70,7 @@ void CtpRecovery::reset() {
     ++reset_gen_;
     pos_cache_.clear();
     pos_bucket_cache_.clear();
+    pos_query_owner_req_ = 0;
     recovering_.store(recovery_enabled_, std::memory_order_release);
 }
 
@@ -93,24 +94,63 @@ void CtpRecovery::on_login() {
     else                             emit_ready();
 }
 
-void CtpRecovery::on_position(const CThostFtdcInvestorPositionField* pPosition, bool bIsLast) {
+void CtpRecovery::begin_position_query(int request_id) {
+
+    std::lock_guard<std::mutex> guard(mu_);
+    pos_query_owner_req_ = request_id;
+    pos_cache_.clear();
+    pos_bucket_cache_.clear();
+}
+
+bool CtpRecovery::position_query_owns(int request_id) const {
+    std::lock_guard<std::mutex> guard(mu_);
+
+    return pos_query_owner_req_ == 0 || request_id <= 0 ||
+           request_id == pos_query_owner_req_;
+}
+
+void CtpRecovery::note_stale_position_frame() {
+    stale_position_frame_dropped_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t CtpRecovery::stale_position_frame_dropped() const {
+    return stale_position_frame_dropped_.load(std::memory_order_relaxed);
+}
+
+uint64_t CtpRecovery::stale_position_frame_unfenceable() const {
+    return stale_position_frame_unfenceable_.load(std::memory_order_relaxed);
+}
+
+bool CtpRecovery::on_position(const CThostFtdcInvestorPositionField* pPosition,
+                              bool bIsLast, int request_id) {
     PositionsPublisher      publish_positions;
     QueryStarter            start_account_query;
     std::vector<PositionSnapshot> out;
     {
         std::lock_guard<std::mutex> guard(mu_);
-        if (!recovery_enabled_) return;
+        if (!recovery_enabled_) return true;
+
+        if (pos_query_owner_req_ != 0) {
+            if (request_id <= 0) {
+                stale_position_frame_unfenceable_.fetch_add(1, std::memory_order_relaxed);
+            } else if (request_id != pos_query_owner_req_) {
+                stale_position_frame_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
         if (pPosition && pPosition->InstrumentID[0])
             merge_position_row(pPosition);
-        if (!bIsLast) return;
+        if (!bIsLast) return true;
         recovered_positions_ = true;
         out                 = collect_snapshots();
+        pos_query_owner_req_ = 0;
         publish_positions   = publish_positions_;
         start_account_query = start_account_query_;
     }
 
     if (publish_positions)   publish_positions(out);
     if (start_account_query) start_account_query();
+    return true;
 }
 
 void CtpRecovery::on_account_done(bool bIsLast) {

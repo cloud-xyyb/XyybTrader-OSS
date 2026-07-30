@@ -8,23 +8,28 @@
 
 namespace xt_identity {
 
-/// @brief 为策略字符串 ID 分配稳定的 sid_id。
+/// @brief 策略字符串 ID 到整数 sid_id 的注册表。
 ///
-/// StrategySidRegistry 在 bootstrap 阶段按配置顺序注册策略 ID，并把字符串 sid
-/// 转为适合热路径和 wire/report 传递的 uint32 sid_id。
-/// sid_id 0 保留给空 sid / single-strategy。
+/// 多策略部署里，订单和回报都要标明归属哪个策略；直接传 std::string 策略名在热路径和
+/// wire/report 上都嫌贵。本注册表在 bootstrap 阶段按配置顺序给每个策略名分配一个稳定的
+/// uint32 sid_id，热路径此后只传这个整数。sid_id 0 保留给空 sid / single-strategy。
 ///
-/// `freeze()` 后 registry 只服务 lookup 和 reverse lookup；
-/// `global()` 是 non-owning process-global 指针，由装配方设置和清理。
+/// `freeze()` 后只服务 lookup 和反查；`global()` 是 non-owning process-global 指针，由装配方
+/// 设置和清理。
 class StrategySidRegistry {
 public:
 
     static constexpr uint32_t kNoSidId = 0;
 
+    static constexpr uint32_t kManualSidId = 0xFFFF'FFFEu;
+
+    static constexpr const char* kManualStrategyId = "_manual";
+
     StrategySidRegistry() : id_to_name_{""} {
     }
 
     uint32_t register_or_lookup(const std::string& sid_string) {
+        if (sid_string == kManualStrategyId) return kManualSidId;
         if (sid_string.empty()) return kNoSidId;
         auto it = name_to_id_.find(sid_string);
         if (it != name_to_id_.end()) return it->second;
@@ -47,11 +52,13 @@ public:
     bool is_frozen() const noexcept { return frozen_; }
 
     uint32_t lookup(const std::string& sid_string) const {
+        if (sid_string == kManualStrategyId) return kManualSidId;
         auto it = name_to_id_.find(sid_string);
         return it != name_to_id_.end() ? it->second : kNoSidId;
     }
 
     const std::string& name(uint32_t sid_id) const {
+        if (sid_id == kManualSidId) return manual_reserved_name();
         return sid_id < id_to_name_.size() ? id_to_name_[sid_id] : id_to_name_[0];
     }
 
@@ -63,6 +70,8 @@ public:
 
     static const char* resolve_sid_cstr_or_null(uint32_t sid_id) noexcept {
         if (sid_id == kNoSidId) return nullptr;
+
+        if (sid_id == kManualSidId) return kManualStrategyId;
         auto* reg = global();
         if (!reg) return nullptr;
         const std::string& s = reg->name(sid_id);
@@ -70,6 +79,11 @@ public:
     }
 
 private:
+
+    static const std::string& manual_reserved_name() {
+        static const std::string s(kManualStrategyId);
+        return s;
+    }
 
     std::vector<std::string> id_to_name_;
 

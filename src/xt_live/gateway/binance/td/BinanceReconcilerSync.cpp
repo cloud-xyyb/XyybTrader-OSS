@@ -170,28 +170,31 @@ BinanceReconciler::fetch_positions() {
     return positions;
 }
 
-void BinanceReconciler::forward_uds_trade(const XtTradeRecord& tr) {
+void BinanceReconciler::forward_uds_trade(const XtTradeRecord& tr,
+                                          XtLatencyEligibility elig) {
     {
         std::lock_guard<std::mutex> lk(resync_gate_mu_);
         if (resync_buffering_) {
+
             resync_fill_buffer_.push_back(tr);
             return;
         }
     }
-    if (cb_.on_trade) cb_.on_trade(tr);
+    if (cb_.on_trade) cb_.on_trade(tr, elig);
 }
 
 void BinanceReconciler::forward_order_update_gated(
-    const XtOrderExecUpdate& upd, EffectiveSignalDedup::Source src) {
+    const XtOrderExecUpdate& upd, EffectiveSignalDedup::Source src,
+    XtLatencyEligibility elig) {
 
     if (order_status_is_final(upd.status)) {
         std::lock_guard<std::mutex> lk(resync_gate_mu_);
         if (resync_buffering_) {
-            resync_terminal_buffer_.emplace_back(upd, src);
+            resync_terminal_buffer_.push_back(ResyncTerminal{upd, src, elig});
             return;
         }
     }
-    hooks_.emit_through_dedup(upd, src);
+    hooks_.emit_through_dedup(upd, src, elig);
 }
 
 void BinanceReconciler::forward_uds_position(
@@ -214,8 +217,9 @@ void BinanceReconciler::forward_uds_position(
     if (cb_.on_position) cb_.on_position(positions);
 }
 
-void BinanceReconciler::emit_reconcile_terminal_update(const XtOrderExecUpdate& upd) {
-    forward_order_update_gated(upd, EffectiveSignalDedup::Source::kAck);
+void BinanceReconciler::emit_reconcile_terminal_update(const XtOrderExecUpdate& upd,
+                                                       XtLatencyEligibility elig) {
+    forward_order_update_gated(upd, EffectiveSignalDedup::Source::kAck, elig);
 }
 
 BinanceReconciler::ResyncFillGate::ResyncFillGate(BinanceReconciler& reconciler)
@@ -247,7 +251,7 @@ void BinanceReconciler::finish_resync_fill_gate_(
     std::lock_guard<std::mutex> lk(resync_gate_mu_);
     std::vector<XtTradeRecord> buffered;
     buffered.swap(resync_fill_buffer_);
-    std::vector<std::pair<XtOrderExecUpdate, EffectiveSignalDedup::Source>> terminals;
+    std::vector<ResyncTerminal> terminals;
     terminals.swap(resync_terminal_buffer_);
     resync_buffering_ = false;
 
@@ -257,8 +261,8 @@ void BinanceReconciler::finish_resync_fill_gate_(
          positions != nullptr);
 
     const auto drain_terminals = [&] {
-        for (const auto& [upd, src] : plan.terminals) {
-            hooks_.emit_through_dedup(upd, src);
+        for (const auto& t : plan.terminals) {
+            hooks_.emit_through_dedup(t.upd, t.src, t.elig);
         }
         if (!plan.terminals.empty()) {
             XtLogger::warn_m("BinanceTD",
@@ -268,7 +272,7 @@ void BinanceReconciler::finish_resync_fill_gate_(
     };
 
     for (const auto& tr : plan.pre_fills) {
-        if (cb_.on_trade) cb_.on_trade(tr);
+        if (cb_.on_trade) cb_.on_trade(tr, XtLatencyEligibility::kIneligible);
     }
 
     if (!plan.emit_position) {
@@ -286,7 +290,7 @@ void BinanceReconciler::finish_resync_fill_gate_(
     }
 
     for (const auto& tr : plan.post_fills) {
-        if (cb_.on_trade) cb_.on_trade(tr);
+        if (cb_.on_trade) cb_.on_trade(tr, XtLatencyEligibility::kIneligible);
     }
 
     drain_terminals();
@@ -458,17 +462,7 @@ void BinanceReconciler::refresh_snapshot() {
         bt.available_balance_fp = det->available_balance_fp;
         bt.maint_margin_fp = det->maint_margin_fp;
         bt.total_margin_balance_fp = det->total_margin_balance_fp;
-        bt.per_symbol.reserve(det->per_symbol.size());
-        for (const auto& pos : det->per_symbol) {
-            PerSymbolTruth row;
-            row.symbol = pos.symbol;
-            row.qty_fp = pos.qty_fp;
-            row.avg_price_fp = pos.avg_price_fp;
-            row.mark_price_fp = pos.mark_price_fp;
-            row.unrealized_pnl_fp = pos.unrealized_pnl_fp;
-            row.margin_fp = pos.margin_fp;
-            bt.per_symbol.push_back(std::move(row));
-        }
+        bt.per_symbol = std::move(det->per_symbol);
         bt.per_symbol_is_broker_truth = true;
         cb_.on_broker_account_truth(bt);
     }
@@ -520,6 +514,29 @@ void BinanceReconciler::bootstrap_snapshot() {
 
                     const std::string symbol = defensive_symbol(p);
                     if (!symbol.empty()) tracked_symbols_.note(symbol);
+
+                    bool provable_nonzero_position = false;
+                    try {
+
+                        const auto it_amt = p.find("positionAmt");
+                        if (it_amt != p.end() && it_amt->is_number()) {
+                            provable_nonzero_position = it_amt->get<double>() != 0.0;
+                        } else {
+                            provable_nonzero_position =
+                                stod_finite(p.value("positionAmt", "0")) != 0.0;
+                        }
+                    } catch (...) {
+
+                    }
+                    if (provable_nonzero_position) {
+                        XtLogger::error_m("BinanceTD",
+                            "bootstrap: unparsable non-zero positionRisk row symbol='{}'; "
+                            "hold Position readiness fail-closed", symbol);
+                        readiness_gate_.fail(
+                            xt_live::gateway::TdReadinessStage::Position,
+                            "unparsable non-zero positionRisk row symbol=" + symbol);
+                        return;
+                    }
                     XtLogger::warn_m("BinanceTD",
                         "bootstrap: unparsable positionRisk row dropped symbol='{}' "
                         "(seeded to tracked set)", symbol);

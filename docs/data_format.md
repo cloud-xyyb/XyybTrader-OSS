@@ -99,14 +99,14 @@ backtest:
 
 ## 6. 运行须知
 
-1. **config 必须用 `--config <path>`（或 `-c` / `XT_CONFIG` env）传**。
-   裸位置参数 `XtBackTestRunner my.yaml` 会被**静默忽略**，然后回退搜索
-   cwd / 可执行文件上层目录里的 `backtest.yaml`。
+1. **config 用 `--config <path>`（或 `-c` / `XT_CONFIG` env）传；裸 `.yaml/.yml` 位置参数也接受**
+   （`XtBackTestRunner my.yaml` 等价 `--config my.yaml`）。其它无法识别的裸参数会打告警忽略；
+   什么都没传时回退搜索 cwd / 可执行文件上层目录里的 `backtest.yaml`。
 2. **策略插件白名单**：`CLOUDTRADER_PLUGIN_ALLOWLIST=libXXX_strategy.so`（逗号分隔多个）必须点名要加载的 .so，否则拒载（loader 默认 fail-closed；`CLOUDTRADER_PLUGIN_ALLOWLIST_ENFORCE=0` 可显式关闭，仅限 dev）。
 3. **插件 sha256 sidecar 默认必需**：loader 默认 strict signing，`.so` 同目录**必须**存在 `<name>.so.sha256` 且内容与当前 .so 的 sha256 一致；缺失或不匹配都拒载（重编插件后要同步重新生成 sidecar）。dev 可用
    `CLOUDTRADER_PLUGIN_STRICT_SIGNING=0` 显式关闭校验。
 4. 加载 profile 时，loader 要求同目录必须存在 market.yaml。它会按路径 deep-merge 到最终配置里，并覆盖主 profile 的同名字段；如果只是想让临时配置目录与仓库默认 market 配置隔离，放一个内容为 {} 的空 market.yaml 即可。--emit-config 生成配置时会自动补这个空文件。
-5. 期货单合约（例如：ag2606）回测请显式关闭换月：在 backtest profile 里写 `roll: {active: false}`。否则 runner 会尝试加载换月表；表缺失时会启动失败。。
+5. 期货单合约（例如：ag2606）回测请显式关闭换月：在 backtest profile 里写 `roll: {active: false}`。否则 runner 会尝试加载换月表；表缺失时会启动失败。
 6. **report_dir 自动加时间戳后缀**：`report_dir: /tmp/foo` 实际产出
    `/tmp/foo_<epoch_ms>/`（`fills.csv` / `trade_excursions.csv` /
    `daily_breakdown.json`）。

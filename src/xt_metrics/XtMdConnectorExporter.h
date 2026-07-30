@@ -32,6 +32,8 @@ public:
 
     void set_check_health(bool healthy);
 
+    void set_stale_watchdog_active(bool active);
+
     void set_uptime_seconds(double seconds);
 
     void set_epoch(uint64_t epoch);

@@ -12,6 +12,8 @@ set(XT_BT_DATA_SOURCES
     reader/XtBinTickReader.cpp
     reader/XtFbsTickReader.cpp          # fbs event-store reader
     reader/XtEventParquetReader.cpp     # canonical events parquet reader
+    reader/XtRawShardTickReader.cpp     # RawShardV3 分片 reader
+    reader/XtTickShardBuilder.cpp       # CSV -> RawShardV3 分片建库（单 pass、驻留有界）
     reader/XtTickCollector.cpp
     source/XtMarketDataSource.cpp
     source/XtMarketDataSource_prepare.cpp
@@ -46,4 +48,19 @@ target_link_libraries(xt_bt_data PUBLIC
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_libraries(xt_bt_data PUBLIC stdc++fs)
+endif()
+
+# 分片计划落定注入点（见 source/detail/XtShardPlanHook.h）只装进需要它的测试可执行文件。
+#
+# seam 要生效必须让 ensure_tick_shard_cache 那个 TU 带着 XT_BT_TEST_SEAMS 编译，而
+# xt_bt_data 同时被 XtBackTestRunner 消费——定义挂在库上就必然跟着进生产二进制。故单独
+# 把该 TU 再编一份放进 object library：链接时 object 先于 archive 落位，用它的符号顶掉
+# 归档里那份，xt_bt_data / XtBackTestRunner 自身一个 hook 符号都不带（含 tests=ON 的同
+# 一构建树）。EXCLUDE_FROM_ALL：只有显式链它的测试目标才会编。
+if(CLOUDTRADER_BUILD_TESTS)
+    add_library(xt_bt_data_test_seams OBJECT EXCLUDE_FROM_ALL
+        source/XtMarketDataSource_prepare.cpp
+    )
+    target_compile_definitions(xt_bt_data_test_seams PUBLIC XT_BT_TEST_SEAMS)
+    target_link_libraries(xt_bt_data_test_seams PUBLIC xt_bt_data)
 endif()

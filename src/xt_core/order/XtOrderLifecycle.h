@@ -9,7 +9,12 @@
 #include "XtOrderTypes.h"
 
 /// @file
-/// @brief Protocol-agnostic 订单生命周期 helper 与去重器。
+/// @brief venue 无关的订单生命周期判定与回报去重。
+///
+/// 不同交易所推来的订单回报格式各异，但生命周期语义相同：一单从报出走到终态，中途可能被
+/// 重复推送、或推来进度倒退的旧回报。本文件把这些判定收成一处——算有效剩余量、判是否终态、
+/// 比两条回报是否同进度——外加一个去重器：吞掉终态后的重复回报、进度回退和原地重复的更新，
+/// 只把真正推进的回报放行给下游。
 
 namespace order_lifecycle {
 
@@ -42,6 +47,8 @@ public:
     bool should_emit(uint64_t order_id, const XtOrderExecUpdate& upd, StatusRankFn rank_fn = nullptr);
 
     void forget(uint64_t order_id);
+
+    bool last_update(uint64_t order_id, XtOrderExecUpdate& out) const;
 
     void clear();
 

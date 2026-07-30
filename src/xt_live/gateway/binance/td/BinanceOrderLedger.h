@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -40,6 +41,8 @@ public:
         uint64_t submit_ts_ms = 0;
         bool has_pending = false;
         bool has_inflight = false;
+
+        std::unordered_set<int64_t> fill_tids;
     };
 
     /// @brief in-flight 记录的只读快照行（ghost sweep / gap-fill 归因用）。
@@ -70,6 +73,20 @@ public:
     };
 
     static constexpr std::size_t kTerminalOrderCacheCap = 8192;
+    static constexpr std::size_t kMaxFillKeysPerOrder = 1024;
+    static constexpr std::size_t kOrderlessFillWindowCap = 8192;
+
+    /// @brief fill 去重侧道计数快照（进程内观测，非 prom）。
+    struct FillDedupStats {
+        uint64_t per_order_dups = 0;
+        uint64_t cross_domain_dups = 0;
+        uint64_t self_trade_leg_passthrough = 0;
+        uint64_t per_order_overflow = 0;
+        uint64_t orderless_routed = 0;
+        uint64_t orderless_dups = 0;
+        uint64_t route_erased_ack = 0;
+        uint64_t route_erased_reconcile = 0;
+    };
 
     void register_submit(uint64_t local_id, OrderRecord rec);
 
@@ -87,6 +104,15 @@ public:
     bool terminal_seen(uint64_t local_id) const;
 
     void remember_terminal(uint64_t local_id);
+
+    bool note_fill_seen(uint64_t order_id, std::string_view symbol, int64_t trade_id);
+
+    FillDedupStats fill_dedup_stats() const;
+
+    bool is_order_terminal(uint64_t local_id) const;
+
+    bool lookup_terminal(uint64_t local_id, XtOrderStatus& out_status,
+                         int64_t& out_filled_fp) const;
 
     bool is_inflight(uint64_t local_id) const;
 
@@ -112,13 +138,35 @@ private:
 
     static void erase_inflight_unlocked_(OrderRecord& rec);
 
-    void erase_client_route_unlocked_(OrderRecord& rec);
+    bool erase_client_route_unlocked_(OrderRecord& rec);
+
+    void settle_ack_terminal_unlocked_(OrderRecord& rec);
+
+    bool note_orderless_fill_unlocked_(std::string_view symbol, int64_t trade_id);
+
+    static std::string make_orderless_fill_key_(std::string_view symbol, int64_t trade_id);
+
+    bool orderless_fill_contains_unlocked_(const std::string& key) const;
+
+    void insert_orderless_fill_unlocked_(std::string key, uint64_t owner);
 
     mutable std::mutex ledger_mu_;
     std::unordered_map<uint64_t, OrderRecord> records_;
     std::unordered_map<std::string, uint64_t> client_to_local_;
     std::unordered_set<uint64_t> terminal_orders_;
     std::deque<uint64_t> terminal_order_fifo_;
+
+    std::unordered_map<std::string, uint64_t> orderless_fill_keys_;
+    std::deque<std::string> orderless_fill_fifo_;
+
+    std::atomic<uint64_t> per_order_fill_dups_{0};
+    std::atomic<uint64_t> cross_domain_fill_dups_{0};
+    std::atomic<uint64_t> self_trade_leg_passthrough_{0};
+    std::atomic<uint64_t> per_order_fill_overflow_{0};
+    std::atomic<uint64_t> orderless_fill_routed_{0};
+    std::atomic<uint64_t> orderless_fill_dups_{0};
+    std::atomic<uint64_t> route_erased_ack_{0};
+    std::atomic<uint64_t> route_erased_reconcile_{0};
 };
 
 }

@@ -74,6 +74,9 @@ public:
 
     [[nodiscard]] bool is_order_terminal(uint64_t local_id) const override;
 
+    [[nodiscard]] bool lookup_terminal(uint64_t local_id,
+                                       XtOrderTerminalRecord& out) const override;
+
     void bind_td(ITradeGateway* td);
 
     void bind_md(IMdGateway* md);
@@ -168,7 +171,20 @@ public:
 
     void pre_warm_risk(const std::vector<std::string>& symbols);
 
-    void notify_order_terminal(const char* code, bool is_buy) override;
+    size_t stp_registered_count() const;
+
+    size_t stp_registered_gauge() const;
+
+    size_t stp_active_order_count() {
+        return cfg_.stp_enabled ? stp_checker_.active_order_count() : 0;
+    }
+
+    void notify_order_terminal(uint64_t order_id) override;
+
+    void rearm_active_order(const std::string& code, uint64_t id,
+                            bool is_buy, int64_t price_fp) override;
+
+    void stp_rearm_reverse_sync(const std::vector<AliveInflightOrder>& orders, bool is_cold_start);
 
     void record_order_terminal(XtOrderStatus status) override;
 

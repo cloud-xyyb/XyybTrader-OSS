@@ -125,11 +125,6 @@ struct XtMetricRegistry::Impl {
 
     prometheus::Family<prometheus::Histogram>* fam_strategy_us          = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_local_submit_us      = nullptr;
-    prometheus::Family<prometheus::Histogram>* fam_ack_path_us          = nullptr;
-    prometheus::Family<prometheus::Histogram>* fam_fill_after_ack_us    = nullptr;
-    prometheus::Family<prometheus::Histogram>* fam_event_to_ack_us      = nullptr;
-    prometheus::Family<prometheus::Histogram>* fam_event_to_fill_us     = nullptr;
-    prometheus::Family<prometheus::Counter>*   fam_stage_taps_dropped_total = nullptr;
 
     prometheus::Family<prometheus::Histogram>* fam_md_event_to_recv_us    = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_md_internal_queue_us   = nullptr;
@@ -211,6 +206,11 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_hft_worker_guard_fail_total = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_open_orders = nullptr;
 
+    prometheus::Family<prometheus::Gauge>* fam_shm_md_attach_failing = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_shm_md_attach_fail_count = nullptr;
+
+    prometheus::Family<prometheus::Gauge>* fam_stp_registered_symbols = nullptr;
+
     prometheus::Family<prometheus::Counter>* fam_runtime_book_drop_total = nullptr;
 
     prometheus::Family<prometheus::Counter>* fam_dropped_total = nullptr;
@@ -219,6 +219,8 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_runtime_market_drop_total = nullptr;
 
     prometheus::Family<prometheus::Counter>* fam_latency_meta_miss_total = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_latency_eligible_total = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_latency_tap_dropped_total = nullptr;
 
     prometheus::Family<prometheus::Counter>* fam_broker_frozen_stale_total = nullptr;
 
@@ -249,9 +251,10 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Gauge>* fam_runner_bucket_schema_info    = nullptr;
 
     prometheus::Family<prometheus::Gauge>* fam_md_gap_ms_p99 = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_md_gap_ms_peak = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_md_age_ms = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_event_drop = nullptr;
-    prometheus::Family<prometheus::Gauge>* fam_queue_depth_p99 = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_queue_depth = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_risk_block_count = nullptr;
 
     Impl() {
@@ -337,26 +340,6 @@ struct XtMetricRegistry::Impl {
         fam_local_submit_us = &prometheus::BuildHistogram()
             .Name("xt_local_submit_us")
             .Help("Local submit path (strategy decision → userspace write complete)")
-            .Register(*registry);
-        fam_ack_path_us = &prometheus::BuildHistogram()
-            .Name("xt_ack_path_us")
-            .Help("ACK path (userspace write → venue ACK callback)")
-            .Register(*registry);
-        fam_fill_after_ack_us = &prometheus::BuildHistogram()
-            .Name("xt_fill_after_ack_us")
-            .Help("Fill latency after ACK (ACK callback → first fill callback)")
-            .Register(*registry);
-        fam_event_to_ack_us = &prometheus::BuildHistogram()
-            .Name("xt_event_to_ack_us")
-            .Help("End-to-end tick→ACK (sum of strategy + local_submit + ack_path)")
-            .Register(*registry);
-        fam_event_to_fill_us = &prometheus::BuildHistogram()
-            .Name("xt_event_to_fill_us")
-            .Help("End-to-end tick→Fill (sum of all four stages)")
-            .Register(*registry);
-        fam_stage_taps_dropped_total = &prometheus::BuildCounter()
-            .Name("xt_stage_taps_dropped_total")
-            .Help("Hot-path tap-buffer overflows; >1% drop rate disqualifies the histogram for SLA")
             .Register(*registry);
 
         fam_md_event_to_recv_us = &prometheus::BuildHistogram()
@@ -705,16 +688,41 @@ struct XtMetricRegistry::Impl {
                   "(labels: venue)")
             .Register(*registry);
 
+        fam_shm_md_attach_failing = &prometheus::BuildGauge()
+            .Name("xt_shm_md_attach_failing")
+            .Help("shm MD reader attach state (1=most recent attach attempt failed "
+                  "and not yet recovered, 0=attached/never-failed; labels: ring). "
+                  "Only present when md.transport=shm (multibook reader).")
+            .Register(*registry);
+        fam_shm_md_attach_fail_count = &prometheus::BuildGauge()
+            .Name("xt_shm_md_attach_fail_count")
+            .Help("Cumulative shm MD reader attach failures since process start "
+                  "(monotonic gauge; labels: ring). Diagnostic companion to "
+                  "xt_shm_md_attach_failing.")
+            .Register(*registry);
+
+        fam_stp_registered_symbols = &prometheus::BuildGauge()
+            .Name("xt_stp_registered_symbols")
+            .Help("Number of symbols armed in the STP self-trade guard "
+                  "(labels: venue). 0 = STP not pre-warmed = self-trade guard "
+                  "bypassed. Set once at runner assembly after pre_warm_risk.")
+            .Register(*registry);
+
         fam_runtime_book_drop_total = &prometheus::BuildCounter()
             .Name("xt_runtime_book_drop_total")
             .Help("XtOrderRuntimeBook drop events (labels: reason="
-                  "slot_pool_full|orphan_update|orphan_reap|snapshot_publish_skipped|"
-                  "cross_thread_direct_read). slot_pool_full 应恒为 0 "
-                  "(kMaxInflightOrders=512 远大于正常 in-flight);orphan_update > 0 "
+                  "slot_pool_full|orphan_update|orphan_trade|orphan_reap|duplicate_submit|"
+                  "snapshot_publish_skipped|cross_thread_direct_read|tracked_codes_truncated|"
+                  "close_outstanding_drift). slot_pool_full 应恒为 0 "
+                  "(kMaxInflightOrders=512 远大于正常 in-flight);orphan_update / orphan_trade > 0 "
                   "表示 reverse 灌路径漏单 / foreign order / 本进程 submit race;"
                   "orphan_reap > 0 表示 cross-restart recovered-unowned 孤儿单 venue 已无被兜底清;"
+                  "duplicate_submit > 0 表示同 id 撞上仍存活的 slot,注册被 fail-closed 丢弃,"
+                  "需查上游发号链;"
                   "snapshot_publish_skipped > 0 表示 snapshot pool 耗尽,reader 读 stale;"
-                  "cross_thread_direct_read > 0 表示非 worker 线程误用直读接口被拦截。")
+                  "cross_thread_direct_read > 0 表示非 worker 线程误用直读接口被拦截;"
+                  "tracked_codes_truncated > 0 表示 tracked code 集合触顶被截断;"
+                  "close_outstanding_drift > 0 表示 close 在途额度与 slot 派生量分歧被自愈。")
             .Register(*registry);
 
         fam_dropped_total = &prometheus::BuildCounter()
@@ -744,6 +752,21 @@ struct XtMetricRegistry::Impl {
             .Name("xt_latency_meta_miss_total")
             .Help("Latency tracker emit skipped: order strategy/code meta unresolved "
                   "even via order-book fallback (labels: venue; once per order).")
+            .Register(*registry);
+
+        fam_latency_eligible_total = &prometheus::BuildCounter()
+            .Name("xt_latency_eligible_total")
+            .Help("Latency sample eligibility (denominator for latency coverage). "
+                  "Labels: stage=ack, strategy, book, symbol. Counted once per "
+                  "successful gateway submit with known strategy/symbol.")
+            .Register(*registry);
+
+        fam_latency_tap_dropped_total = &prometheus::BuildCounter()
+            .Name("xt_latency_tap_dropped_total")
+            .Help("Latency tracker tap dropped events (labels: reason="
+                  "ring_full|overflow_full|meta_evicted|orders_evicted|trace_oversize|"
+                  "slot_exhausted|label_cache_full). rate > 0 表示延迟采样传输面"
+                  "背压 / 容器驱逐，样本覆盖率有损。")
             .Register(*registry);
 
         fam_broker_frozen_stale_total = &prometheus::BuildCounter()
@@ -852,7 +875,12 @@ struct XtMetricRegistry::Impl {
 
         fam_md_gap_ms_p99 = &prometheus::BuildGauge()
             .Name("xt_md_gap_ms_p99")
-            .Help("Runner reporter-window peak MD queue lag in milliseconds (compat p99 metric name)")
+            .Help("Runner MD queue lag p99 in ms (histogram bucket upper bound, conservative). "
+                  "HFT value is the window-max of per-frame p99 (no cross-frame histogram merge; conservative upper bound).")
+            .Register(*registry);
+        fam_md_gap_ms_peak = &prometheus::BuildGauge()
+            .Name("xt_md_gap_ms_peak")
+            .Help("Runner reporter-window peak MD queue lag in milliseconds")
             .Register(*registry);
         fam_md_age_ms = &prometheus::BuildGauge()
             .Name("xt_md_age_ms")
@@ -862,9 +890,10 @@ struct XtMetricRegistry::Impl {
             .Name("xt_event_drop")
             .Help("Runner event drops from MD tick drops plus rejected TD flow events")
             .Register(*registry);
-        fam_queue_depth_p99 = &prometheus::BuildGauge()
-            .Name("xt_queue_depth_p99")
-            .Help("Runner TD event queue depth p99")
+        fam_queue_depth = &prometheus::BuildGauge()
+            .Name("xt_queue_depth")
+            .Help("Runner internal event queue depth (instant snapshot, not a percentile): "
+                  "HFT=TD event queue, CTA=tick queue, SEL=ctrl queue")
             .Register(*registry);
         fam_risk_block_count = &prometheus::BuildGauge()
             .Name("xt_risk_block_count")
@@ -1032,19 +1061,20 @@ void XtMetricRegistry::on_risk_reject(std::string_view strategy,
         "symbol", symbol, "reason", reason)).Increment();
 }
 
+void XtMetricRegistry::inc_risk_rejects_total(std::string_view venue,
+                                              uint64_t delta) {
+
+    auto& counter = impl_->fam_risk_rejects_total->Add(make_labels_4(
+        "strategy", "_runtime", "venue", venue,
+        "symbol", "_all", "reason", "_all"));
+    if (delta > 0) counter.Increment(static_cast<double>(delta));
+}
+
 void XtMetricRegistry::on_order_reject(std::string_view venue,
                                        std::string_view err_code) {
 
     impl_->fam_order_rejects_total->Add(make_labels_2(
         "venue", venue, "err_code", err_code)).Increment();
-}
-
-void XtMetricRegistry::inc_stage_taps_dropped(std::string_view stage,
-                                               std::string_view reason,
-                                               uint64_t count) {
-    impl_->fam_stage_taps_dropped_total->Add(
-        {{"stage", std::string(stage)}, {"reason", std::string(reason)}}
-    ).Increment(static_cast<double>(count));
 }
 
 void XtMetricRegistry::observe_md_event_to_recv_us(std::string_view channel,
@@ -1505,6 +1535,24 @@ void XtMetricRegistry::set_open_orders(std::string_view venue, uint32_t count) {
     ).Set(static_cast<double>(count));
 }
 
+void XtMetricRegistry::set_shm_md_attach_failing(std::string_view ring, uint32_t failing) {
+    impl_->fam_shm_md_attach_failing->Add(
+        prometheus::Labels{{"ring", std::string(ring)}}
+    ).Set(static_cast<double>(failing));
+}
+
+void XtMetricRegistry::set_shm_md_attach_fail_count(std::string_view ring, uint64_t count) {
+    impl_->fam_shm_md_attach_fail_count->Add(
+        prometheus::Labels{{"ring", std::string(ring)}}
+    ).Set(static_cast<double>(count));
+}
+
+void XtMetricRegistry::set_stp_registered_symbols(std::string_view venue, uint32_t count) {
+    impl_->fam_stp_registered_symbols->Add(
+        prometheus::Labels{{"venue", std::string(venue)}}
+    ).Set(static_cast<double>(count));
+}
+
 void XtMetricRegistry::inc_runtime_book_drop_total(std::string_view reason) {
     impl_->fam_runtime_book_drop_total->Add(
         prometheus::Labels{{"reason", std::string(reason)}}
@@ -1536,6 +1584,24 @@ void XtMetricRegistry::inc_runtime_market_drop_total(std::string_view reason) {
 void XtMetricRegistry::inc_latency_meta_miss_total(std::string_view venue) {
     impl_->fam_latency_meta_miss_total->Add(
         prometheus::Labels{{"venue", std::string(venue)}}
+    ).Increment();
+}
+
+void XtMetricRegistry::inc_latency_eligible_total(std::string_view stage,
+                                                  std::string_view strategy,
+                                                  std::string_view book,
+                                                  std::string_view symbol) {
+    impl_->fam_latency_eligible_total->Add(
+        prometheus::Labels{{"stage", std::string(stage)},
+                           {"strategy", std::string(strategy)},
+                           {"book", std::string(book)},
+                           {"symbol", std::string(symbol)}}
+    ).Increment();
+}
+
+void XtMetricRegistry::inc_latency_tap_dropped_total(std::string_view reason) {
+    impl_->fam_latency_tap_dropped_total->Add(
+        prometheus::Labels{{"reason", std::string(reason)}}
     ).Increment();
 }
 
@@ -1666,11 +1732,14 @@ void XtMetricRegistry::set_runtime_kpi_snapshot(std::string_view strategy,
     if (sample.has_md_gap_ms_p99) {
         set_gauge(impl_->fam_md_gap_ms_p99, sample.md_gap_ms_p99);
     }
+    if (sample.has_md_gap_ms_peak) {
+        set_gauge(impl_->fam_md_gap_ms_peak, sample.md_gap_ms_peak);
+    }
     if (sample.has_md_age_ms) {
         set_gauge(impl_->fam_md_age_ms, sample.md_age_ms);
     }
     set_gauge(impl_->fam_event_drop, sample.event_drop);
-    set_gauge(impl_->fam_queue_depth_p99, sample.queue_depth_p99);
+    set_gauge(impl_->fam_queue_depth, sample.queue_depth_p99);
     set_gauge(impl_->fam_risk_block_count, sample.risk_block_count);
 }
 
@@ -1721,6 +1790,14 @@ prometheus::Histogram* XtMetricRegistry::get_local_submit_us_histogram(
     return &impl_->fam_local_submit_us->Add(
         make_labels_3("strategy", strategy, "book", book, "symbol", symbol),
         order_us_buckets()
+    );
+}
+
+prometheus::Counter* XtMetricRegistry::get_latency_eligible_counter(
+    std::string_view stage, std::string_view strategy,
+    std::string_view book, std::string_view symbol) {
+    return &impl_->fam_latency_eligible_total->Add(
+        make_labels_4("stage", stage, "strategy", strategy, "book", book, "symbol", symbol)
     );
 }
 

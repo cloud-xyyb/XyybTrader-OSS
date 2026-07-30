@@ -14,6 +14,8 @@
 
 #include <cstdint>
 
+#include "xt_live/control/SafetyStateWire.h"
+
 // XtHftRunnerControlContext 完整定义在 HftRunnerControl.h；本头仅 forward decl。
 struct XtHftRunnerControlContext;
 
@@ -58,8 +60,6 @@ std::optional<ForceCloseResult> decide_closeout_gate(const CloseoutGateInput& in
 [[nodiscard]] bool closeout_result_trips_kill_switch(ForceCloseResult r) noexcept;
 
 [[nodiscard]] bool kill_switch_source_auto_releasable(uint8_t source) noexcept;
-
-[[nodiscard]] bool kill_switch_source_latches_across_restart(uint8_t source) noexcept;
 
 [[nodiscard]] bool closeout_latch_auto_release_decision(bool kill_switch_active,
                                                         uint8_t source,

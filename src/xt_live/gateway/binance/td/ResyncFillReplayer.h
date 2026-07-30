@@ -12,11 +12,20 @@
 #include <utility>
 #include <vector>
 
+#include "api/ITradeGateway.h"
 #include "xt_core/order/XtOrderTypes.h"
 #include "xt_core/order/XtTradeRecord.h"
 #include "xt_live/gateway/binance/td/EffectiveSignalDedup.h"
 
 namespace binance_u {
+
+/// @brief 栅栏暂存的终态 order update + 其构造时 latency eligibility 与 dedup source。
+/// @note flush 时透传构造时 eligibility（latency-terminal 批 L-1.2）。
+struct ResyncTerminal {
+    XtOrderExecUpdate            upd;
+    EffectiveSignalDedup::Source src;
+    XtLatencyEligibility         elig = XtLatencyEligibility::kEligible;
+};
 
 /// @brief 栅栏 flush 的有序 emit 计划（纯数据，caller 负责实际 emit + 持锁）。
 ///
@@ -28,13 +37,13 @@ struct ReplayPlan {
     std::vector<XtTradeRecord> pre_fills;
     std::vector<XtTradeRecord> post_fills;
 
-    std::vector<std::pair<XtOrderExecUpdate, EffectiveSignalDedup::Source>> terminals;
+    std::vector<ResyncTerminal> terminals;
     bool emit_position = false;
 };
 
 [[nodiscard]] inline ReplayPlan partition_resync_replay(
     std::vector<XtTradeRecord> fills,
-    std::vector<std::pair<XtOrderExecUpdate, EffectiveSignalDedup::Source>> terminals,
+    std::vector<ResyncTerminal> terminals,
     const std::unordered_map<std::string, int64_t>& fence_update_ms,
     int64_t fence_floor_ms,
     bool has_snapshot) {

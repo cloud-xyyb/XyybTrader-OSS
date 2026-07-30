@@ -21,10 +21,6 @@ public:
         return store_.snapshot_position(code);
     }
 
-    [[nodiscard]] RiskSnapshot risk(std::string_view code) const override {
-        return store_.snapshot_risk(code);
-    }
-
     [[nodiscard]] std::vector<std::string> tracked_codes() const override {
         return store_.snapshot_tracked_codes();
     }

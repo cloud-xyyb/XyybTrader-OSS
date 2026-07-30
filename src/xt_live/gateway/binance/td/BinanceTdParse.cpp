@@ -54,7 +54,7 @@ parse_account_detail_body(const std::string& body) {
         if (j.contains("positions") && j["positions"].is_array()) {
             det.per_symbol.reserve(j["positions"].size());
             for (const auto& p : j["positions"]) {
-                BinanceAccountTruthSource::Position pos{};
+                PerSymbolTruth pos{};
                 try {
                     pos.symbol = p.value("symbol", "");
                     const double entry = std::stod(p.value("entryPrice", "0"));

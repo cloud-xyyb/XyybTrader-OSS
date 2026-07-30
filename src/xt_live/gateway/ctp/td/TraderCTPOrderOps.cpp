@@ -93,18 +93,20 @@ uint64_t TraderCTP::submit_order(const char* code,
     req.UserForceClose      = 0;
 
     xt_identity::OrderAttributionStore::remember_order_strategy_sid(local_id, owner_sid);
+    const bool is_close = (close_offset != XtOffset::Open);
+    state_.register_order(local_id, req.OrderRef, code, is_buy, price, qty_fp, user_tag,
+                          is_close, close_offset == XtOffset::CloseToday,
+                          submit_begin_us,  0);
     int ret = api_->ReqOrderInsert(&req, next_req_id());
     if (ret != 0) {
+        state_.rollback_register(local_id);
         xt_identity::OrderAttributionStore::forget_order_strategy_sid(local_id);
         XtLogger::error_m("TD", "ReqOrderInsert failed: {}", ret);
         return 0;
     }
     const uint64_t submit_end_us = XtSteadyClock::steady_now_us();
 
-    const bool is_close = (close_offset != XtOffset::Open);
-    state_.register_order(local_id, req.OrderRef, code, is_buy, price, qty_fp, user_tag,
-                          is_close, close_offset == XtOffset::CloseToday,
-                          submit_begin_us, submit_end_us);
+    state_.note_submit_end(local_id, submit_end_us);
 
     XtLogger::info_m("TD",
         "event=td_order_submit local_id={} order_ref={} code={} side={} offset={} px={} qty={}",
@@ -121,12 +123,24 @@ uint64_t TraderCTP::submit_order(const char* code,
     upd.qty_fp      = qty_fp;
     upd.leaves_fp   = upd.qty_fp;
     upd.local_cb_us = submit_end_us;
-    if (callbacks_.on_order_update) callbacks_.on_order_update(upd);
+
+    if (callbacks_.on_order_update)
+        callbacks_.on_order_update(upd, XtLatencyEligibility::kIneligible);
     return local_id;
 }
 
 bool TraderCTP::is_local_terminal(uint64_t local_id) const {
     return state_.is_local_terminal(local_id);
+}
+
+bool TraderCTP::lookup_terminal(uint64_t local_id, XtOrderTerminalRecord& out) const {
+    xt_live::gateway::XtExecDeliveryLedger::TerminalRecord term;
+    if (!state_.exec_ledger().terminal_record(local_id, term)) return false;
+
+    if (!order_status_is_final(term.status)) return false;
+    out.status = term.status;
+    out.filled_fp = term.filled_fp;
+    return true;
 }
 
 bool TraderCTP::cancel_order(uint64_t local_id) {
@@ -151,7 +165,7 @@ bool TraderCTP::cancel_order(uint64_t local_id) {
             term.sid_id = xt_identity::OrderAttributionStore::lookup_order_strategy_sid(local_id).raw();
             XtLogger::warn_m("TD",
                              "event=td_phantom_self_heal local_id={} reason=terminal_book_open", local_id);
-            callbacks_.on_order_update(term);
+            callbacks_.on_order_update(term, XtLatencyEligibility::kIneligible);
         } else {
             XtLogger::warn_m("TD",
                              "event=td_cancel_req_skip local_id={} reason=no_cancel_target", local_id);
@@ -234,7 +248,9 @@ void TraderCTP::OnRspOrderInsert(CThostFtdcInputOrderField* pInputOrder,
         ct::metrics::XtMetricRegistry::instance().on_order_reject(
             "ctp", std::to_string(error_id));
 #endif
-        if (callbacks_.on_order_update) callbacks_.on_order_update(upd);
+
+        if (callbacks_.on_order_update)
+            callbacks_.on_order_update(upd, XtLatencyEligibility::kEligible);
     }
 }
 
@@ -260,7 +276,8 @@ void TraderCTP::OnRspOrderAction(CThostFtdcInputOrderActionField* pInputOrderAct
     XtOrderExecUpdate upd;
     if (state_.on_cancel_action_error(order_ref, error_id, cb_us, upd) &&
         callbacks_.on_order_update) {
-        callbacks_.on_order_update(upd);
+
+        callbacks_.on_order_update(upd, XtLatencyEligibility::kIneligible);
     }
     XtLogger::error_m("TD",
                       "event=td_cancel_rsp_error req_id={} is_last={} order_ref={} "
@@ -294,7 +311,8 @@ void TraderCTP::OnErrRtnOrderAction(CThostFtdcOrderActionField* pOrderAction,
     XtOrderExecUpdate upd;
     if (state_.on_cancel_action_error(order_ref, error_id, cb_us, upd) &&
         callbacks_.on_order_update) {
-        callbacks_.on_order_update(upd);
+
+        callbacks_.on_order_update(upd, XtLatencyEligibility::kIneligible);
     }
     XtLogger::error_m("TD",
                       "event=td_cancel_err_rtn order_ref={} error_id={} error_msg={}",
@@ -319,7 +337,9 @@ void TraderCTP::OnRtnOrder(CThostFtdcOrderField* pOrder) {
         if (recovering) {
             if (was_local && upd.id != 0 && order_status_is_final(upd.status)) {
                 std::lock_guard<std::mutex> lk(recovery_term_mu_);
-                recovery_pending_terminals_[upd.id] = upd;
+
+                recovery_pending_terminals_[upd.id] =
+                    RecoveryPendingTerminal{upd, XtLatencyEligibility::kEligible};
                 XtLogger::debug_m("TD",
                     "event=td_order_update local_id={} status={} leaves={} filled={} (recovery_buffered)",
                     upd.id, order_status_to_str(upd.status), upd.leaves_fp, upd.filled_fp);
@@ -336,7 +356,8 @@ void TraderCTP::OnRtnOrder(CThostFtdcOrderField* pOrder) {
                 "event=td_order_update local_id={} status={} leaves={} filled={}",
                 upd.id, order_status_to_str(upd.status), upd.leaves_fp, upd.filled_fp);
         }
-        callbacks_.on_order_update(upd);
+
+        callbacks_.on_order_update(upd, XtLatencyEligibility::kEligible);
         return;
     }
 
@@ -344,12 +365,30 @@ void TraderCTP::OnRtnOrder(CThostFtdcOrderField* pOrder) {
         XtLogger::info_m("TD",
             "event=td_order_update local_id={} status={} leaves={} filled={} (suppressed_terminal_resynth)",
             upd.id, order_status_to_str(upd.status), upd.leaves_fp, upd.filled_fp);
-        callbacks_.on_order_update(upd);
+
+        callbacks_.on_order_update(upd, XtLatencyEligibility::kEligible);
     }
 }
 
 void TraderCTP::OnRtnTrade(CThostFtdcTradeField* pTrade) {
     on_rtn_trade_(pTrade,  false);
+}
+
+bool TraderCTP::classify_query_fill_absorbed_(const CThostFtdcTradeField* pTrade) const {
+
+    if (!exec_ledger_query_fill_delivery_) return true;
+    const auto fill_us = static_cast<int64_t>(CtpStateTracker::fill_epoch_us(pTrade));
+
+    if (fill_us <= 0) return true;
+
+    if (fill_us < process_start_epoch_us_ + kFillSealMarginUs) return true;
+
+    if (is_first_recovery_) {
+        const int64_t anchor =
+            recovery_position_anchor_us_.load(std::memory_order_acquire);
+        if (anchor > 0 && fill_us <= anchor + kFillSealMarginUs) return true;
+    }
+    return false;
 }
 
 void TraderCTP::on_rtn_trade_(CThostFtdcTradeField* pTrade, bool from_query) {
@@ -358,26 +397,64 @@ void TraderCTP::on_rtn_trade_(CThostFtdcTradeField* pTrade, bool from_query) {
         return;
     }
     const uint64_t cb_us = XtSteadyClock::steady_now_us();
+
+    const bool absorbed = from_query && classify_query_fill_absorbed_(pTrade);
+    const auto src = from_query ? xt_live::gateway::FillSource::kQueryReplay
+                                : xt_live::gateway::FillSource::kLivePush;
     XtTradeRecord tr;
-    if (!state_.on_trade(pTrade, cb_us, tr) || !callbacks_.on_trade) return;
 
-    if (from_query) return;
-    {
-
-        std::lock_guard<std::mutex> lk(recovery_window_mu_);
-        if (recovery_window_gate_closed_) {
-            if (recovery_window_trades_.size() >= kRecoveryWindowTradeCap) {
-
-                ++recovery_window_overflow_;
-            } else {
-                recovery_window_trades_.push_back(BufferedWindowTrade{
-                    tr,
-                    recovery_position_snap_seq_.load(std::memory_order_relaxed)});
-            }
-            return;
-        }
+    if (!state_.on_trade(pTrade, cb_us, tr, src, absorbed,
+                         static_cast<uint32_t>(query_session_gen()))) {
+        return;
     }
-    callbacks_.on_trade(tr);
+
+    if (!absorbed && callbacks_.on_trade) {
+        bool deliver_inline = true;
+        {
+
+            std::lock_guard<std::mutex> lk(recovery_window_mu_);
+            if (recovery_window_gate_closed_) {
+                deliver_inline = false;
+                if (recovery_window_trades_.size() >= kRecoveryWindowTradeCap) {
+
+                    ++recovery_window_overflow_;
+                } else {
+                    recovery_window_trades_.push_back(tr);
+                }
+            }
+        }
+
+        if (deliver_inline) callbacks_.on_trade(tr, XtLatencyEligibility::kEligible);
+    }
+
+    maybe_emit_cum_filled_completion_(tr.order_id, cb_us);
+}
+
+void TraderCTP::maybe_emit_cum_filled_completion_(uint64_t local_id, uint64_t local_cb_us) {
+    XtOrderExecUpdate comp;
+    if (!state_.make_cum_filled_completion(local_id, local_cb_us, comp)) return;
+
+    bool defer = recovery_.is_recovering();
+    if (!defer) {
+        std::lock_guard<std::mutex> lk(recovery_window_mu_);
+        defer = recovery_window_gate_closed_;
+    }
+    if (defer) {
+        std::lock_guard<std::mutex> lk(recovery_term_mu_);
+
+        recovery_pending_terminals_[comp.id] =
+            RecoveryPendingTerminal{comp, XtLatencyEligibility::kIneligible};
+        XtLogger::debug_m("TD",
+            "event=td_order_update local_id={} status={} (cum_filled_completion_buffered)",
+            comp.id, order_status_to_str(comp.status));
+        return;
+    }
+    XtLogger::info_m("TD",
+        "event=td_order_update local_id={} status={} leaves={} filled={} (cum_filled_completion)",
+        comp.id, order_status_to_str(comp.status), comp.leaves_fp, comp.filled_fp);
+
+    if (callbacks_.on_order_update)
+        callbacks_.on_order_update(comp, XtLatencyEligibility::kIneligible);
 }
 
 bool TraderCTP::should_log_foreign_cancel_error_once(const char* order_ref, int error_id) {

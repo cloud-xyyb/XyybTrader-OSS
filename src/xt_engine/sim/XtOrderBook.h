@@ -47,7 +47,7 @@ public:
         std::vector<uint64_t> canceled;
     };
 
-    void add_order(const XtSimOrder& ord);
+    [[nodiscard]] bool add_order(const XtSimOrder& ord);
 
     void remove_order(const XtSimOrder& ord);
 
@@ -68,8 +68,8 @@ private:
 
     /// @brief 单价格层级的订单 ID 队列。
     ///
-    /// `push()` 和 `pop_front()` 维护同价位 FIFO；`remove()` 用于撤单路径，
-    /// 采用 swap-with-last，不保留剩余 ID 顺序。
+    /// `push()` / `pop_front()` / `remove()` 共同维护同价位 FIFO：撤单后
+    /// 剩余订单保持入队序（venue 时间优先语义）。
     struct PriceLevel {
         int64_t  price_fp                  = 0;
         uint64_t ids[kMaxOrdersPerLevel]   = {};
@@ -86,7 +86,8 @@ private:
         bool remove(uint64_t id) noexcept {
             for (int i = 0; i < count; ++i) {
                 if (ids[i] == id) {
-                    ids[i] = ids[--count];
+                    for (int j = i; j < count - 1; ++j) ids[j] = ids[j + 1];
+                    --count;
                     return true;
                 }
             }
@@ -172,6 +173,12 @@ private:
         MatchResult& result,
         XtSimOrder& (*lookup_fn)(void*, uint64_t),
         void* lookup_ctx);
+
+    template <bool Descending>
+    static void sweep_ioc_fok_(FlatLevels<Descending>& side_levels,
+                               MatchResult& result,
+                               XtSimOrder& (*lookup_fn)(void*, uint64_t),
+                               void* lookup_ctx);
 
     std::unordered_map<std::string, Book> books_;
 

@@ -32,6 +32,17 @@ bool TraderBinanceUGateway::Impl::init(const ITradeGateway::Config& cfg) {
         return false;
     }
 
+    if (!local_id_gen_) {
+        XtLogger::error_m("BinanceTD",
+            "init rejected: local_id generator unavailable: {}",
+            local_id_gen_error_.empty() ? std::string("configure() not called")
+                                        : local_id_gen_error_);
+        return false;
+    }
+
+    XtLogger::info_m("BinanceTD", "local_id domain: instance='{}' tag={}",
+                     td_cfg.local_id_instance, local_id_gen_->instance_tag());
+
     if (!cfg.expected_api_key_sha8.empty()) {
         std::string got;
         try {
@@ -146,13 +157,17 @@ bool TraderBinanceUGateway::Impl::start() {
     uds_cfg.port = "443";
     uds_cfg.keepalive_ms = td_cfg.listen_key_refresh_ms;
     uds = std::make_unique<BinanceUserDataStream>(uds_cfg, *rest);
+
+    uds->set_fill_dedup([this](uint64_t order_id, std::string_view symbol, int64_t tid) {
+        return ledger_.note_fill_seen(order_id, symbol, tid);
+    });
     uds->bind_callbacks(
         [this](const XtOrderExecUpdate& upd) {
             this->on_uds_order_update(upd);
         },
-        [this](const XtTradeRecord& tr) {
+        [this](const XtTradeRecord& tr, XtLatencyEligibility elig) {
 
-            forward_uds_trade(tr);
+            forward_uds_trade(tr, elig);
         },
         [this](const ITradeGateway::AccountSnapshot& a) { if (cb.on_account)  cb.on_account(a); },
         [this](const std::vector<XtPositionSnapshot>& ps) {

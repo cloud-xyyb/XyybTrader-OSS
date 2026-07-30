@@ -64,7 +64,8 @@ bool XtCtaMatchEngine::fill_immediate(const char* code, bool is_buy, int64_t qty
     return do_fill_(code, is_buy, qty_fp, price_fp, tag, offset, date, time_ms);
 }
 
-int XtCtaMatchEngine::flush_session_end(uint32_t date, uint32_t time_ms) {
+int XtCtaMatchEngine::flush_session_end(uint32_t date, uint32_t time_ms,
+                                        bool allow_market_fill) {
     int fills = 0;
     for (const auto& pf : pending_) {
         if (pf.limit_price_fp > 0) {
@@ -79,7 +80,8 @@ int XtCtaMatchEngine::flush_session_end(uint32_t date, uint32_t time_ms) {
             continue;
         }
         auto it = last_price_fp_.find(pf.code);
-        if (it != last_price_fp_.end() && it->second > 0) {
+
+        if (allow_market_fill && it != last_price_fp_.end() && it->second > 0) {
             if (do_fill_(pf.code, pf.is_buy, pf.qty_fp, it->second,
                          pf.tag, pf.offset, date, time_ms, pf.order_id)) {
                 ++fills;
@@ -102,20 +104,10 @@ int XtCtaMatchEngine::flush_session_end(uint32_t date, uint32_t time_ms) {
 }
 
 int XtCtaMatchEngine::advance_clock(uint32_t date, uint32_t time_ms) {
-    const int64_t now_ns = xt_time::to_ns(date, time_ms);
 
-    constexpr int64_t kSegmentWrapBackwardNs = 3'600'000'000'000LL;
-    if (cur_clock_ns_ != INT64_MIN &&
-        cur_clock_ns_ - now_ns > kSegmentWrapBackwardNs) {
-        for (auto& dt : delay_trades_) {
-            if (dt.visible_at_ns > now_ns) dt.visible_at_ns = now_ns;
-        }
-        for (auto& du : delay_updates_) {
-            if (du.visible_at_ns > now_ns) du.visible_at_ns = now_ns;
-        }
-        if (!delay_trades_.empty() || !delay_updates_.empty()) {
-            earliest_due_ns_ = now_ns;
-        }
+    int64_t now_ns = xt_time::to_ns(date, time_ms);
+    if (cur_clock_ns_ != INT64_MIN && now_ns < cur_clock_ns_) {
+        now_ns = cur_clock_ns_;
     }
     cur_clock_ns_ = now_ns;
     if (now_ns < earliest_due_ns_) return 0;
@@ -152,7 +144,12 @@ void XtCtaMatchEngine::publish_order_update_(uint64_t order_id,
     const int64_t now_ns = (date != 0)
                          ? xt_time::to_ns(date, time_ms)
                          : cur_clock_ns_;
-    enqueue_delayed_update_(u, now_ns);
+
+    const int64_t latency_ns = (status == XtOrderStatus::Filled ||
+                                status == XtOrderStatus::PartiallyFilled)
+                                   ? cfg_.fill_latency_ns
+                                   : cfg_.cancel_latency_ns;
+    enqueue_delayed_update_(u, now_ns, latency_ns);
 }
 
 bool XtCtaMatchEngine::do_fill_(const char* code, bool is_buy, int64_t qty_fp,
@@ -203,12 +200,13 @@ void XtCtaMatchEngine::enqueue_delayed_trade_(const XtTradeRecord& tr, int64_t n
     if (visible_at < earliest_due_ns_) earliest_due_ns_ = visible_at;
 }
 
-void XtCtaMatchEngine::enqueue_delayed_update_(const PendingOrderUpdate& upd, int64_t now_ns) {
-    if (now_ns == INT64_MIN || cfg_.cancel_latency_ns <= 0) {
+void XtCtaMatchEngine::enqueue_delayed_update_(const PendingOrderUpdate& upd,
+                                               int64_t now_ns, int64_t latency_ns) {
+    if (now_ns == INT64_MIN || latency_ns <= 0) {
         visible_updates_.push_back(upd);
         return;
     }
-    const int64_t visible_at = now_ns + cfg_.cancel_latency_ns;
+    const int64_t visible_at = now_ns + latency_ns;
     if (visible_at <= cur_clock_ns_) {
         visible_updates_.push_back(upd);
         return;
@@ -220,26 +218,28 @@ void XtCtaMatchEngine::enqueue_delayed_update_(const PendingOrderUpdate& upd, in
 int XtCtaMatchEngine::promote_due_(int64_t now_ns) {
     int released = 0;
 
-    for (size_t i = 0; i < delay_trades_.size(); ) {
+    size_t w = 0;
+    for (size_t i = 0; i < delay_trades_.size(); ++i) {
         if (delay_trades_[i].visible_at_ns <= now_ns) {
             visible_trades_.push_back(std::move(delay_trades_[i].trade));
-            delay_trades_[i] = std::move(delay_trades_.back());
-            delay_trades_.pop_back();
             ++released;
         } else {
-            ++i;
+            if (w != i) delay_trades_[w] = std::move(delay_trades_[i]);
+            ++w;
         }
     }
-    for (size_t i = 0; i < delay_updates_.size(); ) {
+    delay_trades_.resize(w);
+    w = 0;
+    for (size_t i = 0; i < delay_updates_.size(); ++i) {
         if (delay_updates_[i].visible_at_ns <= now_ns) {
             visible_updates_.push_back(std::move(delay_updates_[i].update));
-            delay_updates_[i] = std::move(delay_updates_.back());
-            delay_updates_.pop_back();
             ++released;
         } else {
-            ++i;
+            if (w != i) delay_updates_[w] = std::move(delay_updates_[i]);
+            ++w;
         }
     }
+    delay_updates_.resize(w);
     recompute_earliest_due_();
     return released;
 }

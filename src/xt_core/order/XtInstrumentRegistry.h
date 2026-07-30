@@ -16,10 +16,12 @@ using XtInstrumentId = uint32_t;
 static constexpr XtInstrumentId kInvalidInstrumentId = 0;
 static constexpr uint32_t kMaxInstruments = 4096;
 
-/// @brief 合约符号字符串与整数 ID 的双向注册表。
+/// @brief 合约代码字符串与整数 ID 的双向注册表。
 ///
-/// 启动/持仓初始化阶段通过 `register_or_get()` 注册 code，此后热路径只传递 `XtInstrumentId`。
-/// `code_of()` 使用数组反查合约代码，ID 从 1 开始分配。
+/// 在热路径上到处传 `std::string` 合约代码（比较、hash、拷贝）太贵，本注册表在启动/持仓
+/// 初始化阶段用 `register_or_get()` 把每个 code intern 成一个稳定的 `XtInstrumentId`
+/// （从 1 起分配），此后热路径只传这个整数，需要时再用 `code_of()` O(1) 反查回代码。
+/// ID 0 保留给无效/未注册。
 ///
 /// @note 写入不是线程安全的；完成注册后，多线程只读访问由调用方发布/冻结生命周期保证。
 class XtInstrumentRegistry {

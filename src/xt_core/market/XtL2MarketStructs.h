@@ -3,9 +3,11 @@
 #include <type_traits>
 
 /// @file
-/// @brief L2 订单队列、逐笔委托与逐笔成交结构。
+/// @brief 交易所盘口 Level-2 数据结构：逐档委托队列、逐笔委托、逐笔成交。
 ///
-/// 字段对齐交易所常见定义并保持 stable layout，供 L2 回放、队列模型和 OFI 计算共用。
+/// Level-2（L2）行情在每档价量之外，还给出每笔委托和每笔成交的明细。这三个结构承载这些
+/// 明细，字段对齐交易所常见定义并保持稳定 layout，供 L2 行情回放、排队量（queue-ahead）
+/// 模型和订单流不平衡（OFI）计算共用。
 
 /**
  * @brief 订单队列深度（order queue snapshot）。

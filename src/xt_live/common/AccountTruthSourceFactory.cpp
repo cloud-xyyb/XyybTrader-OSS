@@ -13,7 +13,19 @@
 
 #include "xt_live/common/VenueTraits.h"
 
-std::unique_ptr<IAccountTruthSource> make_runner_account_truth_source(
+namespace {
+
+template <typename T>
+RunnerAccountTruth make_ports(std::unique_ptr<T> impl) {
+    RunnerAccountTruth out;
+    out.sink = static_cast<IAccountTruthSink*>(impl.get());
+    out.source = std::move(impl);
+    return out;
+}
+
+}
+
+RunnerAccountTruth make_runner_account_truth_source(
     const xt_account::AccountStateStore& account_store,
     XtRunnerSignals& signals,
     const XtLiveConfig& cfg,
@@ -38,14 +50,14 @@ std::unique_ptr<IAccountTruthSource> make_runner_account_truth_source(
     };
     if (is_binance) {
 
-        return std::make_unique<BinanceAccountTruthSource>(
+        return make_ports(std::make_unique<BinanceAccountTruthSource>(
             std::move(provider),
-            std::move(income_provider));
+            std::move(income_provider)));
     }
     if (is_ctp) {
-        return std::make_unique<CtpAccountTruthSource>(std::move(provider));
+        return make_ports(std::make_unique<CtpAccountTruthSource>(std::move(provider)));
     }
-    return std::make_unique<StoreBackedAccountTruthSource>(
+    return make_ports(std::make_unique<StoreBackedAccountTruthSource>(
         std::move(provider),
-        trading_day_policy);
+        trading_day_policy));
 }

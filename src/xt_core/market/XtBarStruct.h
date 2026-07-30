@@ -1,10 +1,11 @@
 #pragma once
 #include <cstdint>
 
-/// @brief K 线数据结构（bar / candlestick）。
+/// @brief 一根 K 线（bar）。
 ///
-/// 表示单根 OHLCV 快照，供策略历史行情读取与 bar 模式回调使用。价格字段使用
-/// double；bar 是聚合统计值，不参与订单价格精确比较。
+/// 一根 bar 是一段时间（分钟 / 日…）内的 tick 聚合出的开高低收 + 成交量快照，供 bar 级
+/// 策略读历史行情和 on_bar 回调使用。价格用 double：bar 是统计聚合值，只喂指标计算，不进
+/// 撮合/账务这类要求精确的订单价格比较（那条路径用 fixed-point 的 XtTick）。
 struct XtBar {
     char code[32] = {0};
     uint32_t action_date   = 0;

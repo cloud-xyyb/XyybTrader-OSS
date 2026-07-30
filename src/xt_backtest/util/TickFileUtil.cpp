@@ -1,20 +1,24 @@
 #include "TickFileUtil.h"
 
 #include "xt_core/market/XtTickBinCodec.h"
+#include "XtLogger.h"
 #include "XtParseUtil.h"
 #include "xt_util/path/PathUtil.h"
 #include "TickCsvUtil.h"
 #include "xt_core/sync/XtTransparentStringHash.h"
+#include "xt_util/time/XtTime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <utility>
 
-static bool extract_date_from_filename(const std::string& name, uint32_t& out_date) {
+bool extract_date_from_filename(const std::string& name, uint32_t& out_date) {
 
     for (size_t i = 0; i + 7 < name.size(); ++i) {
         bool ok = true;
@@ -62,7 +66,10 @@ std::string sanitize_filename_part(const std::string& s) {
 std::string build_tick_cache_path(const std::string& cache_dir,
                                   uint32_t start_date,
                                   uint32_t end_date,
-                                  const std::vector<std::string>& tick_symbols) {
+                                  const std::vector<std::string>& tick_symbols,
+                                  double qty_base,
+                                  XtTickVolumeMode vol_mode,
+                                  const std::vector<std::string>& sources) {
     if (cache_dir.empty()) return "";
     std::string dir = cache_dir;
     if (dir.back() != '/' && dir.back() != '\\') dir += "/";
@@ -75,8 +82,121 @@ std::string build_tick_cache_path(const std::string& cache_dir,
         }
         if (!sec.empty()) sym = sec;
     }
-    std::string key  = std::to_string(start_date) + "_" + std::to_string(end_date) + "_" + sym;
+
+    uint64_t phash = xt_core::sync::kFnv1a64OffsetBasis;
+    auto mix = [&](const void* d, size_t n) {
+        phash = xt_core::sync::fnv1a_update(phash, d, n);
+    };
+    std::vector<std::string> sorted = sources;
+    std::sort(sorted.begin(), sorted.end());
+    for (const auto& p : sorted) {
+
+        const uint32_t len = static_cast<uint32_t>(p.size());
+        mix(&len, sizeof(len));
+        mix(p.data(), p.size());
+    }
+    mix(&qty_base, sizeof(qty_base));
+    const int32_t vm = static_cast<int32_t>(vol_mode);
+    mix(&vm, sizeof(vm));
+    char ph[12];
+    std::snprintf(ph, sizeof(ph), "%08x",
+                  static_cast<uint32_t>(phash ^ (phash >> 32)));
+    std::string key = std::to_string(start_date) + "_" + std::to_string(end_date) +
+                      "_" + sym + "_p" + ph;
     return dir + "ticks_" + key + ".bin";
+}
+
+namespace {
+
+bool is_all_digits(const std::string& s, size_t n) {
+    if (s.size() != n) return false;
+    for (char c : s) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
+
+int month_index_of(uint32_t yyyymmdd) {
+    return static_cast<int>(yyyymmdd / 10000) * 12 + static_cast<int>((yyyymmdd / 100) % 100);
+}
+
+std::string month_dir_path(const std::string& root, int month_index) {
+    int yy = month_index / 12;
+    int mm = month_index % 12;
+    if (mm == 0) { mm = 12; yy -= 1; }
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%02d", mm);
+    return PathUtil::join(PathUtil::join(root, std::to_string(yy)), buf);
+}
+
+}
+
+uint32_t derive_night_carry_guard_days(std::vector<uint32_t> filename_days) {
+    const size_t input_files = filename_days.size();
+    filename_days.erase(std::remove_if(filename_days.begin(), filename_days.end(),
+                                       [](uint32_t d) { return !xt_time::is_valid_yyyymmdd(d); }),
+                        filename_days.end());
+    std::sort(filename_days.begin(), filename_days.end());
+    filename_days.erase(std::unique(filename_days.begin(), filename_days.end()),
+                        filename_days.end());
+    if (filename_days.size() < 2) {
+        if (input_files != 0 && filename_days.empty()) {
+
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                XtLogger::warn_m("MD",
+                    "tick corpus has no parsable filename dates ({} file(s)); night-carry "
+                    "guard falls back to {} calendar day(s); later occurrences are silent",
+                    input_files, kTickNightCarryGuardDays);
+            }
+        }
+        return kTickNightCarryGuardDays;
+    }
+    int64_t max_gap = 0;
+    for (size_t i = 1; i < filename_days.size(); ++i) {
+        max_gap = (std::max)(max_gap,
+                             xt_time::yyyymmdd_diff_days(filename_days[i - 1], filename_days[i]));
+    }
+
+    return (std::max)(kTickNightCarryGuardDays, static_cast<uint32_t>(max_gap + 1));
+}
+
+uint32_t derive_night_carry_guard_days_for_paths(const std::vector<std::string>& paths) {
+
+    std::vector<uint32_t> days;
+    days.reserve(paths.size());
+    for (const auto& p : paths) {
+        uint32_t d = 0;
+        if (!extract_date_from_filename(std::filesystem::path(p).filename().string(), d)) d = 0;
+        days.push_back(d);
+    }
+    return derive_night_carry_guard_days(std::move(days));
+}
+
+void append_all_tick_files_from_root(const std::string& root, std::vector<std::string>& out) {
+    if (root.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) return;
+
+    for (const auto& year : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) break;
+        if (!year.is_directory()) continue;
+        if (!is_all_digits(year.path().filename().string(), 4)) continue;
+        std::error_code month_ec;
+        for (const auto& month : std::filesystem::directory_iterator(year.path(), month_ec)) {
+            if (month_ec) break;
+            if (!month.is_directory()) continue;
+            if (!is_all_digits(month.path().filename().string(), 2)) continue;
+            std::error_code file_ec;
+            for (const auto& entry : std::filesystem::directory_iterator(month.path(), file_ec)) {
+                if (file_ec) break;
+                if (!entry.is_regular_file()) continue;
+                if (entry.path().extension() != ".csv") continue;
+                out.push_back(entry.path().string());
+            }
+        }
+    }
+    std::sort(out.begin(), out.end());
 }
 
 void append_tick_files_from_root(const std::string& root,
@@ -98,33 +218,51 @@ void append_tick_files_from_root(const std::string& root,
         return;
     }
 
-    int sy = static_cast<int>(start_date / 10000);
-    int sm = static_cast<int>((start_date / 100) % 100);
-    int ey = static_cast<int>(end_date / 10000);
-    int em = static_cast<int>((end_date / 100) % 100);
-    int cur = sy * 12 + sm;
-    int end = ey * 12 + em;
+    const int end_month = month_index_of(end_date);
 
-    for (int v = cur; v <= end; ++v) {
-        int yy = v / 12;
-        int mm = v % 12;
-        if (mm == 0) { mm = 12; yy -= 1; }
-        char ym[8];
-        std::snprintf(ym, sizeof(ym), "%02d", mm);
-        std::string dir = PathUtil::join(PathUtil::join(root, std::to_string(yy)), ym);
-        if (!std::filesystem::exists(dir, ec)) continue;
-        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file()) continue;
-            auto p = entry.path();
-            if (p.extension() != ".csv") continue;
-            uint32_t fdate = 0;
-            if (extract_date_from_filename(p.filename().string(), fdate)) {
-                if (start_date && fdate < start_date) continue;
-                if (end_date   && fdate > end_date)   continue;
+    int first_month =
+        (start_date != 0)
+            ? month_index_of(xt_time::yyyymmdd_add_days(
+                  start_date, -static_cast<int>(kTickNightCarryGuardDays)))
+            : 0;
+
+    std::vector<std::pair<std::string, uint32_t>> scanned;
+    std::vector<uint32_t> seen_days;
+    auto scan_months = [&](int from_month, int to_month) {
+        for (int v = from_month; v <= to_month; ++v) {
+            const std::string dir = month_dir_path(root, v);
+            if (!std::filesystem::exists(dir, ec)) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file()) continue;
+                auto p = entry.path();
+                if (p.extension() != ".csv") continue;
+                uint32_t fdate = 0;
+                if (!extract_date_from_filename(p.filename().string(), fdate)) fdate = 0;
+                scanned.emplace_back(p.string(), fdate);
+                seen_days.push_back(fdate);
             }
-            out.push_back(p.string());
         }
+    };
+
+    scan_months(first_month, end_month);
+    uint32_t band_start = 0;
+    while (true) {
+        if (start_date == 0) break;
+        band_start = xt_time::yyyymmdd_add_days(
+            start_date, -static_cast<int64_t>(derive_night_carry_guard_days(seen_days)));
+        const int band_month = month_index_of(band_start);
+        if (band_month >= first_month) break;
+        scan_months(band_month, first_month - 1);
+        first_month = band_month;
+    }
+
+    for (const auto& [path, fdate] : scanned) {
+        if (fdate != 0) {
+            if (band_start != 0 && fdate < band_start) continue;
+            if (end_date != 0 && fdate > end_date) continue;
+        }
+        out.push_back(path);
     }
     std::sort(out.begin(), out.end());
 }
@@ -163,6 +301,22 @@ bool find_first_symbol_in_files(const std::vector<std::string>& files,
         }
     }
     return false;
+}
+
+std::vector<std::string> filter_files_for_auto_main(const std::vector<std::string>& files,
+                                                    uint32_t start_date) {
+    if (start_date == 0) return files;
+    std::vector<std::string> kept;
+    kept.reserve(files.size());
+    for (const auto& f : files) {
+        uint32_t fdate = 0;
+        const std::string name = std::filesystem::path(f).filename().string();
+        if (extract_date_from_filename(name, fdate) && fdate < start_date) continue;
+        kept.push_back(f);
+    }
+
+    if (kept.empty()) return files;
+    return kept;
 }
 
 uint64_t compute_source_signature(const std::vector<std::string>& sources,

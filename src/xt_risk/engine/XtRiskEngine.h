@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -30,6 +31,7 @@ struct XtRiskPolicy {
 
 class IFeeRuleProvider;
 class XtCommodityCatalog;
+struct XtCommodityInfo;
 
 /// @brief 同步 pre-trade 风控规则引擎。
 ///
@@ -87,6 +89,8 @@ public:
     };
     AnnualLatchSnapshot annual_latch_snapshot() const;
 
+    [[nodiscard]] uint64_t per_strategy_daily_loss_baseline_missing_count() const noexcept;
+
     XtRiskResult evaluate(const xt_core::XtOrder& order,
                           const XtRiskSnapshot& snapshot,
                           const XtRiskPolicy& policy = XtRiskPolicy{});
@@ -133,12 +137,14 @@ private:
     std::optional<XtRiskResult> eval_position_rules_(const xt_core::XtOrder& order,
                                                      const XtRiskSnapshot& snapshot,
                                                      const XtRiskPolicy& policy,
-                                                     const XtRiskEvalContext& eval_ctx) const;
+                                                     const XtRiskEvalContext& eval_ctx,
+                                                     const XtCommodityInfo* comm) const;
 
     XtRiskResult eval_margin_and_pass_(const xt_core::XtOrder& order,
                                        const XtRiskSnapshot& snapshot,
                                        const XtRiskPolicy& policy,
-                                       int64_t notional_fp) const;
+                                       int64_t notional_fp,
+                                       const XtCommodityInfo* comm) const;
 
     mutable std::shared_mutex cfg_mu_;
 
@@ -153,6 +159,9 @@ private:
     std::unordered_map<uint32_t, int64_t> per_strategy_max_pos_qty_fp_;
 
     std::unordered_map<uint32_t, int64_t> per_strategy_daily_loss_pct_fp_;
+
+    mutable std::atomic<uint64_t> per_strategy_dll_baseline_missing_{0};
+    mutable std::atomic<bool>     per_strategy_dll_baseline_warned_{false};
 
     int64_t year_start_equity_fp_  = 0;
     int     current_year_          = 0;

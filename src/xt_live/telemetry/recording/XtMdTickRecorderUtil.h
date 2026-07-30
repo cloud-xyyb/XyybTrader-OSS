@@ -4,6 +4,7 @@
 /// @brief MD tick 写入 recorder 前的字段转换 helper。
 
 #include <cstdint>
+#include <string>
 
 #include "xt_core/XtFixedPoint.h"
 #include "XtLiveRecorder.h"
@@ -12,6 +13,17 @@ namespace xt_live_recorder_util {
 
 inline int64_t to_recorder_fp(double value) noexcept {
     return ::to_fp_trunc(value);
+}
+
+inline bool venue_volume_is_coin_quantity(const std::string& normalized_provider) noexcept {
+    return normalized_provider == "binance_u";
+}
+
+inline int64_t to_recorder_volume_fp(const std::string& normalized_provider,
+                                     double total_volume) noexcept {
+    return venue_volume_is_coin_quantity(normalized_provider)
+        ? to_recorder_fp(total_volume)
+        : static_cast<int64_t>(total_volume);
 }
 
 inline void fill_md_depth_fp(const double* bid_prices,

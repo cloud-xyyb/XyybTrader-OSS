@@ -3,7 +3,11 @@
 #include <cstdint>
 
 /// @file
-/// @brief 开平语义枚举与净仓推导 helper。
+/// @brief 开平（open/close offset）语义枚举与净仓推导 helper。
+///
+/// 期货报单除了买卖方向，还要声明这一单是开仓还是平仓；SHFE/INE 等交易所更要求平仓时区分
+/// 平今、平昨。本文件定义这套开平枚举，并提供由净持仓和买卖方向反推 Open/Close 的 helper
+/// （今昨的进一步拆分交给路由层）。
 
 enum class XtOffset : uint8_t {
     Open = 0,

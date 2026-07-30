@@ -54,6 +54,8 @@ enum class XtRejectCode {
 
     MarginCallLiquidation,
     AutoOffsetUnresolved,
+
+    BacktestEofClosing,
 };
 
 }

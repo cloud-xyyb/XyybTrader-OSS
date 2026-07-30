@@ -93,6 +93,62 @@ inline AssemblyAlignmentReport check_multi_exec_sink_alignment(
     return rep;
 }
 
+template <typename StrategyIdAt, typename SinkAt>
+inline AssemblyAlignmentReport check_multi_exec_sink_alignment_no_instances(
+    const std::vector<std::string>&        cfg_strategy_ids,
+    const std::vector<IStrategyExecSink*>& sink_ptrs,
+    std::size_t                            context_count,
+    StrategyIdAt&&                         strategy_id_at,
+    SinkAt&&                               sink_at,
+    const xt_identity::StrategySidRegistry* sid_registry = nullptr) {
+    AssemblyAlignmentReport rep;
+    const std::size_t n = cfg_strategy_ids.size();
+
+    if (n != sink_ptrs.size()) {
+        rep.aligned = false;
+        rep.error = "alignment fail: cfg_strategy_ids.size=" + std::to_string(n) +
+                    " != sink_ptrs.size=" + std::to_string(sink_ptrs.size());
+        return rep;
+    }
+    if (n != context_count) {
+        rep.aligned = false;
+        rep.error = "alignment fail: cfg_strategy_ids.size=" + std::to_string(n) +
+                    " != context_count=" + std::to_string(context_count);
+        return rep;
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string& cfg_id = cfg_strategy_ids[i];
+        const std::string  ctx_id = strategy_id_at(i);
+        const IStrategyExecSink* sink_p = sink_ptrs[i];
+        const IStrategyExecSink* sink_a = sink_at(i);
+
+        if (cfg_id != ctx_id || sink_p == nullptr || sink_a == nullptr ||
+            sink_p != sink_a) {
+            rep.aligned = false;
+            rep.error = "alignment fail @ idx=" + std::to_string(i) +
+                        ": cfg.id='" + cfg_id +
+                        "' ctx.id='" + ctx_id +
+                        "' sink_ptr_match=" +
+                        (sink_p == sink_a ? "true" : "false") +
+                        " (engine sid routing 将串扰 fill)";
+            return rep;
+        }
+        if (sid_registry) {
+            const uint32_t sid_id = sid_registry->lookup(cfg_id);
+            if (sid_id != i + 1) {
+                rep.aligned = false;
+                rep.error = "alignment fail @ idx=" + std::to_string(i) +
+                            ": cfg.id='" + cfg_id +
+                            "' sid_registry.lookup=" + std::to_string(sid_id) +
+                            " expected=" + std::to_string(i + 1);
+                return rep;
+            }
+        }
+    }
+    return rep;
+}
+
 template <typename Engine>
 inline AssemblyAlignmentReport check_multi_exec_sink_alignment(
     const std::vector<std::string>&      cfg_strategy_ids,

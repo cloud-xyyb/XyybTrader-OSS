@@ -1,7 +1,10 @@
 #include "XtLatencyModelFactory.h"
 
+#include <cstdio>
 #include <stdexcept>
 #include <string>
+
+#include "xt_engine/sim/XtLatencyArith.h"
 
 #include "xt_util/path/PathUtil.h"
 #include "xt_engine/sim/CdfLatencyModel.h"
@@ -17,8 +20,10 @@ namespace xt_bt::hft {
 
 std::unique_ptr<ILatencyModel> make_latency_model(const LatencyModelCfg& cfg) {
     if (cfg.type == "constant") {
+
         return std::make_unique<ConstantLatencyModel>(
-            cfg.entry_us * 1000LL, cfg.response_us * 1000LL);
+            xt_latency::checked_us_to_ns(cfg.entry_us, "constant entry_us"),
+            xt_latency::checked_us_to_ns(cfg.response_us, "constant response_us"));
     }
     if (cfg.type == "cdf") {
 
@@ -47,6 +52,7 @@ std::unique_ptr<ILatencyModel> make_latency_model(const LatencyModelCfg& cfg) {
                 "实际后缀='." + ext + "' 路径=" + cfg.source +
                 "（CDF YAML 请改用 type:cdf）");
         }
+
         return std::make_unique<InterpolatedLatencyModel>(cfg.source);
     }
     throw std::runtime_error(

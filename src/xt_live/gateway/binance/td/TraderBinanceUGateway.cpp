@@ -73,6 +73,27 @@ bool TraderBinanceUGateway::is_recovering() const {
     return impl_->is_recovering();
 }
 
+bool TraderBinanceUGateway::is_order_terminal(uint64_t local_id) const {
+    return impl_->ledger_.is_order_terminal(local_id);
+}
+
+bool TraderBinanceUGateway::lookup_terminal(uint64_t local_id,
+                                            XtOrderTerminalRecord& out) const {
+    XtOrderStatus status = XtOrderStatus::Canceled;
+    int64_t filled_fp = -1;
+    if (!impl_->ledger_.lookup_terminal(local_id, status, filled_fp)) return false;
+    out.status = status;
+    out.filled_fp = filled_fp;
+    return true;
+}
+
+bool TraderBinanceUGateway::collect_open_delivery_ids(std::vector<uint64_t>& out) const {
+    for (const auto& brief : impl_->ledger_.inflight_snapshot()) {
+        out.push_back(brief.local_id);
+    }
+    return true;
+}
+
 #ifdef XT_BUILD_TESTS
 
 void* TraderBinanceUGateway::_test_impl_void() noexcept {
@@ -84,7 +105,8 @@ void trader_binance_test_inject_transport_ack(void* impl_void, const TransportAc
     TransportLatencyTrace trace;
     trace.local_id = ack.local_id;
     trace.transport = "test";
-    trace.t1_us = ack.is_transport_error() ? 0 : lat_now_us();
+
+    trace.t1_us = lat_now_us();
     impl->test_inject_transport_ack(ack, trace);
 }
 
@@ -127,6 +149,11 @@ long long trader_binance_test_detect_ghosts(void* impl_void, uint32_t min_age_ms
     auto r = static_cast<TraderBinanceUGateway::Impl*>(impl_void)
                  ->reconciler_.detect_and_resolve_ghosts(min_age_ms);
     return r.has_value() ? static_cast<long long>(*r) : -1LL;
+}
+
+uint64_t trader_binance_test_user_trades_pages_capped(void* impl_void) {
+    return static_cast<TraderBinanceUGateway::Impl*>(impl_void)
+        ->reconciler_.user_trades_pages_capped_total();
 }
 
 void trader_binance_test_set_rest(void* impl_void,
@@ -175,7 +202,7 @@ void trader_binance_test_reset_td_readiness(void* impl_void) {
 
 void trader_binance_test_boot_cold_worker_with_uds(
     void* impl_void, const std::string& tracked_symbol,
-    std::function<void(const XtTradeRecord&)> on_gap_fill_trade) {
+    std::function<void(const XtTradeRecord&, XtLatencyEligibility)> on_gap_fill_trade) {
     static_cast<TraderBinanceUGateway::Impl*>(impl_void)
         ->test_boot_cold_worker_with_uds(tracked_symbol, std::move(on_gap_fill_trade));
 }

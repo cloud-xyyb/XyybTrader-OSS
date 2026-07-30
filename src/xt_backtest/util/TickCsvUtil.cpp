@@ -12,6 +12,23 @@
 
 using XtParseUtil::split_csv_trim_sv;
 
+namespace {
+
+int depth_alias_level(const std::string& norm, const char* prefix) {
+    const std::size_t plen = std::strlen(prefix);
+    if (norm.size() <= plen || norm.compare(0, plen, prefix) != 0) return 0;
+    int level = 0;
+    for (std::size_t i = plen; i < norm.size(); ++i) {
+        const char c = norm[i];
+        if (c < '0' || c > '9') return 0;
+        level = level * 10 + (c - '0');
+        if (level > XtTickCsvSpec::MAX_DEPTH) return 0;
+    }
+    return level;
+}
+
+}
+
 XtTickVolumeMode parse_tick_volume_mode(const std::string& mode) {
     const std::string v = XtStringUtil::lower(XtStringUtil::trim(mode));
     if (v == "incremental" || v == "inc") return XtTickVolumeMode::Incremental;
@@ -23,14 +40,8 @@ bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
     thread_local std::vector<std::string_view> cols;
     split_csv_trim_sv(line, cols);
 
-    bool has_alpha = false;
     for (int idx = 0; idx < static_cast<int>(cols.size()); ++idx) {
         const std::string norm = XtParseUtil::normalize_col(cols[idx]);
-
-        if (!has_alpha) {
-            for (unsigned char c : norm)
-                if (std::isalpha(c)) { has_alpha = true; break; }
-        }
 
         if      (norm == "instrumentid")   spec.idx_instrument     = idx;
         else if (norm == "code")           spec.idx_instrument     = idx;
@@ -54,24 +65,30 @@ bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
         else if (norm == "bidvolume1") { spec.idx_bid_qty1   = idx; spec.idx_bid_qty_n[0]   = idx; }
         else if (norm == "askprice1")  { spec.idx_ask_price1 = idx; spec.idx_ask_price_n[0] = idx; }
         else if (norm == "askvolume1") { spec.idx_ask_qty1   = idx; spec.idx_ask_qty_n[0]   = idx; }
-        else if (norm == "bidprice2")  spec.idx_bid_price_n[1] = idx;
-        else if (norm == "bidprice3")  spec.idx_bid_price_n[2] = idx;
-        else if (norm == "bidprice4")  spec.idx_bid_price_n[3] = idx;
-        else if (norm == "bidprice5")  spec.idx_bid_price_n[4] = idx;
-        else if (norm == "askprice2")  spec.idx_ask_price_n[1] = idx;
-        else if (norm == "askprice3")  spec.idx_ask_price_n[2] = idx;
-        else if (norm == "askprice4")  spec.idx_ask_price_n[3] = idx;
-        else if (norm == "askprice5")  spec.idx_ask_price_n[4] = idx;
-        else if (norm == "bidvolume2") spec.idx_bid_qty_n[1]   = idx;
-        else if (norm == "bidvolume3") spec.idx_bid_qty_n[2]   = idx;
-        else if (norm == "bidvolume4") spec.idx_bid_qty_n[3]   = idx;
-        else if (norm == "bidvolume5") spec.idx_bid_qty_n[4]   = idx;
-        else if (norm == "askvolume2") spec.idx_ask_qty_n[1]   = idx;
-        else if (norm == "askvolume3") spec.idx_ask_qty_n[2]   = idx;
-        else if (norm == "askvolume4") spec.idx_ask_qty_n[3]   = idx;
-        else if (norm == "askvolume5") spec.idx_ask_qty_n[4]   = idx;
+
+        else if (int lv = depth_alias_level(norm, "bidprice"); lv >= 2)
+            spec.idx_bid_price_n[lv - 1] = idx;
+        else if (int lv = depth_alias_level(norm, "askprice"); lv >= 2)
+            spec.idx_ask_price_n[lv - 1] = idx;
+        else if (int lv = depth_alias_level(norm, "bidvolume"); lv >= 2)
+            spec.idx_bid_qty_n[lv - 1] = idx;
+        else if (int lv = depth_alias_level(norm, "askvolume"); lv >= 2)
+            spec.idx_ask_qty_n[lv - 1] = idx;
     }
-    if (!has_alpha) return false;
+
+    bool alias_hit =
+        spec.idx_instrument >= 0 || spec.idx_trading_day >= 0 ||
+        spec.idx_update_time >= 0 || spec.idx_update_ms >= 0 ||
+        spec.idx_update_time_ms >= 0 || spec.idx_epoch_us >= 0 ||
+        spec.idx_last_price >= 0 || spec.idx_volume >= 0 ||
+        spec.idx_high >= 0 || spec.idx_low >= 0 || spec.idx_turnover >= 0 ||
+        spec.idx_open_interest >= 0 || spec.idx_upper_limit >= 0 ||
+        spec.idx_lower_limit >= 0;
+    for (int i = 0; !alias_hit && i < XtTickCsvSpec::MAX_DEPTH; ++i) {
+        alias_hit = spec.idx_bid_price_n[i] >= 0 || spec.idx_ask_price_n[i] >= 0 ||
+                    spec.idx_bid_qty_n[i] >= 0 || spec.idx_ask_qty_n[i] >= 0;
+    }
+    if (!alias_hit) return false;
     spec.has_header = true;
 
     if (spec.idx_update_time < 0 && spec.idx_update_time_ms >= 0)
@@ -96,11 +113,18 @@ bool parse_tick_csv_line(const std::string& line,
                          uint64_t& key,
                          const std::unordered_set<std::string>& symbol_filter,
                          double qty_base,
-                         XtTickVolumeMode vol_mode) {
+                         XtTickVolumeMode vol_mode,
+                         TickParseDrop* out_drop) {
+
+    if (out_drop) *out_drop = TickParseDrop::None;
+    const auto drop = [&](TickParseDrop reason) {
+        if (out_drop) *out_drop = reason;
+        return false;
+    };
 
     thread_local std::vector<std::string_view> cols;
     split_csv_trim_sv(line, cols);
-    if (cols.empty()) return false;
+    if (cols.empty()) return drop(TickParseDrop::BadRow);
 
     auto col = [&](int idx) -> std::string_view {
         if (idx >= 0 && idx < static_cast<int>(cols.size())) return cols[idx];
@@ -110,12 +134,13 @@ bool parse_tick_csv_line(const std::string& line,
     if (spec.simple) {
         const std::string_view code  = col(0);
         const std::string_view price = col(1);
-        if (code.empty() || price.empty()) return false;
+        if (code.empty() || price.empty()) return drop(TickParseDrop::BadRow);
 
-        if (!symbol_filter.empty() && !symbol_filter.count(std::string(code))) return false;
+        if (!symbol_filter.empty() && !symbol_filter.count(std::string(code)))
+            return drop(TickParseDrop::SymbolMiss);
 
         double px = 0.0;
-        if (!XtParseUtil::parse_double(price, px)) return false;
+        if (!XtParseUtil::parse_double(price, px)) return drop(TickParseDrop::BadRow);
 
         std::memset(&out, 0, sizeof(out));
         const std::size_t nc = std::min(code.size(), sizeof(out.code) - 1);
@@ -132,11 +157,13 @@ bool parse_tick_csv_line(const std::string& line,
     }
 
     const std::string_view code = col(spec.idx_instrument);
-    if (code.empty()) return false;
-    if (!symbol_filter.empty() && !symbol_filter.count(std::string(code))) return false;
+    if (code.empty()) return drop(TickParseDrop::BadRow);
+    if (!symbol_filter.empty() && !symbol_filter.count(std::string(code)))
+        return drop(TickParseDrop::SymbolMiss);
 
     double last_price = 0.0;
-    if (!XtParseUtil::parse_double(col(spec.idx_last_price), last_price)) return false;
+    if (!XtParseUtil::parse_double(col(spec.idx_last_price), last_price))
+        return drop(TickParseDrop::BadRow);
 
     std::memset(&out, 0, sizeof(out));
     const std::size_t nc = std::min(code.size(), sizeof(out.code) - 1);

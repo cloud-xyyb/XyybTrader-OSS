@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -18,6 +19,7 @@
 #include "xt_core/order/XtOrderTypes.h"
 #include "xt_core/order/XtOffset.h"
 #include "xt_core/order/XtOrder.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_util/sync/XtHazardDomain.h"
 #include "xt_util/sync/XtSnapshotPool.h"
 
@@ -36,6 +38,18 @@ using xt_core::XtInstrumentRegistry;
 using xt_core::kInvalidInstrumentId;
 using xt_core::kMaxInstruments;
 
+/// @brief reverse-sync fillup 实际接受/复活（建成或更新 slot）的一单——供上层 STP re-arm。
+///
+/// book 「接受」= 已过 terminal-tombstone skip（book 拒绝复活已终态 id）且成功建/更新
+/// slot，即 book exchange-as-truth 裁定「该单活着」。engine 对该清单逐单调
+/// XtLiveOrderGateway::rearm_active_order，让 STP 跟随 book 裁决（book 说活即活）。
+struct AcceptedRearmOrder {
+    std::string code;
+    uint64_t    id = 0;
+    bool        is_buy = true;
+    int64_t     price_fp = 0;
+};
+
 /// @brief 进程内在途订单的权威账本。
 ///
 /// - 每笔订单从提交到终态的本地状态记录
@@ -44,7 +58,14 @@ using xt_core::kMaxInstruments;
 /// - 其他线程只能读 Hazard Pointer 保护的 immutable OrderBookSnapshot，不碰内部 slot。
 class XtOrderRuntimeBook {
 public:
+    /// @brief 构造期配置；运行期不可改（无 setter，避免中途换语义的观测窗口）。
+    struct Config {
+
+        int64_t pre_registration_ttl_ms = 5000;
+    };
+
     XtOrderRuntimeBook();
+    explicit XtOrderRuntimeBook(const Config& cfg);
 
     XtOrderRuntimeBook(XtOrderRuntimeBook&& other) noexcept;
     XtOrderRuntimeBook& operator=(XtOrderRuntimeBook&& other) noexcept;
@@ -61,34 +82,63 @@ public:
 
     [[nodiscard]] bool post_to_worker(std::function<void()> fn) const;
 
-    [[nodiscard]] bool should_skip_submit(uint64_t id);
+    void enter_quiescent() noexcept;
 
-    void on_order_submitted(uint64_t id,
-                            const char* code,
-                            bool is_buy,
-                            int64_t qty_fp,
-                            int64_t price_fp,
-                            XtOffset close_offset,
-                            const xt_account::CloseableView& closeable_view,
-                            StrategySid sid);
+    void drain_marshal_side_channel();
 
-    void on_order_submitted(uint64_t id,
-                            const char* code,
-                            bool is_buy,
-                            int64_t qty_fp,
-                            int64_t price_fp,
-                            XtOffset close_offset,
-                            const xt_account::CloseableView& closeable_view);
+    void shutdown_quiesce();
+
+    // Submit 与 execution 回报
+    /// @brief submit 注册的结果分派（终态 tombstone 消费收进注册入口内部）。
+    struct SubmitRegisterResult {
+        enum class Outcome : uint8_t {
+            kRegistered,
+            kSkippedTerminal,
+            kBlockedDuplicate,
+            kDeferred,
+            kDropped,
+        };
+        Outcome outcome = Outcome::kRegistered;
+
+        int64_t filled_fp = 0;
+
+        int64_t leaves_fp = 0;
+    };
+
+    SubmitRegisterResult on_order_submitted(uint64_t id,
+                                            const char* code,
+                                            bool is_buy,
+                                            int64_t qty_fp,
+                                            int64_t price_fp,
+                                            XtOffset close_offset,
+                                            const xt_account::CloseableView& closeable_view,
+                                            StrategySid sid);
+
+    SubmitRegisterResult on_order_submitted(uint64_t id,
+                                            const char* code,
+                                            bool is_buy,
+                                            int64_t qty_fp,
+                                            int64_t price_fp,
+                                            XtOffset close_offset,
+                                            const xt_account::CloseableView& closeable_view);
 
     void on_trade(const XtTradeRecord& tr);
-
-    [[nodiscard]] std::string resolve_order_code_on_update(const XtOrderExecUpdate& upd) const;
 
     [[nodiscard]] uint32_t order_sid_id(uint64_t id) const;
 
     void on_order_update(const XtOrderExecUpdate& upd,
                          bool final_status,
                          int64_t effective_remaining_fp);
+
+    [[nodiscard]] size_t pre_registration_pending_count() const noexcept {
+        return pre_reg_stash_.size();
+    }
+
+    [[nodiscard]] size_t pre_registration_pending_trade_count() const noexcept {
+        return pre_reg_trade_stash_.size();
+    }
+
+    void sweep_stale_pre_registration() { sweep_expired_pre_registration_(); }
 
     void pre_warm_instrument(const char* code);
 
@@ -102,16 +152,13 @@ public:
     void fillup_alive_inflight_orders_batch(
         const std::vector<AliveInflightOrder>& orders,
         std::function<xt_account::CloseableView(const std::string& code,
-                                                 bool is_buy_to_close)> view_for);
+                                                 bool is_buy_to_close)> view_for,
+        std::vector<AcceptedRearmOrder>* accepted_out = nullptr);
 
     [[nodiscard]] std::vector<std::string> sync_position_snapshot(
         const std::vector<std::string>& position_codes,
         bool is_recovery,
         bool is_cold_start);
-
-    void on_position_snapshot(const std::vector<std::string>& position_codes,
-                              bool is_recovery,
-                              bool is_cold_start);
 
     void accumulate_close_outstanding_fp(const char* code,
                                          bool is_buy,
@@ -133,15 +180,13 @@ public:
                                  XtOffset close_offset,
                                  StrategySid sid);
 
-    void record_global_force_flat_order(uint64_t oid,
-                                        const std::string& code,
-                                        bool is_buy,
-                                        int64_t qty_fp,
-                                        XtOffset close_offset);
-
     void collect_active_order_prices(const char* code,
                                      std::vector<int64_t>& bid_prices,
                                      std::vector<int64_t>& ask_prices) const;
+
+    [[nodiscard]] bool terminal_order_seen(uint64_t id) const noexcept {
+        return terminal_order_seen_(id);
+    }
 
     void collect_working_ids_for_code(const char* code,
                                       std::vector<uint64_t>& ids) const;
@@ -173,9 +218,8 @@ public:
                                              const char* code_filter = nullptr,
                                              uint32_t sid_filter = 0) const;
 
-    [[nodiscard]] size_t collect_recovered_unowned_ids(uint64_t* out, size_t max) const;
-
-    [[nodiscard]] size_t reap_recovered_unowned(uint64_t* out, size_t max);
+    [[nodiscard]] size_t reap_recovered_unowned(uint64_t* out, size_t max,
+                                                std::vector<uint64_t>* reaped_ids = nullptr);
 
 private:
     struct CloseOutstandingKey {
@@ -205,6 +249,7 @@ private:
         uint64_t id = 0;
         XtInstrumentId instrument_id = kInvalidInstrumentId;
         bool is_buy = true;
+
         bool is_close = false;
 
         bool is_force_flat = false;
@@ -244,6 +289,8 @@ private:
     const OrderLifecycleSlot* find_slot(uint64_t id) const;
     OrderLifecycleSlot* upsert_slot(uint64_t id, bool& inserted);
     void erase_slot(uint64_t id);
+
+    [[nodiscard]] bool should_skip_submit(uint64_t id);
     [[nodiscard]] bool terminal_order_seen_(uint64_t id) const noexcept;
     void remember_terminal_order_(uint64_t id);
 
@@ -257,6 +304,8 @@ private:
                                      int64_t delta_yesterday_fp);
     void add_slot_close_contribution(const OrderLifecycleSlot& slot);
     void remove_slot_close_contribution(const OrderLifecycleSlot& slot);
+
+    size_t reconcile_close_outstanding_from_slots_();
 
     void track_code_unlocked(const char* code);
     void init_close_locks_on_submit(XtInstrumentId instrument_id,
@@ -272,6 +321,7 @@ private:
     void upsert_order_atom_on_update(const XtOrderExecUpdate& upd,
                                      XtInstrumentId upd_instrument_id,
                                      int64_t effective_remaining_fp);
+
     void populate_submit_slot_(OrderLifecycleSlot& atom,
                                uint64_t id,
                                XtInstrumentId iid,
@@ -279,7 +329,6 @@ private:
                                int64_t qty_fp,
                                int64_t price_fp,
                                XtOffset close_offset,
-                               bool is_close,
                                StrategySid sid);
 
     void fillup_populate_slot_(OrderLifecycleSlot& atom,
@@ -303,6 +352,50 @@ private:
     [[nodiscard]] bool is_collect_thread_allowed_() const noexcept;
 
     void on_cross_thread_direct_read_blocked_() const noexcept;
+
+    [[nodiscard]] bool push_marshal_side_channel_(std::function<void()> fn) const;
+
+    void drain_marshal_side_channel_final_();
+
+    struct PreRegStashEntry {
+        uint64_t id = 0;
+        XtOrderExecUpdate upd;
+        int64_t effective_remaining_fp = 0;
+        int64_t stash_ms = 0;
+    };
+    static constexpr std::size_t kPreRegStashCap = 64;
+
+    /// @brief 注册前先到的独立 Trade 暂存项；到达序 = vector 序。
+    ///
+    /// 最小投影 POD：on_trade 的 slot 写路径只消费 order_id / qty_fp / is_today
+    /// 三个字段（apply_trade_fill_ + accumulate_close_fills_on_trade），不存整个
+    /// XtTradeRecord（10 个 std::string 成员）。
+    /// @note 若 on_trade 的成交消费面扩大（读取更多 tr 字段），须同步扩本投影。
+    struct PreRegTradeStashEntry {
+        uint64_t id = 0;
+        int64_t qty_fp = 0;
+        bool is_today = false;
+        int64_t stash_ms = 0;
+    };
+    static constexpr std::size_t kPreRegTradeStashCap = 64;
+
+    void stash_pre_registration_update_(const XtOrderExecUpdate& upd,
+                                        int64_t effective_remaining_fp);
+
+    void stash_pre_registration_trade_(uint64_t id, int64_t qty_fp, bool is_today);
+
+    void sweep_expired_pre_registration_();
+
+    void replay_pre_registration_updates_(uint64_t id);
+
+    void replay_pre_registration_trades_(uint64_t id);
+
+    void apply_trade_fill_(OrderLifecycleSlot& atom, uint64_t id, int64_t qty_fp,
+                           bool is_today);
+
+    void clear_pre_registration_for_id_(uint64_t id);
+
+    void clear_pre_registration_trades_for_id_(uint64_t id);
 
     std::array<OrderLifecycleSlot, kMaxInflightOrders> slot_pool_;
     std::array<uint16_t, kMaxInflightOrders> free_stack_;
@@ -329,6 +422,17 @@ private:
     WorkerPostFn marshal_post_;
     std::thread::id marshal_worker_tid_{};
     std::atomic<bool> marshal_bound_{false};
+
+    std::atomic<bool> marshal_quiescent_{false};
+
+    static constexpr std::size_t kMarshalSideChannelCap = 1024;
+    mutable std::mutex marshal_side_channel_mu_;
+    mutable std::vector<std::function<void()>> marshal_side_channel_;
+    mutable std::atomic<std::size_t> marshal_side_channel_depth_{0};
+
+    std::vector<PreRegStashEntry> pre_reg_stash_;
+    std::vector<PreRegTradeStashEntry> pre_reg_trade_stash_;
+    int64_t pre_reg_ttl_ms_ = Config{}.pre_registration_ttl_ms;
 };
 
 }
@@ -339,7 +443,13 @@ std::atomic<uint64_t>& slot_pool_full_drops();
 
 std::atomic<uint64_t>& orphan_update_dropped();
 
+std::atomic<uint64_t>& orphan_trade_dropped();
+
 std::atomic<uint64_t>& orphan_reap_dropped();
+
+std::atomic<uint64_t>& fillup_terminal_resurrect_blocked();
+
+std::atomic<uint64_t>& close_outstanding_drift_healed();
 
 std::atomic<uint64_t>& snapshot_publish_skipped();
 
@@ -347,15 +457,30 @@ std::atomic<uint64_t>& cross_thread_direct_read_blocked();
 
 std::atomic<uint64_t>& tracked_codes_truncated();
 
+std::atomic<uint64_t>& marshal_side_channel_used();
+
+std::atomic<uint64_t>& marshal_side_channel_overflow_dropped();
+
+std::atomic<uint64_t>& duplicate_submit_blocked();
+
+std::atomic<uint64_t>& venue_fillup_qty_sanitized();
+
 #ifdef XT_BUILD_TESTS
 
 inline void reset_for_test() {
     slot_pool_full_drops().store(0, std::memory_order_relaxed);
     orphan_update_dropped().store(0, std::memory_order_relaxed);
+    orphan_trade_dropped().store(0, std::memory_order_relaxed);
     orphan_reap_dropped().store(0, std::memory_order_relaxed);
+    fillup_terminal_resurrect_blocked().store(0, std::memory_order_relaxed);
+    close_outstanding_drift_healed().store(0, std::memory_order_relaxed);
     snapshot_publish_skipped().store(0, std::memory_order_relaxed);
     cross_thread_direct_read_blocked().store(0, std::memory_order_relaxed);
     tracked_codes_truncated().store(0, std::memory_order_relaxed);
+    marshal_side_channel_used().store(0, std::memory_order_relaxed);
+    marshal_side_channel_overflow_dropped().store(0, std::memory_order_relaxed);
+    duplicate_submit_blocked().store(0, std::memory_order_relaxed);
+    venue_fillup_qty_sanitized().store(0, std::memory_order_relaxed);
 }
 #endif
 }

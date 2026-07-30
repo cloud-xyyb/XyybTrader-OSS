@@ -1,6 +1,7 @@
 #include "xt_core/market/XtRollEngine.h"
 
 #include "xt_util/string/XtStringUtil.h"
+#include "xt_util/time/XtTime.h"
 
 #include <algorithm>
 #include <cctype>
@@ -59,6 +60,16 @@ void XtRollEngine::Config::validate(std::vector<std::string>& errors) const {
             errors.push_back("backtest.roll.path 中 date 必须是有效日期");
             continue;
         }
+        if (!xt_time::is_valid_yyyymmdd(sw.date)) {
+            errors.push_back("backtest.roll.path 中 date 不是合法日历日期: "
+                             + std::to_string(sw.date));
+            continue;
+        }
+        if (sw.known_on_date != 0 && !xt_time::is_valid_yyyymmdd(sw.known_on_date)) {
+            errors.push_back("backtest.roll.path 中 known_on 不是合法日历日期: "
+                             + std::to_string(sw.known_on_date));
+            continue;
+        }
         if (sw.symbol.empty()) {
             errors.push_back("backtest.roll.path 中 symbol 不能为空");
         }
@@ -75,19 +86,27 @@ void XtRollEngine::Config::validate(std::vector<std::string>& errors) const {
                 errors.push_back("window_before_days>0 时，roll.path 中 known_on 必填");
                 continue;
             }
-            if (sw.date > static_cast<uint32_t>(window_before_days) &&
-                sw.known_on_date > (sw.date - static_cast<uint32_t>(window_before_days))) {
+            if (sw.known_on_date >
+                xt_time::yyyymmdd_add_days(sw.date, -static_cast<int64_t>(window_before_days))) {
                 errors.push_back("roll.path 中 known_on 必须早于等于 (date-window_before_days)");
             }
         }
 
-        const uint32_t total_window = static_cast<uint32_t>(window_before_days + window_after_days);
-        if (total_window > 0 && i + 1 < switches.size()) {
-            const uint32_t gap = switches[i + 1].date - sw.date;
-            if (gap < total_window) {
+        if (i + 1 < switches.size() && (window_before_days > 0 || window_after_days > 0)) {
+            const int64_t gap = xt_time::yyyymmdd_diff_days(sw.date, switches[i + 1].date);
+            bool overlap = false;
+            if (window_before_days > 0 && window_after_days > 0) {
+                overlap = gap <= static_cast<int64_t>(window_before_days + window_after_days);
+            } else if (window_before_days > 0) {
+                overlap = gap < static_cast<int64_t>(window_before_days);
+            } else {
+                overlap = gap <= static_cast<int64_t>(window_after_days);
+            }
+            if (overlap) {
                 errors.push_back("相邻换月间距（" + std::to_string(gap)
-                    + "天）小于窗口总宽（" + std::to_string(total_window)
-                    + "天），窗口将重叠");
+                    + "自然日）与窗口（before=" + std::to_string(window_before_days)
+                    + ", after=" + std::to_string(window_after_days)
+                    + "）重叠或截断");
             }
         }
     }
@@ -165,9 +184,8 @@ XtRollEngine::ResolveResult XtRollEngine::resolve(uint32_t date) const {
 
     if (window_before_days_ > 0 && static_cast<size_t>(idx + 1) < switches_.size()) {
         const auto& next = switches_[static_cast<size_t>(idx + 1)];
-        const uint32_t start = (next.date > static_cast<uint32_t>(window_before_days_))
-                                   ? (next.date - static_cast<uint32_t>(window_before_days_))
-                                   : 0;
+        const uint32_t start =
+            xt_time::yyyymmdd_add_days(next.date, -static_cast<int64_t>(window_before_days_));
         if (date >= start && date < next.date && can_pre_roll_to(static_cast<size_t>(idx + 1), date)) {
             if (!next.symbol.empty() && !contains_symbol(out.accepted_symbols, next.symbol)) {
                 out.accepted_symbols.push_back(next.symbol);
@@ -179,7 +197,8 @@ XtRollEngine::ResolveResult XtRollEngine::resolve(uint32_t date) const {
     if (window_after_days_ > 0 && idx > 0) {
         const auto& cur = switches_[static_cast<size_t>(idx)];
         const auto& prev = switches_[static_cast<size_t>(idx - 1)];
-        const uint32_t end = cur.date + static_cast<uint32_t>(window_after_days_);
+        const uint32_t end =
+            xt_time::yyyymmdd_add_days(cur.date, static_cast<int64_t>(window_after_days_));
         if (date >= cur.date && date <= end) {
             if (!prev.symbol.empty() && !contains_symbol(out.accepted_symbols, prev.symbol)) {
                 out.accepted_symbols.push_back(prev.symbol);

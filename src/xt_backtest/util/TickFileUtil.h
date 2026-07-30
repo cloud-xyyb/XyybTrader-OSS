@@ -28,17 +28,33 @@ std::string sanitize_filename_part(const std::string& s);
 std::string build_tick_cache_path(const std::string& cache_dir,
                                   uint32_t start_date,
                                   uint32_t end_date,
-                                  const std::vector<std::string>& tick_symbols);
+                                  const std::vector<std::string>& tick_symbols,
+                                  double qty_base,
+                                  XtTickVolumeMode vol_mode,
+                                  const std::vector<std::string>& sources);
+
+bool extract_date_from_filename(const std::string& name, uint32_t& out_date);
+
+constexpr uint32_t kTickNightCarryGuardDays = 15;
+
+uint32_t derive_night_carry_guard_days(std::vector<uint32_t> filename_days);
+
+uint32_t derive_night_carry_guard_days_for_paths(const std::vector<std::string>& paths);
 
 void append_tick_files_from_root(const std::string& root,
                                  uint32_t start_date,
                                  uint32_t end_date,
                                  std::vector<std::string>& out);
 
+void append_all_tick_files_from_root(const std::string& root, std::vector<std::string>& out);
+
 bool find_first_symbol_in_files(const std::vector<std::string>& files,
                                 std::string& out,
                                 double qty_base,
                                 XtTickVolumeMode vol_mode);
+
+std::vector<std::string> filter_files_for_auto_main(const std::vector<std::string>& files,
+                                                    uint32_t start_date);
 
 uint64_t compute_source_signature(const std::vector<std::string>& sources,
                                   double qty_base,

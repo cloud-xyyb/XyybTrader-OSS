@@ -7,6 +7,7 @@
 
 #include "api/IMdGateway.h"
 #include "ctp/md/CTPMdCfg.h"
+#include "ctp/common/CtpExchangeInfer.h"
 #include "ctp/common/CtpFrontDisconnectLogGate.h"
 #include "ThostFtdcMdApi.h"
 
@@ -90,8 +91,12 @@ private:
     IMdGateway::Config saved_cfg_;
     uint32_t stale_reconnect_ms_ = 0;
     std::atomic<uint32_t> last_tick_steady_ms_{0};
+    ctp_md_session::TradingWindowGate window_gate_;
+    uint32_t synthetic_arm_steady_ms_ = 0;
+    bool prev_in_window_ = false;
+    ctp_util::CtpExchangeWarnGate exchg_enrich_warn_gate_;
 
-    std::function<void(const XtRawTick&)> on_tick_;
+    std::function<void(const XtRawTick&, uint64_t)> on_tick_;
     std::function<void()> on_ready_;
     std::function<void(bool, int)> on_front_;
 };

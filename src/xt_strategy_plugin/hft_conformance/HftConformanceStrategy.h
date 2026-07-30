@@ -41,6 +41,7 @@ public:
         stuck_viol_grace_ms_     = cfg.get_int("stuck_viol_grace_ms", 40000);
         far_offset_ticks_        = cfg.get_int("far_offset_ticks", 100);
         max_orders_per_min_      = cfg.get_int("max_orders_per_min", 0);
+        halt_reprobe_decisions_  = cfg.get_int("halt_reprobe_decisions", 600);
         max_pos_qty_abs_fp_      = order_exec_to_fp(cfg.get_double("max_pos_qty_abs", qty_ * 5.0));
 
         flatten_chunk_qty_fp_    = order_exec_to_fp(cfg.get_double("flatten_chunk_qty", qty_));
@@ -166,6 +167,8 @@ public:
         rec.expect_reject = o.expect_reject; rec.overfill_flagged = o.overfill_flagged;
         recent_terminal_[u.id] = rec;
         inflight_.erase(it);
+
+        if (u.id == pending_marketable_id_) pending_marketable_id_ = 0;
         check_reject_storm_(ctx);
     }
 
@@ -328,13 +331,30 @@ private:
     void on_tick_impl_(IStrategyContext* ctx, const XtTick& tk) {
         ++tick_seq_;
 
+        const uint32_t td_now = ctx->get_trading_date();
+        if (td_now != 0 && td_now > cap_day_) {
+            if (cap_day_ != 0) {
+                char rbuf[144];
+                std::snprintf(rbuf, sizeof(rbuf),
+                              "conf CAP day rollover %u -> %u ord_day=%llu capped=%d (quota reset)",
+                              cap_day_, td_now, (unsigned long long)orders_day_, (int)capped_);
+                ctx->log_info(rbuf);
+            }
+            cap_day_ = td_now;
+            orders_day_ = 0;
+            capped_ = false;
+
+            symbol_open_halted_.clear();
+            symbol_reject_streak_.clear();
+        }
+
         const int64_t now_ms = packed_hms_to_ms(ctx->get_time_ms());
         if (first_ms_ < 0) first_ms_ = now_ms;
         const bool warmed = (now_ms - first_ms_ >= warmup_ms_) || (tick_seq_ >= warmup_ticks_);
-        if (!warmed) return;
+        if (!warmed) { ++skip_warmup_total_; return; }
 
         if (!self_pos_anchored_) {
-            if (!ctx->can_submit()) return;
+            if (!ctx->can_submit()) { ++skip_gate_total_; return; }
             self_pos_fp_ = confirmed_pos_(ctx);
             self_pos_anchored_ = true;
             char abuf[96];
@@ -357,25 +377,50 @@ private:
         if (audit_interval_ticks_ > 0) run_audit_machine_(ctx, tk);
         if (audit_state_ != AuditState::Normal) return;
 
-        if (!ctx->can_submit()) return;
+        if (!ctx->can_submit()) { ++skip_gate_total_; return; }
         if (decision_interval_ticks_ > 1 && (tick_seq_ % decision_interval_ticks_) != 0) return;
-        if (orders_total_ >= max_total_orders_) return;
+        if (orders_day_ >= (uint64_t)max_total_orders_) {
+            if (!capped_) {
+                capped_ = true;
+                ++cap_hit_days_total_;
+                char cbuf[176];
+                std::snprintf(cbuf, sizeof(cbuf),
+                              "conf CAP HIT day=%u ord_day=%llu max=%lld "
+                              "(open scenarios halted until day rollover; flatten/cancel unaffected)",
+                              cap_day_, (unsigned long long)orders_day_,
+                              (long long)max_total_orders_);
+                ctx->log_warn(cbuf);
+            }
+            return;
+        }
+
+        if (is_open_halted_(symbol_)) {
+            if (halt_reprobe_decisions_ <= 0) return;
+            if (++halt_reprobe_counter_ < halt_reprobe_decisions_) return;
+            halt_reprobe_counter_ = 0;
+
+            halt_probe_active_ = true;
+            fire_rapid_submit(ctx, tk);
+            halt_probe_active_ = false;
+            return;
+        }
         if (!order_budget_ok(now_ms)) { ++budget_skip_total_; return; }
 
         if (s_rapid_submit_) {
-            for (int i = 0; i < fire_per_tick_ && orders_total_ < max_total_orders_
-                            && order_budget_ok(now_ms); ++i)
+            for (int i = 0; i < fire_per_tick_ && orders_day_ < (uint64_t)max_total_orders_
+                            && order_budget_ok(now_ms) && !is_open_halted_(symbol_); ++i)
                 fire_rapid_submit(ctx, tk);
         }
 
         if (fill_per_tick_ > 0) {
             int64_t fs_proj_fp = 0;
-            for (int i = 0; i < fill_per_tick_ && orders_total_ < max_total_orders_
-                            && order_budget_ok(now_ms); ++i)
+            for (int i = 0; i < fill_per_tick_ && orders_day_ < (uint64_t)max_total_orders_
+                            && order_budget_ok(now_ms) && !is_open_halted_(symbol_); ++i)
                 fire_fill_storm(ctx, tk, fs_proj_fp);
         }
 
-        if (order_budget_ok(now_ms)) dispatch_rotating_scenario(ctx, tk);
+        if (orders_day_ < (uint64_t)max_total_orders_ && order_budget_ok(now_ms))
+            dispatch_rotating_scenario(ctx, tk);
     }
 
     int64_t aggressive_buy_px(const XtTick& tk) const noexcept {
@@ -480,6 +525,110 @@ private:
         return true;
     }
 
+    bool is_open_halted_(const std::string& code) const {
+        auto it = symbol_open_halted_.find(code);
+        return it != symbol_open_halted_.end() && it->second;
+    }
+
+    void note_open_reject_(IStrategyContext* ctx, bool latch_class) {
+        int& streak = symbol_reject_streak_[symbol_];
+        if (!latch_class) { streak = 0; return; }
+        if (++streak < kSymbolHaltStreakThreshold) return;
+        bool& halted = symbol_open_halted_[symbol_];
+        if (halted) return;
+        halted = true;
+        ++symbol_halt_events_total_;
+        char hbuf[192];
+        std::snprintf(hbuf, sizeof(hbuf),
+            "conf SYMBOL HALT sym=%s streak=%d "
+            "(non-self-healing latch reject; open scenarios halted until day rollover; "
+            "flatten/cancel unaffected)",
+            symbol_.c_str(), streak);
+        ctx->log_warn(hbuf);
+    }
+
+    bool marketable_pending_() const {
+        return pending_marketable_id_ != 0 &&
+               inflight_.find(pending_marketable_id_) != inflight_.end();
+    }
+
+    bool aggressive_gate_ready_(IStrategyContext* ctx, bool is_buy) {
+        bool blocked = false;
+
+        for (auto& kv : inflight_) {
+            Inflight& o = kv.second;
+            if (o.is_buy == is_buy) continue;
+            blocked = true;
+            request_cancel_(ctx, kv.first, o);
+        }
+
+        XtOrderExecUpdate ob[kOrphanSweepBuf];
+        const size_t n = ctx->get_open_orders(symbol_.c_str(), ob, kOrphanSweepBuf);
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t oid = ob[i].id;
+            if (oid == 0 || ob[i].is_buy == is_buy) continue;
+            if (inflight_.count(oid) != 0) continue;
+            blocked = true;
+
+            try_cancel_orphan_(ctx, oid);
+        }
+        if (blocked) {
+            ++aggr_gate_skips_;
+            steer_rapid_valid_  = true;
+            steer_rapid_is_buy_ = is_buy;
+        } else {
+            steer_rapid_valid_ = false;
+        }
+        return !blocked;
+    }
+
+    enum class RejectClass { kSticky, kTransient, kCloseFriction, kInfraSoft, kUnexpected };
+
+    static RejectClass classify_reject_(xt_runtime::XtRejectCode rc, XtOffset offset) {
+        using RC = xt_runtime::XtRejectCode;
+        switch (rc) {
+
+            case RC::SymbolBlacklisted:
+            case RC::SelfMatchPostTrade:
+            case RC::StrategyKillSwitchActive:
+            case RC::StrategyBlockedByWatchdog:
+            case RC::AnnualLossExceeded:
+            case RC::OpenHalted:
+            case RC::KillSwitchActive:
+            case RC::StrategyDailyLossExceeded:
+            case RC::DailyLossExceeded:
+                return RejectClass::kSticky;
+
+            case RC::SelfTradeDetected:
+            case RC::OrderRateExceeded:
+                return RejectClass::kTransient;
+
+            case RC::CloseSyncPending:
+            case RC::InsufficientCloseToday:
+            case RC::InsufficientCloseYesterday:
+            case RC::PositionSyncStale:
+            case RC::OppositeOpenPending:
+                return RejectClass::kCloseFriction;
+
+            case RC::CloseoutNoOpen:
+            case RC::Gated:
+            case RC::TradingNotReady:
+            case RC::OrderCountExceeded:
+            case RC::StrategyMaxPosQtyExceeded:
+                return RejectClass::kInfraSoft;
+            case RC::PositionLimit:
+
+                return offset != XtOffset::Open ? RejectClass::kCloseFriction
+                                                : RejectClass::kUnexpected;
+            case RC::Unknown:
+
+                return offset != XtOffset::Open ? RejectClass::kCloseFriction
+                                                : RejectClass::kUnexpected;
+            default:
+                return RejectClass::kUnexpected;
+        }
+    }
+
     uint64_t submit(IStrategyContext* ctx, int scenario, bool is_buy, int64_t price_fp,
                     int64_t qty_fp, XtTimeInForce tif, XtOffset offset,
                     const char* tag, bool expect_reject, bool expect_fast_terminal) {
@@ -490,34 +639,45 @@ private:
             : ctx->sell_fp(symbol_.c_str(), price_fp, qty_fp, tif, tag, offset);
         ++orders_total_;
         ++window_orders_;
+
+        consume_order_budget();
         if (id == 0) {
 
             const auto rc = ctx->last_reject_code();
             using RC = xt_runtime::XtRejectCode;
-            const bool infra_gated =
-                rc == RC::CloseoutNoOpen || rc == RC::KillSwitchActive ||
-                rc == RC::Gated || rc == RC::OpenHalted || rc == RC::TradingNotReady ||
-
-                rc == RC::SymbolBlacklisted || rc == RC::OrderCountExceeded ||
-                rc == RC::OrderRateExceeded || rc == RC::SelfMatchPostTrade ||
-                rc == RC::AnnualLossExceeded || rc == RC::StrategyMaxPosQtyExceeded ||
-                rc == RC::StrategyDailyLossExceeded || rc == RC::StrategyKillSwitchActive ||
-                rc == RC::StrategyBlockedByWatchdog;
-
-            const bool close_friction =
-                rc == RC::CloseSyncPending || rc == RC::InsufficientCloseToday ||
-                rc == RC::InsufficientCloseYesterday || rc == RC::PositionSyncStale ||
-                rc == RC::OppositeOpenPending ||
-                (rc == RC::PositionLimit && offset != XtOffset::Open);
+            if (rc == RC::SelfTradeDetected) ++selftrade_detected_total_;
             if (expect_reject) { ++rejects_expected_; probe_hit_(scenario); }
-            else if (infra_gated)   ++rejects_gated_;
-            else if (close_friction || (rc == RC::Unknown && offset != XtOffset::Open))
-                ++rejects_close_local_;
-            else { ++rejects_unexpected_; ++window_unexp_; }
+            else {
+                const RejectClass cls = classify_reject_(rc, offset);
+                note_open_reject_(ctx, cls == RejectClass::kSticky);
+                switch (cls) {
+                    case RejectClass::kSticky:
+                    case RejectClass::kTransient:
+                    case RejectClass::kInfraSoft:
+                        ++rejects_gated_; break;
+                    case RejectClass::kCloseFriction:
+                        ++rejects_close_local_; break;
+                    case RejectClass::kUnexpected:
+                        ++rejects_unexpected_; ++window_unexp_; break;
+                }
+            }
             check_reject_storm_(ctx);
             return 0;
         }
-        consume_order_budget();
+
+        ++orders_day_;
+
+        if (offset == XtOffset::Open) symbol_reject_streak_[symbol_] = 0;
+
+        if (halt_probe_active_) {
+            auto halt_it = symbol_open_halted_.find(symbol_);
+            if (halt_it != symbol_open_halted_.end() && halt_it->second) {
+                halt_it->second = false;
+                halt_reprobe_counter_ = 0;
+                ++symbol_halt_clears_total_;
+                ctx->log_info("conf SYMBOL HALT CLEARED (reprobe Open probe accepted)");
+            }
+        }
         Inflight o;
         o.id = id; o.scenario = scenario; o.is_buy = is_buy; o.qty_fp = qty_fp;
         o.venue_qty_fp = qty_fp;
@@ -543,7 +703,7 @@ private:
         const int64_t tickfp = price_tick_fp(ctx, tk);
         const int64_t off = tickfp * far_offset_ticks_;
 
-        const bool is_buy = (rotor_++ & 1) == 0;
+        const bool is_buy = steer_rapid_valid_ ? steer_rapid_is_buy_ : ((rotor_++ & 1) == 0);
         if (!can_open_side(confirmed_pos_(ctx), is_buy)) return;
         const int64_t mid = ref_mid_px(tk);
         if (mid <= 0) return;
@@ -597,32 +757,41 @@ private:
     }
 
     void fire_market_ioc(IStrategyContext* ctx, const XtTick& tk) {
+        if (marketable_pending_()) return;
         const int64_t pos = confirmed_pos_(ctx);
         const bool is_buy = oscillation_side(pos);
         const XtOffset offset = infer_offset_from_pos(pos, is_buy);
         if (offset == XtOffset::Open && !can_open_side(pos, is_buy)) return;
+        if (!aggressive_gate_ready_(ctx, is_buy)) return;
         const int64_t px = is_buy ? aggressive_buy_px(tk) : aggressive_sell_px(tk);
         if (venue_is_ctp_ && px <= 0) return;
-        submit(ctx, SC_MARKET_IOC, is_buy, px, order_exec_to_fp(qty_),
+        const uint64_t id = submit(ctx, SC_MARKET_IOC, is_buy, px, order_exec_to_fp(qty_),
                XtTimeInForce::IOC, offset, "market_ioc", false,  true);
+        if (id != 0) pending_marketable_id_ = id;
     }
 
     void fire_fill_storm(IStrategyContext* ctx, const XtTick& tk, int64_t& proj_fp) {
+        if (marketable_pending_()) return;
 
         const int64_t eff_pos = confirmed_pos_(ctx) + proj_fp;
         const bool is_buy = oscillation_side(eff_pos);
         const XtOffset offset = infer_offset_from_pos(eff_pos, is_buy);
         if (offset == XtOffset::Open && !can_open_side(eff_pos, is_buy)) return;
+        if (!aggressive_gate_ready_(ctx, is_buy)) return;
         const int64_t px = is_buy ? aggressive_buy_px(tk) : aggressive_sell_px(tk);
         if (venue_is_ctp_ && px <= 0) return;
         const int64_t qfp = order_exec_to_fp(qty_);
         const uint64_t id = submit(ctx, SC_MARKET_IOC, is_buy, px, qfp,
                                    XtTimeInForce::IOC, offset, "fill_storm",
                                     false,  true);
-        if (id != 0) proj_fp += is_buy ? qfp : -qfp;
+        if (id != 0) {
+            proj_fp += is_buy ? qfp : -qfp;
+            pending_marketable_id_ = id;
+        }
     }
 
     void fire_flip(IStrategyContext* ctx, const XtTick& tk) {
+        if (marketable_pending_()) return;
 
         const int64_t pos = confirmed_pos_(ctx);
         bool is_buy;
@@ -631,10 +800,12 @@ private:
         else              is_buy = (rotor_++ & 1) == 0;
         const XtOffset offset = infer_offset_from_pos(pos, is_buy);
         if (offset == XtOffset::Open && !can_open_side(pos, is_buy)) return;
+        if (!aggressive_gate_ready_(ctx, is_buy)) return;
         const int64_t px = is_buy ? aggressive_buy_px(tk) : aggressive_sell_px(tk);
         if (venue_is_ctp_ && px <= 0) return;
-        submit(ctx, SC_FLIP, is_buy, px, order_exec_to_fp(qty_),
+        const uint64_t id = submit(ctx, SC_FLIP, is_buy, px, order_exec_to_fp(qty_),
                XtTimeInForce::IOC, offset, "flip", false,  true);
+        if (id != 0) pending_marketable_id_ = id;
     }
 
     void fire_tif_matrix(IStrategyContext* ctx, const XtTick& tk) {
@@ -643,9 +814,15 @@ private:
         const bool is_buy = (rotor_++ & 1) == 0;
         if (!can_open_side(confirmed_pos_(ctx), is_buy)) return;
 
+        const bool aggressive = (tif != XtTimeInForce::GTC);
+
+        if (aggressive) {
+            if (marketable_pending_()) return;
+            if (!aggressive_gate_ready_(ctx, is_buy)) return;
+        }
         int64_t px;
         bool fast_terminal;
-        if (tif == XtTimeInForce::GTC) {
+        if (!aggressive) {
             const int64_t mid = ref_mid_px(tk);
             if (mid <= 0) return;
             px = is_buy ? (mid - price_tick_fp(ctx, tk) * far_offset_ticks_)
@@ -656,8 +833,9 @@ private:
             fast_terminal = true;
         }
         if (venue_is_ctp_ && px <= 0) return;
-        submit(ctx, SC_TIF_MATRIX, is_buy, px, order_exec_to_fp(qty_),
+        const uint64_t id = submit(ctx, SC_TIF_MATRIX, is_buy, px, order_exec_to_fp(qty_),
                tif, XtOffset::Open, "tif_matrix", false, fast_terminal);
+        if (aggressive && id != 0) pending_marketable_id_ = id;
     }
 
     void fire_risk_probe(IStrategyContext* ctx, const XtTick& tk) {
@@ -1112,7 +1290,7 @@ private:
 
         sweep_orphan_orders_(ctx);
 
-        if (pos != 0) {
+        if (pos != 0 && aggressive_gate_ready_(ctx, close_is_buy)) {
             const int64_t px = close_is_buy ? aggressive_buy_px(tk) : aggressive_sell_px(tk);
             if (!venue_is_ctp_ || px > 0) {
                 const int64_t total_abs = pos < 0 ? -pos : pos;
@@ -1135,6 +1313,27 @@ private:
         ctx->log_info(buf);
     }
 
+    bool try_cancel_orphan_(IStrategyContext* ctx, uint64_t oid) {
+
+        if (orphan_cancel_count_[oid] >= kOrphanCancelGiveUp) return false;
+        auto it = orphan_cancel_tick_.find(oid);
+        if (it != orphan_cancel_tick_.end() &&
+            (tick_seq_ - it->second) <= kCancelRetryCooldownTicks) return false;
+        ctx->cancel(oid);
+        orphan_cancel_tick_[oid] = tick_seq_;
+        ++cancels_req_total_;
+        ++orphan_cancel_total_;
+        if (++orphan_cancel_count_[oid] == kOrphanCancelGiveUp) {
+            ++orphan_giveup_total_;
+            char gbuf[128];
+            std::snprintf(gbuf, sizeof(gbuf),
+                "conf ORPHAN-GIVEUP id=%llu after %d cancels (no terminal; engine reaper/B3/B4 backstop)",
+                (unsigned long long)oid, kOrphanCancelGiveUp);
+            ctx->log_warn(gbuf);
+        }
+        return true;
+    }
+
     void sweep_orphan_orders_(IStrategyContext* ctx) {
         XtOrderExecUpdate ob[kOrphanSweepBuf];
         const size_t n = ctx->get_open_orders(symbol_.c_str(), ob, kOrphanSweepBuf);
@@ -1142,24 +1341,7 @@ private:
         for (size_t i = 0; i < n && sweep_budget > 0; ++i) {
             const uint64_t oid = ob[i].id;
             if (oid == 0 || inflight_.count(oid) != 0) continue;
-
-            if (orphan_cancel_count_[oid] >= kOrphanCancelGiveUp) continue;
-            auto it = orphan_cancel_tick_.find(oid);
-            if (it != orphan_cancel_tick_.end() &&
-                (tick_seq_ - it->second) <= kCancelRetryCooldownTicks) continue;
-            ctx->cancel(oid);
-            orphan_cancel_tick_[oid] = tick_seq_;
-            ++cancels_req_total_;
-            ++orphan_cancel_total_;
-            --sweep_budget;
-            if (++orphan_cancel_count_[oid] == kOrphanCancelGiveUp) {
-                ++orphan_giveup_total_;
-                char gbuf[128];
-                std::snprintf(gbuf, sizeof(gbuf),
-                    "conf ORPHAN-GIVEUP id=%llu after %d cancels (no terminal; engine reaper/B3/B4 backstop)",
-                    (unsigned long long)oid, kOrphanCancelGiveUp);
-                ctx->log_warn(gbuf);
-            }
+            if (try_cancel_orphan_(ctx, oid)) --sweep_budget;
         }
         if (orphan_cancel_tick_.size() > 4096) {
             orphan_cancel_tick_.clear();
@@ -1200,6 +1382,19 @@ private:
         ctx->report_metric("conf_orphan_cancels",   (double)orphan_cancel_total_);
         ctx->report_metric("conf_orphan_giveup",    (double)orphan_giveup_total_);
         ctx->report_metric("conf_budget_skips",     (double)budget_skip_total_);
+
+        ctx->report_metric("conf_orders_day",       (double)orders_day_);
+        ctx->report_metric("conf_capped",           capped_ ? 1.0 : 0.0);
+        ctx->report_metric("conf_cap_hit_days",     (double)cap_hit_days_total_);
+
+        ctx->report_metric("conf_symbol_halted",     is_open_halted_(symbol_) ? 1.0 : 0.0);
+        ctx->report_metric("conf_symbol_halt_events",(double)symbol_halt_events_total_);
+
+        ctx->report_metric("conf_aggr_gate_skips",   (double)aggr_gate_skips_);
+        ctx->report_metric("conf_selftrade_detected",(double)selftrade_detected_total_);
+        ctx->report_metric("conf_symbol_halt_clears",(double)symbol_halt_clears_total_);
+        ctx->report_metric("conf_skip_warmup",      (double)skip_warmup_total_);
+        ctx->report_metric("conf_skip_gate",        (double)skip_gate_total_);
         ctx->report_metric("conf_audit_cycles",     (double)audit_cycles_);
         ctx->report_metric("conf_probe_qty_hits",   (double)probe_qty_hits_);
         ctx->report_metric("conf_probe_pos_hits",   (double)probe_pos_hits_);
@@ -1225,7 +1420,7 @@ private:
 
     void heartbeat_counts_line_(IStrategyContext* ctx) {
 
-        char buf[768];
+        char buf[1280];
         std::snprintf(buf, sizeof(buf),
             "conf HB tick=%lld ord=%llu fill=%llu cxl=%llu term=%llu "
             "rej[exp=%llu unexp=%llu gated=%llu closeL=%llu] viol=%llu desync=%llu maxdrift_fp=%lld "
@@ -1233,7 +1428,8 @@ private:
             "audit[c=%llu st=%d] probe[q=%llu p=%llu n=%llu miss=%llu] "
             "uf=%llu fac=%llu oc=%llu tc=%llu sess[b=%llu e=%llu] roll=%llu acct=%llu params=%llu ch[r=%llu l=%llu] "
             "md[crossed=%llu nonmono=%llu onesided=%llu] rdamend=%llu rdrift=%llu "
-            "lock_fp=%lld",
+            "lock_fp=%lld "
+            "cap[day=%u dord=%llu capped=%d] halt[on=%d ev=%llu] skip[warm=%llu gate=%llu]",
             (long long)tick_seq_, (unsigned long long)orders_total_, (unsigned long long)fills_total_,
             (unsigned long long)cancels_req_total_, (unsigned long long)terminal_total_,
             (unsigned long long)rejects_expected_, (unsigned long long)rejects_unexpected_,
@@ -1255,7 +1451,10 @@ private:
             (unsigned long long)md_one_sided_total_,
             (unsigned long long)reduce_only_amend_down_total_,
             (unsigned long long)recovery_drift_realign_total_,
-            (long long)(self_long_fp_ < self_short_fp_ ? self_long_fp_ : self_short_fp_));
+            (long long)(self_long_fp_ < self_short_fp_ ? self_long_fp_ : self_short_fp_),
+            cap_day_, (unsigned long long)orders_day_, (int)capped_,
+            is_open_halted_(symbol_) ? 1 : 0, (unsigned long long)symbol_halt_events_total_,
+            (unsigned long long)skip_warmup_total_, (unsigned long long)skip_gate_total_);
         ctx->log_info(buf);
     }
 
@@ -1483,6 +1682,30 @@ private:
     uint64_t orders_total_ = 0, fills_total_ = 0, cancels_req_total_ = 0, terminal_total_ = 0;
     uint64_t rejects_expected_ = 0, rejects_unexpected_ = 0, rejects_close_local_ = 0, rejects_gated_ = 0;
     uint64_t violations_total_ = 0, orphan_cancel_total_ = 0, budget_skip_total_ = 0;
+
+    uint64_t orders_day_ = 0;
+    uint32_t cap_day_ = 0;
+    bool     capped_ = false;
+    uint64_t cap_hit_days_total_ = 0;
+
+    std::unordered_map<std::string, int>  symbol_reject_streak_;
+    std::unordered_map<std::string, bool> symbol_open_halted_;
+    uint64_t symbol_halt_events_total_ = 0;
+
+    uint64_t pending_marketable_id_ = 0;
+
+    uint64_t aggr_gate_skips_ = 0;
+
+    bool steer_rapid_valid_  = false;
+    bool steer_rapid_is_buy_ = false;
+
+    uint64_t selftrade_detected_total_ = 0;
+
+    int64_t  halt_reprobe_decisions_ = 600;
+    int64_t  halt_reprobe_counter_ = 0;
+    bool     halt_probe_active_ = false;
+    uint64_t symbol_halt_clears_total_ = 0;
+    uint64_t skip_warmup_total_ = 0, skip_gate_total_ = 0;
     uint64_t orphan_giveup_total_ = 0;
     uint64_t hard_violations_total_ = 0;
 
@@ -1513,6 +1736,7 @@ private:
     static constexpr int64_t kCancelRetryCooldownTicks = 500;
     static constexpr int64_t kTicksOrderRecoveryWindowTicks = 2000;
     static constexpr int kOrphanCancelGiveUp = 12;
+    static constexpr int kSymbolHaltStreakThreshold = 2;
     static constexpr int64_t kStuckViolGraceTickMult   = 10;
     static constexpr int     kOrphanSweepPerFlatten = 8;
     static constexpr size_t  kOrphanSweepBuf = 64;

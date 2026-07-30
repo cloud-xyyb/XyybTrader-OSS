@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@ class XtLiveOrderGateway;
 struct XtRunnerSignals;
 
 class IMdGateway;
+namespace xt_ipc { class XtShmMdGateway; }
 class IAccountTruthSource;
 class XtLiveLatencyTracker;
 class XtLiveParamDomain;
@@ -59,6 +61,12 @@ namespace xt_strategy_engine {
 class XtDeclaredSymbolRegistry;
 }
 
+namespace xt_live::control {
+class PanelForceExitLatch;
+class ForceFlatSubmitFence;
+namespace detail { struct ControlSnapshot; }
+}
+
 #include "xt_live/hft/control/PerSidLiquidator.h"
 
 /// @brief 控制环依赖注入上下文。
@@ -85,11 +93,15 @@ struct XtHftRunnerControlContext {
     XtLockFreeQueue<XtTradeRecord>*     trade_drain_q        = nullptr;
     XtLockFreeQueue<XtOrderExecUpdate>* order_update_drain_q = nullptr;
 
+    std::function<void()> frame_tail_hook;
+
     xt_risk::XtRiskMonitor* risk_monitor = nullptr;
 
     xt_risk::XtRiskMonitorState* risk_monitor_state = nullptr;
 
     IMdGateway* md_gateway = nullptr;
+
+    xt_ipc::XtShmMdGateway* shm_md_gateway = nullptr;
 
     const xt_runtime::XtRuntimeMarketCache* market_cache = nullptr;
 
@@ -103,6 +115,10 @@ struct XtHftRunnerControlContext {
 
     std::function<void(bool active, const std::string& actor,
                        const std::string& reason, int64_t ts_unix_ns)> record_kill_switch_trip;
+
+    xt_live::control::PanelForceExitLatch* force_exit_latch = nullptr;
+
+    xt_live::control::ForceFlatSubmitFence* force_flat_fence = nullptr;
 };
 
 XtHftRunnerControlContext make_runner_control_context(ITradeGateway* td_gateway,
@@ -144,8 +160,11 @@ public:
     HftRunnerControl(const XtRunnerControlConfig& cfg,
                   XtHftRunnerControlContext& ctx,
                   const Deps& deps);
+    ~HftRunnerControl();
 
     void run(std::atomic<bool>& shutdown);
+
+    void finalize_report();
 
     void configure_auto_liquidator(xt_live::control::PerSidLiquidatorCfg cfg) {
         liquidator_.configure(std::move(cfg));
@@ -156,5 +175,9 @@ private:
     XtHftRunnerControlContext& ctx_;
     xt_report::XtLiveReporter& live_reporter_;
     xt_live::control::PerSidLiquidator liquidator_;
+
+    bool finalize_ready_ = false;
+    std::unique_ptr<xt_live::control::detail::ControlSnapshot> last_snapshot_;
+    int64_t last_snapshot_ms_ = 0;
 
 };

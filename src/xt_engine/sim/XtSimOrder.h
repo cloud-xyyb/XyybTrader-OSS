@@ -27,14 +27,14 @@ struct XtSimOrder {
     XtTimeInForce tif = XtTimeInForce::GTC;
 
     uint64_t create_tick = 0;
-    uint32_t create_time_ms = 0;
+    int64_t  create_event_ns = 0;
     uint32_t order_date = 0;
     uint32_t order_time = 0;
     uint64_t ack_due_tick = 0;
-    uint32_t ack_due_time_ms = 0;
-    uint32_t fill_eligible_time_ms = 0;
+    int64_t  ack_due_event_ns = 0;
+    int64_t  fill_eligible_event_ns = 0;
 
-    uint32_t cancel_due_time_ms = 0;
+    int64_t  cancel_due_event_ns = 0;
 
     int64_t response_latency_ns = -1;
 

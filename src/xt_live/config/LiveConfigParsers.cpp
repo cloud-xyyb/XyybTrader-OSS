@@ -135,6 +135,8 @@ CTPTdCfg parse_ctp_td_cfg(const YAML::Node& node) {
     if (node["recovery_query_max_timeouts"]) cfg.recovery_query_max_timeouts = node["recovery_query_max_timeouts"].as<int>();
     if (node["recovery_rearm_backoff_ms"]) cfg.recovery_rearm_backoff_ms = node["recovery_rearm_backoff_ms"].as<int>();
     if (node["recovery_rearm_alert_rounds"]) cfg.recovery_rearm_alert_rounds = node["recovery_rearm_alert_rounds"].as<int>();
+    if (node["query_generation_fence"]) cfg.query_generation_fence = node["query_generation_fence"].as<bool>();
+    if (node["exec_ledger_query_fill_delivery"]) cfg.exec_ledger_query_fill_delivery = node["exec_ledger_query_fill_delivery"].as<bool>();
     return cfg;
 }
 
@@ -239,6 +241,7 @@ XTPTdCfg parse_xtp_td_cfg(const YAML::Node& node) {
         if (x["init_query_timeout_ms"]) cfg.init_query_timeout_ms = x["init_query_timeout_ms"].as<int>();
         if (x["recovery_query_timeout_ms"]) cfg.recovery_query_timeout_ms = x["recovery_query_timeout_ms"].as<int>();
         if (x["recovery_query_max_timeouts"]) cfg.recovery_query_max_timeouts = x["recovery_query_max_timeouts"].as<int>();
+        if (x["position_refresh_ms"]) cfg.position_refresh_ms = x["position_refresh_ms"].as<int>();
     }
     return cfg;
 }
@@ -452,6 +455,11 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
     cfg.closeout_retry_ms = std::max(0, YamlNodeUtil::as_or<int>(closeout_node, "retry_ms", 1000));
     cfg.closeout_escalate_after_ms = std::max(0, YamlNodeUtil::as_or<int>(closeout_node, "escalate_after_ms", 3000));
     cfg.closeout_aggressive_buffer_bps = std::max(1, YamlNodeUtil::as_or<int>(closeout_node, "aggressive_buffer_bps", 10));
+    cfg.closeout_force_exit_latch_enabled =
+        YamlNodeUtil::as_or<bool>(closeout_node, "force_exit_latch_enabled", true);
+
+    cfg.closeout_force_exit_latch_ttl_ms =
+        YamlNodeUtil::as_or<int>(closeout_node, "force_exit_latch_ttl_ms", 30'000);
 
     const YAML::Node recovery_node =
         (runtime_node && runtime_node["recovery"]) ? runtime_node["recovery"] : YAML::Node();
@@ -530,6 +538,7 @@ XtRunnerControlConfig parse_runner_control_config(const YAML::Node& md_node,
     cfg.strategy_metrics_flush_sec = std::max(1, as_or<int>(debug_node, "strategy_metrics_flush_sec", 5));
     cfg.unified_report_dir    = as_or<std::string>(debug_node,    "report_contract_dir",   std::string("var/live_metrics/report_contract"));
     cfg.unified_run_id        = as_or<std::string>(debug_node,    "report_run_id",         std::string(""));
+
     cfg.unified_strategy_id   = as_or<std::string>(strategy_node, "id",                    std::string(""));
     cfg.unified_symbol        = as_or<std::string>(instrument_node,"symbol",               std::string(""));
     cfg.unified_config_hash   = as_or<std::string>(debug_node,    "report_config_hash",    std::string(""));

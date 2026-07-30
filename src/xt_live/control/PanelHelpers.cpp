@@ -16,6 +16,7 @@
 
 #include "api/ITradeGateway.h"
 #include "xt_identity/OrderAttributionStore.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "xt_account/state/AccountStateStore.h"
 #include "xt_identity/StrategySidRegistry.h"
@@ -27,8 +28,11 @@
 #include "api/ExecFlags.h"
 #include "xt_live/gateway/binance/refdata/BinanceExchangeInfo.h"
 #include "xt_live/control/CloseoutPricing.h"
+#include "xt_live/control/ForceFlatSubmitFence.h"
+#include "xt_util/time/XtSteadyClock.h"
 #include "xt_config/catalog/XtCommodityCatalog.h"
 #include "xt_risk/engine/XtRiskMonitor.h"
+#include "xt_risk/engine/XtRiskMonitorState.h"
 #include "XtDeclaredSymbolRegistry.h"
 #include "xt_strategy_engine/XtStrategyInitConfig.h"
 #include "XtLogger.h"
@@ -252,6 +256,12 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     }
     const int64_t close_price_fp = legal_close_price_fp(
         symbol, aggressive_close_price_fp(mark_fp, buy_to_close), buy_to_close, price_tick_fp);
+
+    uint64_t fence_gen = 0;
+    if (ctx.force_flat_fence) {
+        fence_gen = ctx.force_flat_fence->try_acquire(symbol, XtSteadyClock::steady_now_ms());
+        if (fence_gen == 0) return ForceExitOutcome::AlreadyForceFlat;
+    }
     if (strategy_scoped) {
         xt_identity::OrderAttributionStore::set_thread_submit_strategy_sid(scope_sid);
     }
@@ -266,13 +276,19 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     if (strategy_scoped) {
         xt_identity::OrderAttributionStore::set_thread_submit_strategy_sid(StrategySid::legacy());
     }
-    if (oid == 0) return ForceExitOutcome::SubmitFailed;
+    if (oid == 0) {
+
+        if (ctx.force_flat_fence) ctx.force_flat_fence->release(symbol, fence_gen);
+        return ForceExitOutcome::SubmitFailed;
+    }
     if (strategy_scoped) {
         ctx.order_book->record_force_flat_order(oid, symbol.c_str(), buy_to_close,
                                                 qty_fp, XtOffset::Close, scope_sid);
     } else {
-        ctx.order_book->record_global_force_flat_order(oid, symbol.c_str(), buy_to_close,
-                                                       qty_fp, XtOffset::Close);
+
+        ctx.order_book->record_force_flat_order(oid, symbol.c_str(), buy_to_close,
+                                                qty_fp, XtOffset::Close,
+                                                StrategySid::legacy());
     }
     if (force_order_id_out) *force_order_id_out = oid;
     return ForceExitOutcome::ForceClosed;
@@ -282,13 +298,20 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
                                               const ManualOrderRequest& req,
                                               std::string& reject_reason_out) {
     reject_reason_out.clear();
+
+    auto reject_log = [&](ManualOrderOutcome outcome, const char* reason) -> ManualOrderOutcome {
+        XtLogger::warn_m("control",
+            "panel.manual_order reject: request_id={} venue={} symbol={} reason={}",
+            req.request_id, req.venue, req.symbol, reason);
+        return outcome;
+    };
     if (!ctx.td_gateway || !ctx.account_store || !ctx.live_order_gateway
         || !ctx.runtime_shared_state) {
-        return ManualOrderOutcome::NoTd;
+        return reject_log(ManualOrderOutcome::NoTd, "context_incomplete");
     }
     ITradeGateway* td = load_td_for_panel_request(ctx.td_gateway,
         ctx.runtime_shared_state->trading_ready);
-    if (!td) return ManualOrderOutcome::NoTd;
+    if (!td) return reject_log(ManualOrderOutcome::NoTd, "td_not_ready");
 
     std::string side_upper;
     side_upper.reserve(req.side.size());
@@ -296,44 +319,52 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     bool is_buy;
     if      (side_upper == "BUY")  is_buy = true;
     else if (side_upper == "SELL") is_buy = false;
-    else return ManualOrderOutcome::InvalidSide;
+    else return reject_log(ManualOrderOutcome::InvalidSide, "invalid_side");
 
     std::string type_upper;
     type_upper.reserve(req.type.size());
     for (char c : req.type) type_upper.push_back(static_cast<char>(::toupper(c)));
     const bool is_market = (type_upper == "MARKET");
-    if (!is_market && type_upper != "LIMIT") return ManualOrderOutcome::InvalidType;
+    if (!is_market && type_upper != "LIMIT")
+        return reject_log(ManualOrderOutcome::InvalidType, "invalid_type");
 
     char* end = nullptr;
     const double qty_d = std::strtod(req.qty.c_str(), &end);
     if (end == req.qty.c_str() || qty_d <= 0.0 || !std::isfinite(qty_d)) {
-        return ManualOrderOutcome::InvalidQty;
+        return reject_log(ManualOrderOutcome::InvalidQty, "invalid_qty");
     }
     const int64_t qty_fp = xt_fp::to_fp(qty_d);
-    if (qty_fp <= 0) return ManualOrderOutcome::InvalidQty;
+    if (qty_fp <= 0) return reject_log(ManualOrderOutcome::InvalidQty, "invalid_qty_fp");
 
     int64_t price_fp = 0;
     XtTimeInForce tif;
     if (is_market) {
         price_fp = ctx.account_store->snapshot_position(req.symbol).mark_price;
-        if (price_fp <= 0) return ManualOrderOutcome::InvalidPrice;
+        if (price_fp <= 0) return reject_log(ManualOrderOutcome::InvalidPrice, "invalid_price_no_mark");
         tif = XtTimeInForce::IOC;
     } else {
         end = nullptr;
         const double price_d = std::strtod(req.price.c_str(), &end);
         if (end == req.price.c_str() || price_d <= 0.0 || !std::isfinite(price_d)) {
-            return ManualOrderOutcome::InvalidPrice;
+            return reject_log(ManualOrderOutcome::InvalidPrice, "invalid_price_parse");
         }
         price_fp = xt_fp::to_fp(price_d);
-        if (price_fp <= 0) return ManualOrderOutcome::InvalidPrice;
+        if (price_fp <= 0) return reject_log(ManualOrderOutcome::InvalidPrice, "invalid_price_fp");
         tif = XtTimeInForce::GTC;
     }
 
-    if (!req.strategy_id.empty()) {
+    std::string effective_strategy_id = req.strategy_id;
+    if (ctx.attribution_router_mode && effective_strategy_id.empty()) {
+        effective_strategy_id = xt_identity::StrategySidRegistry::kManualStrategyId;
+    }
+
+    if (!effective_strategy_id.empty()) {
+
         const auto* sid_registry = xt_identity::StrategySidRegistry::global();
         if (!sid_registry ||
-            sid_registry->lookup(req.strategy_id) == xt_identity::StrategySidRegistry::kNoSidId) {
-            return ManualOrderOutcome::InvalidStrategy;
+            sid_registry->lookup(effective_strategy_id)
+                == xt_identity::StrategySidRegistry::kNoSidId) {
+            return reject_log(ManualOrderOutcome::InvalidStrategy, "invalid_strategy");
         }
     }
 
@@ -346,13 +377,23 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     order_req.order.tif = tif;
     order_req.order.set_tag(user_tag.c_str());
     order_req.order.close_offset = XtOffset::Open;
-    order_req.strategy_id = req.strategy_id;
+    order_req.strategy_id = effective_strategy_id;
     order_req.source = xt_core::XtOrderSource::Manual;
     const xt_runtime::SubmitResult r = ctx.live_order_gateway->submit(order_req, exec_none());
+    const char* sid_disp = effective_strategy_id.empty() ? "-" : effective_strategy_id.c_str();
     if (!r.accepted()) {
         reject_reason_out = std::to_string(static_cast<int>(r.reject_reason));
+
+        XtLogger::warn_m("control",
+            "panel.manual_order reject: request_id={} venue={} symbol={} sid={} reason=risk_rejected reason_code={}",
+            req.request_id, req.venue, req.symbol, sid_disp, reject_reason_out);
         return ManualOrderOutcome::RiskRejected;
     }
+
+    XtLogger::info_m("control",
+        "panel.manual_order submitted: request_id={} venue={} symbol={} sid={} order_id={}",
+        req.request_id, req.venue, req.symbol, sid_disp,
+        static_cast<unsigned long long>(r.order_id));
     return ManualOrderOutcome::Submitted;
 }
 
@@ -369,6 +410,35 @@ void wire_per_strategy_risk_state(
     if (order_gateway && risk_monitor_state) {
         order_gateway->set_per_strategy_risk_monitor_state(risk_monitor_state);
     }
+}
+
+namespace {
+std::atomic<uint64_t> g_strategy_init_failure_latched_total_{0};
+}
+
+std::function<void(uint32_t, const std::string&)>
+make_strategy_init_failure_handler(
+    xt_risk::XtRiskMonitorState* risk_monitor_state) noexcept {
+    return [risk_monitor_state](uint32_t sid_id, const std::string& name) {
+        const uint64_t total =
+            g_strategy_init_failure_latched_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        bool latched = false;
+        if (risk_monitor_state && sid_id != 0) {
+            risk_monitor_state->per_strategy.set_strategy_killed(sid_id, true);
+            latched = true;
+        }
+
+        XtLogger::critical(
+            "[INIT-FAILURE] strategy '{}' (sid_id={}) on_init 失败 → fail-closed disabled + "
+            "per-sid kill latch {}（拒新开仓、平仓通行）；若该 sid 有恢复持仓则无人管理，"
+            "需 operator 处置。latched_total={}",
+            name.c_str(), sid_id, latched ? "已置位" : "跳过(sid=0 或无 risk state)", total);
+    };
+}
+
+uint64_t strategy_init_failure_latched_total() noexcept {
+    return g_strategy_init_failure_latched_total_.load(std::memory_order_relaxed);
 }
 
 bool wire_risk_state_and_validate(

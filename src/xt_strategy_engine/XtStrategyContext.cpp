@@ -183,6 +183,7 @@ const char* trace_reject_code(xt_runtime::XtRejectCode rc) noexcept {
     case XtRejectCode::PriceExceedsLimit:            return "PriceExceedsLimit";
     case XtRejectCode::MarginCallLiquidation:        return "MarginCallLiquidation";
     case XtRejectCode::AutoOffsetUnresolved:         return "AutoOffsetUnresolved";
+    case XtRejectCode::BacktestEofClosing:           return "BacktestEofClosing";
     }
     return "Unknown";
 }

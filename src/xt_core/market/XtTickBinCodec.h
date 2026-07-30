@@ -10,11 +10,13 @@
 #include "XtRawTick.h"
 
 /// @file XtTickBinCodec.h
-/// @brief Tick binary cache 的 DualV2 编解码入口。
+/// @brief 回测 tick 加速缓存的二进制编解码入口。
 ///
-/// 本文件只定义回测加速缓存格式：header 后按记录写入 `XtRawTick` 与 `XtTick`。
-/// 调用方负责以 binary 模式打开 stream、决定文件路径和 cache 生命周期。
-/// detect/read 系列用 `false` 表示打不开、短读、header 不匹配或不支持的格式；失败不抛异常。
+/// 回测要反复读同一批 tick，每次都解析 CSV 太慢；解析一次后把 tick 落成二进制缓存，下次
+/// 直接顺序读回。本文件定义这个缓存格式（DualV2：header 之后每条记录同时存 double 版
+/// `XtRawTick` 与 fixed-point 版 `XtTick`）并给出读写函数。调用方负责以 binary 模式打开
+/// stream、决定文件路径与缓存生命周期。detect/read 系列用 `false` 表示打不开、短读、
+/// header 不匹配或格式不支持；失败不抛异常。
 
 enum class XtTickBinFormat : uint8_t {
     DualV2 = 2,
@@ -23,7 +25,7 @@ enum class XtTickBinFormat : uint8_t {
 
 namespace xt_tick_bin {
 
-inline constexpr uint16_t kTickBinCodecVersion = 3;
+inline constexpr uint16_t kTickBinCodecVersion = 4;
 
 bool detect_stream_format(std::istream& in, XtTickBinFormat& fmt);
 

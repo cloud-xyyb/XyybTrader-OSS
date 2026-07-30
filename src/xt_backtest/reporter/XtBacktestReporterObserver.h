@@ -17,7 +17,9 @@ public:
 
     explicit XtBacktestReporterObserver(XtBacktestReporter* r) : reporter_(r) {}
 
-    void on_order_update(const XtOrderExecUpdate& u) override {
+    void on_order_update(const XtOrderExecUpdate& u,
+                         XtLatencyEligibility   = XtLatencyEligibility::kEligible) override {
+
         if (reporter_) reporter_->on_order_update(u);
     }
 
@@ -49,7 +51,9 @@ public:
 
     explicit XtBacktestReporterFillObserver(XtBacktestReporter* r) : reporter_(r) {}
 
-    void on_trade(const XtTradeRecord& tr) override;
+    void on_trade(const XtTradeRecord& tr,
+                  XtLatencyEligibility elig = XtLatencyEligibility::kEligible,
+                  uint64_t logical_order_id = 0) override;
 
 private:
     XtBacktestReporter* reporter_;

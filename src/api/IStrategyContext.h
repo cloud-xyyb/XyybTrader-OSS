@@ -130,3 +130,24 @@ public:
 
     virtual bool cancel_stop(uint64_t  ) { return false; }
 };
+
+[[nodiscard]] inline int64_t xt_open_orders_net_leaves_fp(IStrategyContext* ctx,
+                                                          const char* code) {
+    if (!ctx) return 0;
+    XtOrderExecUpdate buf[64];
+    const size_t n = ctx->get_open_orders(code, buf, 64);
+    int64_t net_fp = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (buf[i].leaves_fp <= 0) continue;
+        net_fp += buf[i].is_buy ? buf[i].leaves_fp : -buf[i].leaves_fp;
+    }
+    return net_fp;
+}
+
+[[nodiscard]] inline int64_t xt_projected_position_fp(IStrategyContext* ctx,
+                                                      const char* code) {
+    if (!ctx) return 0;
+    const int64_t confirmed_fp =
+        ctx->get_position_fp(code) - ctx->projected_inflight_fp(code);
+    return confirmed_fp + xt_open_orders_net_leaves_fp(ctx, code);
+}

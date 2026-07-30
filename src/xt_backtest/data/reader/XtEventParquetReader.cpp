@@ -57,6 +57,26 @@ std::optional<int64_t> id_or_null(int64_t v) {
     return v < 0 ? std::optional<int64_t>{} : std::optional<int64_t>{v};
 }
 
+bool require_typed_col(const std::shared_ptr<arrow::Table>& table,
+                       const char* name, arrow::Type::type expected,
+                       const std::string& path) {
+    if (table->num_rows() == 0) return true;
+    const auto arr = xt_arrow::col_array(table, name);
+    if (!arr) {
+        std::fprintf(stderr,
+                     "[XtEventParquetReader] missing required column '%s' in %s\n",
+                     name, path.c_str());
+        return false;
+    }
+    if (arr->type_id() != expected) {
+        std::fprintf(stderr,
+                     "[XtEventParquetReader] column '%s' physical type drift (got %s) in %s\n",
+                     name, arr->type()->ToString().c_str(), path.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool symbol_allowed(const std::unordered_set<std::string>& symbols, const std::string& symbol) {
     return symbols.empty() || symbols.count(symbol) > 0;
 }
@@ -263,22 +283,54 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
                                            uint32_t trading_day,
                                            const std::string& trades_path,
                                            const std::string& book_path) {
-    Stream stream;
-    stream.exchange = exchange;
-    stream.symbol = symbol;
-    stream.trading_day = trading_day;
-    if (!read_parquet_table(trades_path, stream.trades_table) ||
-        !read_parquet_table(book_path, stream.book_table)) {
+
+    Stream base;
+    base.exchange = exchange;
+    base.symbol = symbol;
+    base.trading_day = trading_day;
+    if (!read_parquet_table(trades_path, base.trades_table) ||
+        !read_parquet_table(book_path, base.book_table)) {
         return false;
     }
 
-    const auto trade_exchange = col_array(stream.trades_table, "exchange");
-    const auto trade_symbol = col_array(stream.trades_table, "symbol");
-    const auto trade_ts = col_array(stream.trades_table, "exch_ts_ms");
-    const auto trade_price = col_array(stream.trades_table, "price");
-    const auto trade_qty = col_array(stream.trades_table, "quantity");
+    if (!require_typed_col(base.trades_table, "exch_ts_ms", arrow::Type::INT64, trades_path) ||
+        !require_typed_col(base.trades_table, "price", arrow::Type::DOUBLE, trades_path) ||
+        !require_typed_col(base.trades_table, "quantity", arrow::Type::DOUBLE, trades_path) ||
+        !require_typed_col(base.book_table, "exch_ts_ms", arrow::Type::INT64, book_path) ||
+        !require_typed_col(base.book_table, "event_type", arrow::Type::STRING, book_path) ||
+        !require_typed_col(base.book_table, "side", arrow::Type::STRING, book_path) ||
+        !require_typed_col(base.book_table, "price", arrow::Type::DOUBLE, book_path) ||
+        !require_typed_col(base.book_table, "quantity", arrow::Type::DOUBLE, book_path)) {
+        return false;
+    }
 
-    for (int64_t i = 0; i < stream.trades_table->num_rows(); ++i) {
+    const auto trade_exchange = col_array(base.trades_table, "exchange");
+    const auto trade_symbol = col_array(base.trades_table, "symbol");
+    const auto trade_ts = col_array(base.trades_table, "exch_ts_ms");
+    const auto trade_price = col_array(base.trades_table, "price");
+    const auto trade_qty = col_array(base.trades_table, "quantity");
+
+    base.book_ts = col_array(base.book_table, "exch_ts_ms");
+    base.book_event_type = col_array(base.book_table, "event_type");
+    base.book_first = col_array(base.book_table, "first_update_id");
+    base.book_final = col_array(base.book_table, "final_update_id");
+    base.book_prev = col_array(base.book_table, "prev_final_update_id");
+    base.book_side = col_array(base.book_table, "side");
+    base.book_price = col_array(base.book_table, "price");
+    base.book_qty = col_array(base.book_table, "quantity");
+    base.book_symbol = col_array(base.book_table, "symbol");
+    base.book_rows = static_cast<std::size_t>(std::max<int64_t>(0, base.book_table->num_rows()));
+
+    std::vector<std::pair<std::string, std::vector<TradeRow>>> buckets;
+    auto rows_of = [&buckets](const std::string& key) -> std::vector<TradeRow>& {
+        for (auto& b : buckets) {
+            if (b.first == key) return b.second;
+        }
+        buckets.emplace_back(key, std::vector<TradeRow>{});
+        return buckets.back().second;
+    };
+
+    for (int64_t i = 0; i < base.trades_table->num_rows(); ++i) {
         TradeRow row;
         row.exchange = string_at(trade_exchange, i);
         row.symbol = string_at(trade_symbol, i);
@@ -287,43 +339,56 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
         row.exch_ts_ms = int64_at(trade_ts, i, 0);
         row.price = double_at(trade_price, i);
         row.quantity = double_at(trade_qty, i);
-        stream.trades.push_back(std::move(row));
+        const std::string key = symbol.empty() ? row.symbol : symbol;
+        rows_of(key).push_back(std::move(row));
     }
 
-    stream.book_ts = col_array(stream.book_table, "exch_ts_ms");
-    stream.book_event_type = col_array(stream.book_table, "event_type");
-    stream.book_first = col_array(stream.book_table, "first_update_id");
-    stream.book_final = col_array(stream.book_table, "final_update_id");
-    stream.book_prev = col_array(stream.book_table, "prev_final_update_id");
-    stream.book_side = col_array(stream.book_table, "side");
-    stream.book_price = col_array(stream.book_table, "price");
-    stream.book_qty = col_array(stream.book_table, "quantity");
-    stream.book_symbol = col_array(stream.book_table, "symbol");
-    stream.book_rows = static_cast<std::size_t>(std::max<int64_t>(0, stream.book_table->num_rows()));
+    if (buckets.size() > 1) {
 
-    std::stable_sort(stream.trades.begin(), stream.trades.end(), [](const TradeRow& a, const TradeRow& b) {
-        return a.exch_ts_ms < b.exch_ts_ms;
-    });
-
-    if (stream.exchange.empty()) {
-        for (const auto& t : stream.trades) {
-            if (!t.exchange.empty()) {
-                stream.exchange = t.exchange;
-                break;
+        for (const auto& b : buckets) {
+            if (b.first.empty()) {
+                std::fprintf(stderr,
+                             "[XtEventParquetReader] aggregated trades mix empty and named symbols in %s\n",
+                             trades_path.c_str());
+                return false;
             }
         }
-    }
-    if (stream.symbol.empty()) {
-        for (const auto& t : stream.trades) {
-            if (!t.symbol.empty()) {
-                stream.symbol = t.symbol;
-                break;
+
+        if (!base.book_symbol) {
+            std::fprintf(stderr,
+                         "[XtEventParquetReader] aggregated book missing 'symbol' column with multi-symbol trades in %s\n",
+                         book_path.c_str());
+            return false;
+        }
+        for (std::size_t r = 0; r < base.book_rows; ++r) {
+            if (string_at(base.book_symbol, static_cast<int64_t>(r)).empty()) {
+                std::fprintf(stderr,
+                             "[XtEventParquetReader] aggregated book row %zu has empty symbol with multi-symbol trades in %s\n",
+                             r, book_path.c_str());
+                return false;
             }
         }
     }
 
-    if (stream.trades.empty()) return true;
-    streams_.push_back(std::move(stream));
+    for (auto& bucket : buckets) {
+        Stream stream = base;
+        stream.symbol = bucket.first;
+        stream.trades = std::move(bucket.second);
+        std::stable_sort(stream.trades.begin(), stream.trades.end(),
+                         [](const TradeRow& a, const TradeRow& b) {
+                             return a.exch_ts_ms < b.exch_ts_ms;
+                         });
+        if (stream.exchange.empty()) {
+
+            for (const auto& t : stream.trades) {
+                if (!t.exchange.empty()) {
+                    stream.exchange = t.exchange;
+                    break;
+                }
+            }
+        }
+        streams_.push_back(std::move(stream));
+    }
     return true;
 }
 

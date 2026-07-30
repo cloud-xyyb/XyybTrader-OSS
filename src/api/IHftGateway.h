@@ -1,12 +1,14 @@
 #pragma once
 
 #include "api/IExecutionGateway.h"
+#include "api/XtOrderTerminalRecord.h"
 #include "xt_core/market/XtTick.h"
 #include "xt_core/order/XtTradeRecord.h"
 #include "xt_core/order/XtOrderTypes.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace xt_runtime {
@@ -19,9 +21,8 @@ namespace xt_runtime {
 class IHftGateway : virtual public IExecutionGateway {
 public:
 
-    virtual void advance_clock(uint32_t  , uint32_t  ) {}
-
-    virtual void apply_market_tick(const char*  , int64_t  ) {}
+    virtual void advance_clock(uint32_t  , uint32_t  ,
+                               uint32_t  ) {}
 
     virtual void process_tick(const XtTick&  ) {}
 
@@ -36,7 +37,10 @@ public:
 
     virtual void on_session_begin(uint32_t  ) {}
 
-    virtual void notify_order_terminal(const char*  , bool  ) {}
+    virtual void notify_order_terminal(uint64_t  ) {}
+
+    virtual void rearm_active_order(const std::string&  , uint64_t  ,
+                                    bool  , int64_t  ) {}
 
     virtual void record_order_terminal(XtOrderStatus  ) {}
 
@@ -45,6 +49,11 @@ public:
     [[nodiscard]] virtual size_t live_orders() const = 0;
 
     [[nodiscard]] virtual bool is_order_terminal(uint64_t  ) const { return false; }
+
+    [[nodiscard]] virtual bool lookup_terminal(uint64_t  ,
+                                               XtOrderTerminalRecord&  ) const {
+        return false;
+    }
 };
 
 }

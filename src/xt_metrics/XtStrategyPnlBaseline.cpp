@@ -198,6 +198,7 @@ bool XtStrategyPnlBaseline::load(std::string_view base_dir, int trading_day_id) 
         next[k] = std::move(r);
     }
     baseline_ = std::move(next);
+    new_reported_keys_.clear();
     last_load_status_ = LoadStatus::Loaded;
     ready_ = true;
     return true;
@@ -206,6 +207,7 @@ bool XtStrategyPnlBaseline::load(std::string_view base_dir, int trading_day_id) 
 void XtStrategyPnlBaseline::rotate_day(const std::vector<BaselineRow>& rows) {
     std::lock_guard<std::mutex> lock(mu_);
     baseline_.clear();
+    new_reported_keys_.clear();
     for (const auto& r : rows) {
         if (r.code.empty()) continue;
         BaselineRow row = r;
@@ -264,6 +266,12 @@ XtStrategyPnlBaseline::get(std::string_view sid, std::string_view code, bool* is
     }
     if (is_new) *is_new = false;
     return it->second;
+}
+
+bool XtStrategyPnlBaseline::mark_new_reported(std::string_view sid, std::string_view code) {
+    std::lock_guard<std::mutex> lock(mu_);
+    Key k{normalize_sid(sid), std::string(code)};
+    return new_reported_keys_.insert(std::move(k)).second;
 }
 
 int64_t XtStrategyPnlBaseline::realized_fp_for_sid(std::string_view sid) const {

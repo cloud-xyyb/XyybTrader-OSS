@@ -3,6 +3,7 @@
 
 #include "xt_risk/engine/AnnualLatchArm.h"
 #include "xt_risk/engine/XtRiskMonitorState.h"
+#include "live/StpReverseSyncRearm.h"
 #include "xt_identity/StrategySidRegistry.h"
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include "xt_risk/engine/RiskActionDispatch.h"
 #include "live/LiveRejectReason.h"
 #include "XtFixedPoint.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
 #include "xt_account/state/AccountStateStore.h"
@@ -546,18 +548,37 @@ void XtLiveOrderGateway::pre_warm_risk(const std::vector<std::string>& symbols) 
         stp_checker_.register_symbol(s);
         velocity_limiter_.register_symbol(s);
     }
+
+    XtLogger::info_m("RT",
+                     "risk pre-warm: STP registered {} symbol(s) (stp_enabled={})",
+                     stp_checker_.registered_count(), cfg_.stp_enabled ? 1 : 0);
 }
 
-void XtLiveOrderGateway::notify_order_terminal(const char* code, [[maybe_unused]] bool is_buy) {
+size_t XtLiveOrderGateway::stp_registered_count() const {
+    return stp_checker_.registered_count();
+}
+
+size_t XtLiveOrderGateway::stp_registered_gauge() const {
+    return cfg_.stp_enabled ? stp_checker_.registered_count() : 0;
+}
+
+void XtLiveOrderGateway::notify_order_terminal(uint64_t order_id) {
     if (!cfg_.stp_enabled) return;
 
-    std::vector<int64_t> bid_prices, ask_prices;
-    if (order_book_direct_) {
-        order_book_direct_->collect_active_order_prices(code, bid_prices, ask_prices);
-    }
-    stp_checker_.on_order_terminal(code,
-                                   bid_prices.data(), bid_prices.size(),
-                                   ask_prices.data(), ask_prices.size());
+    stp_checker_.on_order_terminal(order_id);
+}
+
+void XtLiveOrderGateway::stp_rearm_reverse_sync(const std::vector<AliveInflightOrder>& orders,
+                                                bool is_cold_start) {
+    if (!cfg_.stp_enabled) return;
+    stp_rearm_on_reverse_sync(stp_checker_, orders, is_cold_start);
+}
+
+void XtLiveOrderGateway::rearm_active_order(const std::string& code, uint64_t id,
+                                            bool is_buy, int64_t price_fp) {
+    if (!cfg_.stp_enabled) return;
+
+    stp_checker_.rearm_active_order(code, id, is_buy, price_fp);
 }
 
 void XtLiveOrderGateway::refresh_param_gate_cache() {
@@ -750,13 +771,17 @@ void XtLiveOrderGateway::emit_margin_reject(bool is_buy,
     xt_strategy_engine::IStrategyExecSink* target_sink =
         strategy_id.empty() ? exec_sink_ : nullptr;
     bool routed_by_sid = false;
-    if (!strategy_id.empty() && sid_registry_ != nullptr && !exec_sinks_.empty()) {
+    bool manual_reserved = false;
+    if (!strategy_id.empty() && sid_registry_ != nullptr) {
         const std::string sid_key(strategy_id);
         const uint32_t sid_id = sid_registry_->lookup(sid_key);
-
-        if (sid_id != xt_identity::StrategySidRegistry::kNoSidId
+        if (sid_id == xt_identity::StrategySidRegistry::kManualSidId) {
+            manual_reserved = true;
+        } else if (!exec_sinks_.empty()
+                && sid_id != xt_identity::StrategySidRegistry::kNoSidId
                 && sid_id <= exec_sinks_.size()
                 && exec_sinks_[sid_id - 1] != nullptr) {
+
             target_sink = exec_sinks_[sid_id - 1];
             routed_by_sid = true;
         }
@@ -769,7 +794,11 @@ void XtLiveOrderGateway::emit_margin_reject(bool is_buy,
             [&]() { target_sink->on_order(rej); });
     }
 
-    if (!strategy_id.empty() && !routed_by_sid) {
+    if (manual_reserved) {
+        XtLogger::info_m("RT",
+            "panel.manual_order reject: sid=_manual reason_code=insufficient_margin");
+    } else if (!strategy_id.empty() && !routed_by_sid) {
+
         dropped_margin_reject_total_.fetch_add(1, std::memory_order_relaxed);
         XtLogger::error_m("RT",
             "margin reject route failed for strategy_id='{}'; reject not delivered to default sink",
@@ -806,6 +835,10 @@ void emit_order_submit_tap(const char* code, uint64_t phys_id, bool is_buy, XtOf
     const std::string sid_str(strategy_id);
     char reason_buf[48];
     xt_core::tap::peek_next_order_reason(reason_buf, sizeof(reason_buf));
+
+    int64_t event_ts_ns = 0;
+    const bool event_clock_valid = xt_core::tap::project_event_ts_ns(
+        static_cast<int64_t>(ts_local_ns), event_ts_ns);
     rec->emit_order_submit({
         .ts_local_ns      = ts_local_ns,
         .logical_id       = phys_id,
@@ -823,6 +856,8 @@ void emit_order_submit_tap(const char* code, uint64_t phys_id, bool is_buy, XtOf
         .account_id       = nullptr,
         .user_tag         = user_tag_str_tap.c_str(),
         .decision_mono_ns = decision_us * 1000ULL,
+        .event_clock_valid = event_clock_valid,
+        .event_ts_local_ns = event_ts_ns,
     });
 }
 }
@@ -837,17 +872,28 @@ void XtLiveOrderGateway::register_submitted_order_(uint64_t phys_id,
                                                    int64_t required_margin_fp,
                                                    int64_t per_unit_margin_fp) {
 
-    if (order_book_direct_->should_skip_submit(phys_id)) return;
     const bool is_close = (close_offset != XtOffset::Open);
     xt_account::CloseableView closeable{};
     if (is_close) {
         closeable = xt_account::closeable_view(
             account_store_direct_->snapshot_position(code ? code : ""), is_buy);
     }
-    order_book_direct_->on_order_submitted(phys_id, code, is_buy, qty_fp, price_fp,
-                                           close_offset, closeable, owner_sid);
+
+    using Outcome = xt_runtime::order::XtOrderRuntimeBook::SubmitRegisterResult::Outcome;
+    const auto reg = order_book_direct_->on_order_submitted(
+        phys_id, code, is_buy, qty_fp, price_fp, close_offset, closeable, owner_sid);
+
+    if (reg.outcome == Outcome::kSkippedTerminal ||
+        reg.outcome == Outcome::kBlockedDuplicate) {
+        return;
+    }
     account_store_direct_->apply(
         XtAccountEvent::order_accepted(phys_id, required_margin_fp, per_unit_margin_fp));
+
+    if (reg.filled_fp > 0) {
+        account_store_direct_->apply(XtAccountEvent::order_update(
+            phys_id, reg.filled_fp,  false));
+    }
 }
 
 uint64_t XtLiveOrderGateway::submit_slices(const char* code,
@@ -1100,7 +1146,7 @@ XtLiveOrderGateway::SliceOutcome XtLiveOrderGateway::submit_one_slice_(
         } else {
 
             std::string code_copy(code ? code : "");
-            const bool posted = order_book_direct_->post_to_worker(
+            (void)order_book_direct_->post_to_worker(
                 [this, phys_id, code_copy = std::move(code_copy), is_buy,
                  qty_fp = sl.qty_fp, price_fp, close_offset = sl.close_offset, owner_sid,
                  required_margin_fp = risk_dec.required_margin_fp,
@@ -1109,21 +1155,16 @@ XtLiveOrderGateway::SliceOutcome XtLiveOrderGateway::submit_one_slice_(
                                               price_fp, close_offset, owner_sid,
                                               required_margin_fp, per_unit_margin_fp);
                 });
-            if (!posted) {
-
-                XtLogger::warn_m("RT",
-                                 "submit register enqueue failed, inline fallback id={}",
-                                 phys_id);
-                register_submitted_order_(phys_id, code, is_buy, sl.qty_fp, price_fp,
-                                          sl.close_offset, owner_sid,
-                                          risk_dec.required_margin_fp,
-                                          risk_dec.per_unit_margin_fp);
-            }
         }
     }
 
     if (cfg_.stp_enabled) {
-        stp_checker_.on_order_submitted(code, is_buy, price_fp);
+        if (!stp_checker_.is_registered(code)) stp_checker_.register_symbol(code);
+
+        stp_checker_.on_order_submitted(code, phys_id, is_buy, price_fp);
+    }
+    if (cfg_.velocity_enabled && !velocity_limiter_.is_registered(code)) {
+        velocity_limiter_.register_symbol(code);
     }
     submit_success_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1392,6 +1433,11 @@ SubmitResult XtLiveOrderGateway::submit_with_metadata(const char* code,
         latency_tracker_->on_submit_result(result.order_id, std::string(user_tag),
                                            t0_us, t1_us, trigger_tick_us,
                                            strategy_id, std::string_view(code));
+
+        if (result.order_id != 0 && !strategy_id.empty() && code != nullptr && code[0] != '\0') {
+            latency_tracker_->note_ack_eligible(strategy_id, strategy_id,
+                                                std::string_view(code));
+        }
     }
 
     if (!result.accepted()) {
@@ -1436,6 +1482,12 @@ SubmitResult XtLiveOrderGateway::submit(const xt_core::XtOrderRequest& req,
 bool XtLiveOrderGateway::is_order_terminal(uint64_t local_id) const {
     const ITradeGateway* td = td_.load(std::memory_order_acquire);
     return td != nullptr && td->is_order_terminal(local_id);
+}
+
+bool XtLiveOrderGateway::lookup_terminal(uint64_t local_id,
+                                         XtOrderTerminalRecord& out) const {
+    const ITradeGateway* td = td_.load(std::memory_order_acquire);
+    return td != nullptr && td->lookup_terminal(local_id, out);
 }
 
 bool XtLiveOrderGateway::cancel(uint64_t id) {

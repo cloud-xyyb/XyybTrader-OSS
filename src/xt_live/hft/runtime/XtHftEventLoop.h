@@ -13,6 +13,7 @@
 #include "xt_core/container/XtLockFreeQueue.h"
 #include "xt_core/market/XtTick.h"
 #include "xt_core/market/XtRawTick.h"
+#include "xt_live/common/XtLagHistogram.h"
 #include "xt_live/hft/runtime/XtHftRunnerEvent.h"
 #include "xt_live/hft/runtime/XtHftEventLoopCfg.h"
 #include "xt_core/session/XtSessionWindow.h"
@@ -24,6 +25,7 @@ class XtFeeRuleBook;
 class XtTradeCostConfig;
 
 class XtHftEngine;
+class XtLiveLatencyTracker;
 namespace xt_risk { class SelfMatchDetector; }
 
 /// @brief HFT 实盘的单消费者事件循环。
@@ -69,6 +71,10 @@ public:
 
         xt_risk::SelfMatchDetector* self_match_detector = nullptr;
         std::function<void(const char*, const char*)> blacklist_sink;
+
+        std::function<void()> marshal_overflow_drain;
+
+        XtLiveLatencyTracker* latency_tracker = nullptr;
     };
 
     XtHftEventLoop(const Config& cfg, const Deps& deps);
@@ -81,6 +87,8 @@ public:
 
     [[nodiscard]] bool try_push_tick(const XtRawTick& tick);
 
+    [[nodiscard]] bool try_push_tick(const XtRawTick& tick, uint64_t capture_ns);
+
     [[nodiscard]] bool push_td_event(XtHftRunnerEvent ev);
 
     [[nodiscard]] bool push_flow_event(XtHftRunnerEvent ev);
@@ -90,7 +98,11 @@ public:
     [[nodiscard]] uint64_t tick_backlog() const;
     [[nodiscard]] uint64_t td_event_backlog() const;
 
-    [[nodiscard]] uint64_t drain_tick_lag_p99_us();
+    [[nodiscard]] uint64_t drain_tick_lag_peak_us();
+
+    [[nodiscard]] xt_live::XtLagHistogram::Stats drain_tick_lag_hist_stats();
+
+    [[nodiscard]] xt_live::XtLagHistogram::Stats drain_td_flow_lag_hist_stats();
     [[nodiscard]] uint64_t td_event_peak_backlog_val() const;
     [[nodiscard]] uint64_t td_flow_event_lag_us_max_val() const;
 
@@ -99,6 +111,10 @@ public:
     [[nodiscard]] uint64_t engine_dropped_fill_count() const noexcept;
     [[nodiscard]] uint64_t engine_dropped_order_update_count() const noexcept;
     [[nodiscard]] uint64_t engine_orphan_reap_cancel_count() const noexcept;
+
+    [[nodiscard]] uint64_t engine_orphan_reap_suppressed_count() const noexcept;
+
+    [[nodiscard]] uint64_t engine_strategy_init_failure_count() const noexcept;
     [[nodiscard]] uint32_t engine_open_order_count() const noexcept;
 
     [[nodiscard]] XtHftUnmatchedStats engine_unmatched_stats() const noexcept;
@@ -114,6 +130,7 @@ private:
     struct TickEvent {
         XtTick core_tick;
         uint64_t enqueue_ts_us = 0;
+        uint64_t capture_ts_us = 0;
     };
 
     /// @brief worker 调度预算；构造期按 cfg clamp 一次，之后只读。
@@ -226,6 +243,8 @@ private:
 
     xt_risk::SelfMatchDetector* self_match_detector_ = nullptr;
     std::function<void(const char*, const char*)> blacklist_sink_;
+    std::function<void()> marshal_overflow_drain_;
+    XtLiveLatencyTracker* latency_tracker_ = nullptr;
 
     const XtTradeCostConfig* live_cost_ = nullptr;
     const XtFeeRuleBook*     live_fees_ = nullptr;
@@ -249,7 +268,10 @@ private:
     std::atomic<uint64_t> tick_backlog_{0};
 
     alignas(64)
-    std::atomic<uint64_t> tick_lag_us_p99_{0};
+    std::atomic<uint64_t> tick_lag_us_peak_{0};
+
+    xt_live::XtLagHistogram tick_lag_hist_;
+    xt_live::XtLagHistogram td_flow_lag_hist_;
 
     std::atomic<uint64_t> td_event_backlog_{0};
     std::atomic<uint64_t> td_event_peak_backlog_{0};

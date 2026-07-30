@@ -119,6 +119,25 @@ std::string to_csv_line(const std::string& dims_prefix, const XtKpi1sRow& row) {
     append_latency5(line, l.submit_to_ack_paired_us_avg, l.submit_to_ack_paired_us_p50,
                     l.submit_to_ack_paired_us_p90, l.submit_to_ack_paired_us_p95,
                     l.submit_to_ack_paired_us_p99);
+    n = std::snprintf(buf, sizeof(buf), ",%.3f", l.md_gap_ms_peak);
+    append_fmt(line, buf, n);
+
+    n = std::snprintf(buf, sizeof(buf), ",%llu,%llu,%llu",
+                      static_cast<unsigned long long>(l.submit_to_ack_us_samples),
+                      static_cast<unsigned long long>(l.fill_after_ack_us_samples),
+                      static_cast<unsigned long long>(l.local_submit_us_samples));
+    append_fmt(line, buf, n);
+
+    n = std::snprintf(buf, sizeof(buf), ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+                      static_cast<unsigned long long>(l.submit_to_ack_paired_us_samples),
+                      static_cast<unsigned long long>(l.submit_to_trade_ack_us_samples),
+                      static_cast<unsigned long long>(l.uds_first_savings_us_samples),
+                      static_cast<unsigned long long>(l.submit_to_fill_us_samples),
+                      static_cast<unsigned long long>(l.strategy_us_samples),
+                      static_cast<unsigned long long>(l.ack_path_us_samples),
+                      static_cast<unsigned long long>(l.event_to_ack_us_samples),
+                      static_cast<unsigned long long>(l.event_to_fill_us_samples));
+    append_fmt(line, buf, n);
     line += '\n';
     return line;
 }
@@ -169,7 +188,15 @@ std::string csv_header_kpi_1s() {
            "risk_block_count,md_gap_ms_p99,event_drop,queue_depth_p99,uptime_sec,"
 
            "kill_switch_active,"
-           "submit_to_ack_paired_us_avg,submit_to_ack_paired_us_p50,submit_to_ack_paired_us_p90,submit_to_ack_paired_us_p95,submit_to_ack_paired_us_p99\n";
+           "submit_to_ack_paired_us_avg,submit_to_ack_paired_us_p50,submit_to_ack_paired_us_p90,submit_to_ack_paired_us_p95,submit_to_ack_paired_us_p99,"
+
+           "md_gap_ms_peak,"
+
+           "submit_to_ack_us_samples,fill_after_ack_us_samples,local_submit_us_samples,"
+
+           "submit_to_ack_paired_us_samples,submit_to_trade_ack_us_samples,uds_first_savings_us_samples,"
+           "submit_to_fill_us_samples,strategy_us_samples,ack_path_us_samples,"
+           "event_to_ack_us_samples,event_to_fill_us_samples\n";
 }
 
 std::string csv_header_fill() {

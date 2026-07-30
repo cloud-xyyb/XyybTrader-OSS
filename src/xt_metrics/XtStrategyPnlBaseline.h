@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,8 @@ public:
 
     BaselineRow get(std::string_view sid, std::string_view code, bool* is_new = nullptr) const;
 
+    bool mark_new_reported(std::string_view sid, std::string_view code);
+
     int64_t realized_fp_for_sid(std::string_view sid) const;
 
     static int compute_trading_day_id(int tz_offset_h);
@@ -79,6 +82,8 @@ private:
     std::string                                          instance_id_;
     mutable std::mutex                                   mu_;
     std::unordered_map<Key, BaselineRow, PairHash>       baseline_;
+
+    std::unordered_set<Key, PairHash>                    new_reported_keys_;
     LoadStatus                                           last_load_status_ = LoadStatus::NotLoaded;
     bool                                                 ready_ = false;
 };

@@ -18,8 +18,8 @@ uint64_t price_levels_full_drops() noexcept {
 }
 }
 
-void XtOrderBook::add_order(const XtSimOrder& ord) {
-    if (ord.code.empty() || ord.price_fp <= 0 || ord.qty_fp <= 0) return;
+bool XtOrderBook::add_order(const XtSimOrder& ord) {
+    if (ord.code.empty() || ord.price_fp <= 0 || ord.qty_fp <= 0) return false;
 
     Book& book = books_[ord.code];
     const int64_t fp = ord.price_fp;
@@ -28,17 +28,24 @@ void XtOrderBook::add_order(const XtSimOrder& ord) {
         PriceLevel* lvl = book.bids.get_or_insert(fp);
         if (!lvl) {
             g_price_levels_full_drops_.fetch_add(1, std::memory_order_relaxed);
-        } else if (!lvl->push(ord.id)) {
+            return false;
+        }
+        if (!lvl->push(ord.id)) {
             g_orders_per_level_drops_.fetch_add(1, std::memory_order_relaxed);
+            return false;
         }
     } else {
         PriceLevel* lvl = book.asks.get_or_insert(fp);
         if (!lvl) {
             g_price_levels_full_drops_.fetch_add(1, std::memory_order_relaxed);
-        } else if (!lvl->push(ord.id)) {
+            return false;
+        }
+        if (!lvl->push(ord.id)) {
             g_orders_per_level_drops_.fetch_add(1, std::memory_order_relaxed);
+            return false;
         }
     }
+    return true;
 }
 
 void XtOrderBook::remove_order(const XtSimOrder& ord) {
@@ -284,7 +291,7 @@ const XtOrderBook::MatchResult& XtOrderBook::match_tick(
 
     const double liq_factor = 1.0 - liquidity_ratio;
 
-    double remaining_capacity = max_fill_qty > 0.0 ? max_fill_qty : -1.0;
+    double remaining_capacity = max_fill_qty >= 0.0 ? max_fill_qty : -1.0;
 
     const bool buy_frozen = upper_limit_fp > 0 && bid_px_fp
                             && bid_px_fp[0] >= upper_limit_fp;
@@ -311,5 +318,34 @@ const XtOrderBook::MatchResult& XtOrderBook::match_tick(
                               lookup_fn, lookup_ctx);
     }
 
+    sweep_ioc_fok_(book.bids, match_result_, lookup_fn, lookup_ctx);
+    sweep_ioc_fok_(book.asks, match_result_, lookup_fn, lookup_ctx);
+
     return match_result_;
+}
+
+template <bool Descending>
+void XtOrderBook::sweep_ioc_fok_(FlatLevels<Descending>& side_levels,
+                                 MatchResult& result,
+                                 XtSimOrder& (*lookup_fn)(void*, uint64_t),
+                                 void* lookup_ctx) {
+    for (int li = 0; li < side_levels.size; ) {
+        PriceLevel& lvl = side_levels.levels[li];
+        for (int k = 0; k < lvl.count; ) {
+            const uint64_t oid = lvl.ids[k];
+            const XtSimOrder& ord = lookup_fn(lookup_ctx, oid);
+            if (ord.tif == XtTimeInForce::IOC || ord.tif == XtTimeInForce::FOK) {
+
+                if (ord.status == XtOrderStatus::Accepted ||
+                    ord.status == XtOrderStatus::PartiallyFilled) {
+                    result.canceled.push_back(oid);
+                }
+                for (int j = k; j < lvl.count - 1; ++j) lvl.ids[j] = lvl.ids[j + 1];
+                --lvl.count;
+            } else {
+                ++k;
+            }
+        }
+        if (lvl.empty()) side_levels.erase_at(li); else ++li;
+    }
 }

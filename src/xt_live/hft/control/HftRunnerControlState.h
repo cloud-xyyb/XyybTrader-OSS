@@ -23,7 +23,11 @@ namespace xt_live::control::detail {
 /// @brief 每轮控制环采样的完整 runtime 快照（事件循环 / 风控 / 延迟 / 一致性）。
 /// 生命周期仅限单轮循环，下轮重新采样。
 struct ControlSnapshot {
+    uint64_t tick_lag_p50_us = 0;
     uint64_t tick_lag_p99_us = 0;
+    uint64_t tick_lag_peak_us = 0;
+    uint64_t td_flow_lag_p99_us = 0;
+    uint64_t td_event_backlog = 0;
     uint64_t td_event_peak_backlog = 0;
     uint64_t td_flow_event_lag_us_max = 0;
     uint64_t td_flow_event_rejected = 0;
@@ -101,6 +105,7 @@ struct ControlLoopState {
     uint64_t last_orphan_reap_prom_total = 0;
     int64_t  last_metric_wire_ms = 0;
     uint64_t last_md_ticks_prom_total = 0;
+    uint64_t last_risk_rejects_prom_total = 0;
     uint64_t last_td_position_snapshot_drop_prom_total = 0;
     uint64_t last_td_control_event_drop_prom_total = 0;
     uint64_t last_td_other_event_drop_prom_total = 0;
@@ -116,6 +121,8 @@ struct ControlLoopState {
 
     xt_live::control::UnmatchedBudgetWindow unmatched_budget;
     uint64_t kpi_window_tick_lag_us_peak = 0;
+
+    uint64_t kpi_window_tick_lag_us_p99 = 0;
 
     std::vector<std::string> last_truth_symbols;
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <shared_mutex>
 #include <string>
@@ -18,6 +19,13 @@ namespace ct::metrics {
 /// realized 内部用 ×1e6 fixed-point 存储；空 strategy_id 归一化为 "_default"。
 class XtStrategyPnlAggregator {
 public:
+
+    enum class LoadResult {
+        kLoaded,
+        kMissing,
+        kInvalid,
+    };
+
     /// @brief 累计快照行。
     ///
     /// realized 是由内部 fixed-point 反算后的金额；fees/fills 保持累计口径。
@@ -41,7 +49,11 @@ public:
 
     bool save_state(std::string_view path) const;
 
-    bool load_state(std::string_view path);
+    LoadResult load_state(std::string_view path);
+
+    uint64_t invalid_load_count() const noexcept {
+        return invalid_load_count_.load(std::memory_order_relaxed);
+    }
 
 private:
 
@@ -64,9 +76,13 @@ private:
         uint64_t fills       = 0;
     };
 
+    LoadResult reject_and_quarantine_(const std::string& path, std::string_view reason);
+
     mutable std::shared_mutex                          mu_;
 
     std::unordered_map<Key, State, PairHash>           rows_;
+
+    std::atomic<uint64_t>                              invalid_load_count_{0};
 };
 
 }

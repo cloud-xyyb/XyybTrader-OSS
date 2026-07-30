@@ -19,6 +19,7 @@
 #include "api/XtRunnerSignals.h"
 #include "xt_util/time/XtSteadyClock.h"
 #include "XtFixedPoint.h"
+#include "xt_account/api/AccountCloseableView.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "state/AccountStateStore.h"
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
@@ -241,8 +242,9 @@ void submit_force_flat_request(ITradeGateway* td,
                              static_cast<int>(req.close_offset));
             break;
         }
-        book->record_global_force_flat_order(oid, req.code, req.is_buy, send_fp,
-                                             req.close_offset);
+
+        book->record_force_flat_order(oid, req.code, req.is_buy, send_fp,
+                                      req.close_offset, StrategySid::legacy());
         ++submit_cnt;
         remaining_fp -= send_fp;
     }
@@ -370,11 +372,6 @@ bool kill_switch_source_auto_releasable(uint8_t source) noexcept {
 
     return source == XtRunnerSignals::kKillSwitchSourceAutoCloseoutBlock ||
            source == XtRunnerSignals::kKillSwitchSourceUnmatchedBudget;
-}
-
-bool kill_switch_source_latches_across_restart(uint8_t source) noexcept {
-
-    return source != XtRunnerSignals::kKillSwitchSourceReconcileDivergence;
 }
 
 bool closeout_boundary_trap(const std::vector<int>& force_hhmm_list,

@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "ctp/md/CtpMdSessionGate.h"
+
 /// @brief CTP 行情网关配置。
 ///
 /// 承载 CTP MD SDK 特有的 broker 编码和 flow 文件目录；provider-neutral 的
@@ -11,4 +13,6 @@
 struct CTPMdCfg {
     std::string broker;
     std::string flow_dir = "CTP_MD_FLOW";
+
+    ctp_md_session::TradingWindowGate window_gate;
 };

@@ -86,6 +86,13 @@ public:
         return true;
     }
 
+    bool peek(T& out) const {
+        const size_t tail = tail_.load(std::memory_order_relaxed);
+        if (__builtin_expect(tail == head_.load(std::memory_order_acquire), 0)) return false;
+        out = buf_[tail];
+        return true;
+    }
+
 private:
     static size_t next_pow2(size_t v) {
         size_t n = 1;

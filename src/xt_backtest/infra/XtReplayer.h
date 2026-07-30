@@ -12,7 +12,8 @@ class XtMarketDataSource;
 /// @brief 回测 market-data 事件调度器。
 ///
 /// 单线程读取 `XtMarketDataSource` 并驱动 `IReplayRuntime`；
-/// 启用 clock grid 时，在相邻 source event 之间注入 `runtime.on_clock(date, time_ms)`。
+/// 启用 clock grid 时，在相邻 source event 之间注入
+/// `runtime.on_clock(action_date, action_time_ms, trading_date)`（event-axis 网格）。
 ///
 class XtReplayer {
 public:

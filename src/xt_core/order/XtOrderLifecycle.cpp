@@ -97,6 +97,13 @@ void XtOrderUpdateDeduper::forget(uint64_t order_id) {
     final_seen_.erase(order_id);
 }
 
+bool XtOrderUpdateDeduper::last_update(uint64_t order_id, XtOrderExecUpdate& out) const {
+    const auto it = last_update_.find(order_id);
+    if (it == last_update_.end()) return false;
+    out = it->second;
+    return true;
+}
+
 void XtOrderUpdateDeduper::clear() {
     last_update_.clear();
     final_seen_.clear();

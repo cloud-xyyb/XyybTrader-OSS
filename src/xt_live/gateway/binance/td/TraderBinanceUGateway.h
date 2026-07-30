@@ -74,6 +74,13 @@ public:
 
     QueryControlStats query_control_stats() const override { return QueryControlStats{}; }
 
+    [[nodiscard]] bool is_order_terminal(uint64_t local_id) const override;
+
+    [[nodiscard]] bool lookup_terminal(uint64_t local_id,
+                                       XtOrderTerminalRecord& out) const override;
+
+    [[nodiscard]] bool collect_open_delivery_ids(std::vector<uint64_t>& out) const override;
+
     uint64_t submit_order(const char* code,
                           bool is_buy,
                           int64_t price_fp,
@@ -123,6 +130,7 @@ private:
 	    friend void  trader_binance_test_rebuild_from_open_orders_body(void*, const std::string&, bool);
 
     friend long long trader_binance_test_detect_ghosts(void*, uint32_t);
+    friend uint64_t trader_binance_test_user_trades_pages_capped(void*);
     friend void  trader_binance_test_set_rest(void*, std::unique_ptr<BinanceRestClient>);
     friend void  trader_binance_test_reconcile_resync(void*);
     friend void  trader_binance_test_note_tracked_symbol(void*, const std::string&);
@@ -135,7 +143,7 @@ private:
     friend int   trader_binance_test_keepalive_pick(void*, long long);
     friend void  trader_binance_test_reset_td_readiness(void*);
     friend void  trader_binance_test_boot_cold_worker_with_uds(
-        void*, const std::string&, std::function<void(const XtTradeRecord&)>);
+        void*, const std::string&, std::function<void(const XtTradeRecord&, XtLatencyEligibility)>);
     friend void  trader_binance_test_install_uds_prod_wired(void*, const std::string&);
 #endif
 };

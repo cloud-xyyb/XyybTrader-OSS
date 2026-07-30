@@ -2,10 +2,12 @@
 #include <cstdint>
 
 /// @file XtBarSlot.h
-/// @brief CTA/live/backtest 共用的 bar 时间槽计算。
+/// @brief bar 时间槽（bucket）计算的单一口径，CTA/live/backtest 共用。
 ///
-/// `action_time` 使用 HHMMSSmmm 编码。分钟级 slot 以 action_date 分组并按
-/// period 向下取整；日线及以上以 trading_date 分组，避免夜盘跨自然日断裂。
+/// K 线要把连续 tick 归进「分钟桶 / 日桶」再聚合成一根 OHLCV；只要 live 聚合和 backtest
+/// 回放用的桶边界不一致，同一段行情就会算出不同的 bar。本文件把归桶规则收成一处：分钟级
+/// slot 以 action_date（自然日）分组并按 period 向下取整，日线及以上以 trading_date 分组，
+/// 让夜盘不会因为跨过自然日而被切成两根。`action_time` 用 HHMMSSmmm 编码。
 
 namespace xt_bar_slot {
 

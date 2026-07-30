@@ -26,7 +26,8 @@ public:
 
     [[nodiscard]] bool write_json(const std::string& out_path,
                                   uint32_t cfg_start_date,
-                                  uint32_t cfg_end_date) const;
+                                  uint32_t cfg_end_date,
+                                  bool shared_execution_counters = false) const;
 
     [[nodiscard]] bool empty() const noexcept { return daily_stats_.empty(); }
 

@@ -106,7 +106,12 @@ ControlSnapshot sample_control_snapshot(const XtHftRunnerControlContext& ctx,
                                         const ControlParamSnapshot& params,
                                         ITradeGateway* td) {
     ControlSnapshot out;
-    out.tick_lag_p99_us          = ctx.strategy_event_loop.drain_tick_lag_p99_us();
+    const auto tick_lag_hist     = ctx.strategy_event_loop.drain_tick_lag_hist_stats();
+    out.tick_lag_p50_us          = tick_lag_hist.p50_us;
+    out.tick_lag_p99_us          = tick_lag_hist.p99_us;
+    out.tick_lag_peak_us         = ctx.strategy_event_loop.drain_tick_lag_peak_us();
+    out.td_flow_lag_p99_us       = ctx.strategy_event_loop.drain_td_flow_lag_hist_stats().p99_us;
+    out.td_event_backlog         = ctx.strategy_event_loop.td_event_backlog();
     out.td_event_peak_backlog    = ctx.strategy_event_loop.td_event_peak_backlog_val();
     out.td_flow_event_lag_us_max = ctx.strategy_event_loop.td_flow_event_lag_us_max_val();
     out.td_flow_event_rejected   = ctx.runtime_shared_state.td_event_drop_cnt.load(std::memory_order_relaxed)

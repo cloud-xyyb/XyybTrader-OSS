@@ -423,27 +423,6 @@ void parse_strategy_runtime_cfg(const LiveConfigNodes& nodes,
     }
 }
 
-void fill_control_grpc_cfg(const YAML::Node& runtime_node, XtLiveControlGrpcConfig& cfg) {
-
-    const YAML::Node cg_node =
-        (runtime_node && !runtime_node.IsNull()) ? runtime_node["control_grpc"] : YAML::Node();
-    const YAML::Node tls_node = cg_node ? cg_node["tls"] : YAML::Node();
-    cfg.enabled =
-        YamlNodeUtil::as_or<bool>(cg_node, "enabled", cfg.enabled);
-    cfg.listen_addr =
-        YamlNodeUtil::as_or<std::string>(cg_node, "listen_addr", cfg.listen_addr);
-    cfg.tls_mode =
-        YamlNodeUtil::as_or<std::string>(tls_node, "mode", cfg.tls_mode);
-    cfg.tls_ca_path =
-        YamlNodeUtil::as_or<std::string>(tls_node, "ca_path", cfg.tls_ca_path);
-    cfg.tls_cert_path =
-        YamlNodeUtil::as_or<std::string>(tls_node, "cert_path", cfg.tls_cert_path);
-    cfg.tls_key_path =
-        YamlNodeUtil::as_or<std::string>(tls_node, "key_path", cfg.tls_key_path);
-    cfg.audit_log_path =
-        YamlNodeUtil::as_or<std::string>(cg_node, "audit_log_path", cfg.audit_log_path);
-}
-
 void fill_safety_state_cfg(const YAML::Node& runtime_node,
                            const std::string& md_provider,
                            XtRunnerControlConfig& ctrl) {
@@ -473,6 +452,67 @@ void fill_metrics_cfg(const YAML::Node& runtime_node, XtRunnerControlConfig& ctr
 void fill_portfolio_router_flag(const YAML::Node& runtime_node, XtLiveParsedConfig& parsed) {
     parsed.portfolio_router = YamlNodeUtil::as_or<bool>(
         runtime_node, "portfolio_router", true);
+}
+
+bool parse_sel_task_period(const std::string& s, TaskPeriod& out) {
+    if (s == "minute")  { out = TaskPeriod::Minute;  return true; }
+    if (s == "daily")   { out = TaskPeriod::Daily;   return true; }
+    if (s == "weekly")  { out = TaskPeriod::Weekly;  return true; }
+    if (s == "monthly") { out = TaskPeriod::Monthly; return true; }
+    if (s == "yearly")  { out = TaskPeriod::Yearly;  return true; }
+    return false;
+}
+
+void fill_selector_tasks(const YAML::Node& root,
+                         XtLiveParsedConfig& parsed,
+                         std::vector<std::string>& validation_errors) {
+    parsed.sel_tasks.clear();
+    const YAML::Node sel = root["selector"];
+    if (!sel || sel.IsNull()) return;
+    if (!sel.IsMap()) {
+        validation_errors.push_back("selector 必须是 map（含 tasks: [...]）");
+        return;
+    }
+    const YAML::Node tasks = sel["tasks"];
+    if (!tasks || tasks.IsNull()) return;
+    if (!tasks.IsSequence()) {
+        validation_errors.push_back(
+            "selector.tasks 必须是 list（each entry: {strategy_id, period, ...}）");
+        return;
+    }
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const YAML::Node t = tasks[i];
+        const std::string prefix = "selector.tasks[" + std::to_string(i) + "]";
+        if (!t || !t.IsMap()) {
+            validation_errors.push_back(prefix + " 必须是 map");
+            continue;
+        }
+        XtSelLiveTaskCfg cfg;
+        cfg.strategy_id = YamlNodeUtil::as_or<std::string>(t, "strategy_id", std::string());
+        if (cfg.strategy_id.empty()) {
+            validation_errors.push_back(prefix + ".strategy_id 不能为空");
+            continue;
+        }
+        if (!t["period"] || t["period"].IsNull()) {
+            validation_errors.push_back(
+                prefix + ".period 必填（minute / daily / weekly / monthly / yearly）");
+            continue;
+        }
+        const std::string period = t["period"].as<std::string>("");
+        if (!parse_sel_task_period(period, cfg.period)) {
+            validation_errors.push_back(
+                prefix + ".period 只支持 minute / daily / weekly / monthly / yearly，得到 '" +
+                period + "'");
+            continue;
+        }
+        cfg.day         = YamlNodeUtil::as_or<uint32_t>(t, "day", cfg.day);
+        cfg.time        = YamlNodeUtil::as_or<uint32_t>(t, "time", cfg.time);
+        cfg.strict_time = YamlNodeUtil::as_or<bool>(t, "strict_time", cfg.strict_time);
+        cfg.trdtpl      = YamlNodeUtil::as_or<std::string>(t, "trdtpl", cfg.trdtpl);
+        cfg.session     = YamlNodeUtil::as_or<std::string>(t, "session", cfg.session);
+        cfg.name        = YamlNodeUtil::as_or<std::string>(t, "name", std::string());
+        parsed.sel_tasks.push_back(std::move(cfg));
+    }
 }
 
 void fill_strategies_vector(const LiveConfigNodes& nodes, XtLiveParsedConfig& parsed) {
@@ -625,8 +665,49 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
 
     fill_roll_engine_cfg(nodes.runtime_node, out.parsed.cfg_path, out.bootstrap, validation_errors);
     append_roll_symbols_to_md_subscriptions(out);
+
+    {
+        const std::string inst = resolved_instance_id(
+            out.parsed.md_provider, out.runtime.control_cfg.instance_id);
+        if (auto* bn = std::get_if<BinanceTdCfg>(&out.parsed.td_provider_cfg.extra)) {
+            bn->local_id_instance = inst;
+        } else if (auto* xtp = std::get_if<XTPTdCfg>(&out.parsed.td_provider_cfg.extra)) {
+            xtp->local_id_instance = inst;
+        }
+    }
 }
 
+}
+
+void fill_control_grpc_cfg(const YAML::Node& runtime_node, XtLiveControlGrpcConfig& cfg) {
+
+    const YAML::Node cg_node =
+        (runtime_node && !runtime_node.IsNull()) ? runtime_node["control_grpc"] : YAML::Node();
+    const YAML::Node tls_node = cg_node ? cg_node["tls"] : YAML::Node();
+    cfg.enabled_explicit = cg_node ? static_cast<bool>(cg_node["enabled"]) : false;
+    cfg.enabled =
+        XtConfigYamlUtil::as_or<bool>(cg_node, "enabled", cfg.enabled);
+    cfg.listen_addr =
+        XtConfigYamlUtil::as_or<std::string>(cg_node, "listen_addr", cfg.listen_addr);
+    cfg.tls_mode =
+        XtConfigYamlUtil::as_or<std::string>(tls_node, "mode", cfg.tls_mode);
+    cfg.tls_ca_path =
+        XtConfigYamlUtil::as_or<std::string>(tls_node, "ca_path", cfg.tls_ca_path);
+    cfg.tls_cert_path =
+        XtConfigYamlUtil::as_or<std::string>(tls_node, "cert_path", cfg.tls_cert_path);
+    cfg.tls_key_path =
+        XtConfigYamlUtil::as_or<std::string>(tls_node, "key_path", cfg.tls_key_path);
+    cfg.audit_log_path =
+        XtConfigYamlUtil::as_or<std::string>(cg_node, "audit_log_path", cfg.audit_log_path);
+#ifndef XT_HAVE_CONTROL_GRPC
+
+    if (cfg.enabled && !cfg.enabled_explicit) {
+        std::fprintf(stderr,
+                     "[CFG WARN] runtime.control_grpc.enabled 未显式配置且本 binary "
+                     "未编译 XT_HAVE_CONTROL_GRPC — 控制面降级为 disabled\n");
+        cfg.enabled = false;
+    }
+#endif
 }
 
 bool load_live_config(int argc,
@@ -685,17 +766,12 @@ bool load_live_config(int argc,
 
     validate_unknown_config_keys(root, build_live_schema_rules(), validation_errors);
 
-    if (live_selector_section_present(root)) {
-        std::fprintf(stderr,
-                     "[CFG WARN] 'selector' section is schema-registered but not consumed by live "
-                     "runners yet; the whole section is ignored (SEL task registration pending)\n");
-    }
-
     const LiveConfigNodes nodes = collect_live_config_nodes(root);
     ParsedFlags flags = parse_and_validate_base_cfg(nodes, out, validation_errors);
     parse_runtime_runner_cfg(nodes, out, flags, validation_errors);
     parse_strategy_runtime_cfg(nodes, flags, out, validation_errors);
     fill_misc_runtime_cfg(nodes, out, validation_errors);
+    fill_selector_tasks(root, out.parsed, validation_errors);
     resolve_runtime_output_paths(out);
 
     {

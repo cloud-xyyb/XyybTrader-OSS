@@ -24,6 +24,8 @@ struct XtLiveOrderGatewayCfg {
     int                                closeout_retry_ms  = 1000;
     int                                closeout_escalate_after_ms = 3000;
     int                                closeout_aggressive_buffer_bps = 10;
+    bool                               closeout_force_exit_latch_enabled = true;
+    int                                closeout_force_exit_latch_ttl_ms = 30'000;
 
     bool     orphan_reap_enabled = true;
     int64_t  orphan_reap_grace_ms = 60'000;

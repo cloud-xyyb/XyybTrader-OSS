@@ -41,6 +41,7 @@ void PerSidLiquidator::step(XtHftRunnerControlContext& ctx) {
     panel.runtime_shared_state = &ctx.runtime_shared_state;
     panel.param_domain         = ctx.param_domain;
     panel.catalog              = ctx.catalog;
+    panel.force_flat_fence     = ctx.force_flat_fence;
 
     auto& reg = ct::metrics::XtMetricRegistry::instance();
 

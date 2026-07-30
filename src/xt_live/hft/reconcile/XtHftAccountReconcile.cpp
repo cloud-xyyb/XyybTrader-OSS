@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include "xt_live/hft/control/HftRunnerControl.h"
 #include "XtRunnerControlCfg.h"
@@ -115,6 +116,20 @@ struct BrokerView {
     ReconcileDiff balance_d;
 };
 
+// gateway 交付投影 open 集合（差集观测输入）；@pre 同 run_account_reconcile_on_stop
+// —— gateway stop() 已完成，投影读取为无并发写者的冷路径。
+struct LedgerView {
+    bool supported = false;
+    std::vector<uint64_t> open_ids;
+};
+
+LedgerView fetch_ledger_view(const XtHftRunnerControlContext& ctx) {
+    LedgerView out;
+    if (!ctx.td_gateway) return out;
+    out.supported = ctx.td_gateway->collect_open_delivery_ids(out.open_ids);
+    return out;
+}
+
 BrokerView fetch_broker_view(const XtHftRunnerControlContext& ctx,
                              const RuntimeView& rt,
                              double abs_tol, double rel_tol) {
@@ -140,6 +155,8 @@ BrokerView fetch_broker_view(const XtHftRunnerControlContext& ctx,
 
 void write_reconcile_report(const RuntimeView& rt,
                             const BrokerView& bd,
+                            const LedgerView& lv,
+                            const LedgerOpenObservation& obs,
                             double abs_tol, double rel_tol,
                             bool all_pass,
                             const std::string& report_path) {
@@ -168,6 +185,24 @@ void write_reconcile_report(const RuntimeView& rt,
         report << "broker_pass=" << (bd.balance_d.pass ? 1 : 0) << "\n";
     } else {
         report << "broker_pass=1\n";
+    }
+
+    report << "exec_ledger_present=" << (obs.present ? 1 : 0) << "\n";
+    if (obs.present) {
+        report << "exec_ledger_open_count=" << obs.open_count << "\n";
+        if (!lv.open_ids.empty()) {
+            constexpr std::size_t kIdDumpCap = 32;
+            report << "exec_ledger_open_ids=";
+            const std::size_t dump = std::min(lv.open_ids.size(), kIdDumpCap);
+            for (std::size_t i = 0; i < dump; ++i) {
+                if (i > 0) report << ",";
+                report << lv.open_ids[i];
+            }
+            if (lv.open_ids.size() > kIdDumpCap) report << ",...";
+            report << "\n";
+        }
+        report << "exec_ledger_stale_frozen_suspect="
+               << (obs.stale_frozen_suspect ? 1 : 0) << "\n";
     }
     report << "tolerance_abs=" << abs_tol << "\n";
     report << "tolerance_rel=" << rel_tol << "\n";
@@ -199,6 +234,17 @@ BrokerBalancePick pick_broker_balance(ITradeGateway* gw,
     return out;
 }
 
+LedgerOpenObservation make_ledger_open_observation(bool supported,
+                                                   std::size_t open_count,
+                                                   double frozen_cash_by_orders) {
+    LedgerOpenObservation out;
+    out.present = supported;
+    out.open_count = supported ? open_count : 0;
+    out.stale_frozen_suspect =
+        supported && open_count == 0 && frozen_cash_by_orders > 0.0;
+    return out;
+}
+
 void run_account_reconcile_on_stop(const XtRunnerControlConfig& cfg,
                                    const XtHftRunnerControlContext& ctx) {
     if (!cfg.account_reconcile_on_stop) return;
@@ -212,25 +258,38 @@ void run_account_reconcile_on_stop(const XtRunnerControlConfig& cfg,
 
     const RuntimeView rt = fetch_runtime_view(ctx);
     const BrokerView bd = fetch_broker_view(ctx, rt, abs_tol, rel_tol);
+    const LedgerView lv = fetch_ledger_view(ctx);
+    const LedgerOpenObservation obs = make_ledger_open_observation(
+        lv.supported, lv.open_ids.size(), rt.frozen_audit.frozen_cash_by_orders);
 
     const bool broker_pass = !bd.has_snapshot || bd.balance_d.pass;
     const bool frozen_pass = rt.frozen_audit.ok;
     const bool all_pass = broker_pass && frozen_pass;
 
     const std::string report_path = account_reconcile_report_path(cfg);
-    write_reconcile_report(rt, bd, abs_tol, rel_tol, all_pass, report_path);
+    write_reconcile_report(rt, bd, lv, obs, abs_tol, rel_tol, all_pass, report_path);
 
+    if (obs.stale_frozen_suspect) {
+        XtLogger::warn_m("RT",
+                         "account reconcile: stale frozen suspect — 交付投影 open=0 但 "
+                         "frozen_by_orders={}（trade-only 终态漏收尾候选）",
+                         rt.frozen_audit.frozen_cash_by_orders);
+    }
     if (all_pass) {
         XtLogger::info_m("RT",
-                         "account reconcile PASS cash={} broker_present={} broker_source={} report={}",
+                         "account reconcile PASS cash={} broker_present={} broker_source={} "
+                         "ledger_open={} report={}",
                          rt.cash, bd.has_snapshot ? 1 : 0,
                          bd.has_snapshot ? (bd.fresh ? "fresh_rest" : "anchor_cache") : "none",
+                         obs.present ? static_cast<long long>(obs.open_count) : -1LL,
                          report_path);
     } else {
         XtLogger::error_m("RT",
-                          "account reconcile FAIL broker_pass={} frozen_pass={} broker_source={} report={}",
+                          "account reconcile FAIL broker_pass={} frozen_pass={} broker_source={} "
+                          "ledger_open={} report={}",
                           broker_pass ? 1 : 0, frozen_pass ? 1 : 0,
                           bd.has_snapshot ? (bd.fresh ? "fresh_rest" : "anchor_cache") : "none",
+                          obs.present ? static_cast<long long>(obs.open_count) : -1LL,
                           report_path);
     }
 }

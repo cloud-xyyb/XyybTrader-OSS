@@ -8,6 +8,7 @@
 #include "xt_engine/hft/XtHftEngine.h"
 #include "xt_live/telemetry/recording/XtLiveRecorder.h"
 #include "xt_metrics/XtVenueLabel.h"
+#include "xt_risk/config/XtRiskCfg.h"
 #include "XtFixedPoint.h"
 #include "XtMetricRegistry.h"
 #include "XtLiveConfig.h"
@@ -39,7 +40,9 @@ class XtHftFeeObserver final : public xt_runtime::IHftEngineObserver {
 public:
     explicit XtHftFeeObserver(ct::metrics::XtStrategyPnlAggregator* a)
         : aggr_(a) {}
-    void on_trade(const XtTradeRecord& tr) override {
+    void on_trade(const XtTradeRecord& tr, XtLatencyEligibility   = XtLatencyEligibility::kEligible,
+                  uint64_t   = 0) override {
+
         if (aggr_) {
             aggr_->on_fill(tr.strategy_id, tr.code, tr.fee);
         }
@@ -51,22 +54,34 @@ private:
 
 }
 
-void wire_hft_telemetry(
+bool wire_hft_telemetry(
     std::unique_ptr<ct::metrics::XtStrategyPnlAggregator>& aggr_slot,
     std::unique_ptr<ct::metrics::XtStrategyPnlBaseline>& baseline_slot,
     std::unique_ptr<xt_runtime::IHftEngineObserver>& fee_observer_slot,
-    XtHftEngine& engine,
+    XtHftEngine::Hooks& hooks,
     const XtLiveConfig& cfg) {
 
     aggr_slot = std::make_unique<ct::metrics::XtStrategyPnlAggregator>();
 
     {
+        using LR = ct::metrics::XtStrategyPnlAggregator::LoadResult;
         const std::string aggr_path = aggregator_state_path(cfg);
-        const bool loaded_aggr = aggr_slot->load_state(aggr_path);
-        if (loaded_aggr) {
+        const LR res = aggr_slot->load_state(aggr_path);
+        if (res == LR::kLoaded) {
             XtLogger::info_m("control", "PNL aggregator state reloaded from {}", aggr_path);
-        } else {
+        } else if (res == LR::kMissing) {
             XtLogger::info_m("control", "PNL aggregator first-init (no prior state at {})", aggr_path);
+        } else {
+
+            if (has_active_per_strategy_daily_loss(cfg.bootstrap.order_gateway_cfg.risk)) {
+                XtLogger::error_m("control",
+                    "PNL aggregator state corrupt and per-strategy daily-loss enabled: "
+                    "refusing to start with corrupt risk input (path={})", aggr_path);
+                return false;
+            }
+            XtLogger::warn_m("control",
+                "PNL aggregator state corrupt (quarantined), no per-strategy daily-loss "
+                "configured: cold-starting from empty state (path={})", aggr_path);
         }
     }
 
@@ -144,7 +159,7 @@ void wire_hft_telemetry(
     }
     {
         fee_observer_slot = std::make_unique<XtHftFeeObserver>(aggr_slot.get());
-        engine.add_observer(fee_observer_slot.get());
+        hooks.observers.push_back(fee_observer_slot.get());
     }
 
     {
@@ -183,15 +198,15 @@ void wire_hft_telemetry(
                 reg.set_strategy_position_qty_fp(
                     venue_label, account_label, sid, sid, code ? code : "", qty_fp);
             };
-        engine.init_lifecycle_telemetry(std::move(init));
+        hooks.lifecycle = std::move(init);
     }
 
     {
         ct::metrics::XtStrategyPnlAggregator* aggr_raw = aggr_slot.get();
-        engine.set_fill_realized_callback(
+        hooks.fill_realized =
             [aggr_raw](const std::string& sid, const std::string& code, int64_t realized_fp) {
                 if (aggr_raw) aggr_raw->on_close(sid, code, realized_fp);
-            });
+            };
     }
 
     if (cfg.parsed.td_provider == "ctp") {
@@ -200,12 +215,13 @@ void wire_hft_telemetry(
         const std::string account_label = cfg.runtime.control_cfg.account_label.empty()
             ? "_default"
             : cfg.runtime.control_cfg.account_label;
-        engine.set_cash_reanchor_probe(
+        hooks.cash_reanchor =
             [venue_label, account_label](int64_t divergence_fp) {
                 ct::metrics::XtMetricRegistry::instance().observe_cash_reanchor(
                     venue_label, account_label, xt_fp::from_fp(divergence_fp));
-            });
+            };
     }
+    return true;
 }
 
 void save_hft_telemetry(const ct::metrics::XtStrategyPnlAggregator* aggr,

@@ -15,7 +15,7 @@ void apply_event(AccountState& account, const XtAccountEvent& ev) {
         return;
 
     case T::SessionBegin:
-        account.on_session_begin(ev.trading_date);
+        account.on_session_begin();
         return;
 
     case T::Reset:
@@ -51,17 +51,7 @@ void apply_event(AccountState& account, const XtAccountEvent& ev) {
     case T::OrderExecUpdate:
         account.on_order_update(ev.order_id,
                                 ev.payload.order_state.filled,
-                                ev.payload.order_state.remaining,
                                 ev.payload.order_state.is_final);
-        return;
-
-    case T::OrderFilled:
-    case T::OrderCanceled:
-    case T::OrderRejected:
-        account.on_order_update(ev.order_id,
-                                ev.payload.order_state.filled,
-                                ev.payload.order_state.remaining,
-                                 true);
         return;
 
     case T::DailySettlement:

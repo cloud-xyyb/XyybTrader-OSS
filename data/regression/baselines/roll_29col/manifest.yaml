@@ -48,8 +48,8 @@ inputs:
 golden:
   output: fills.csv
   expected: data/regression/baselines/roll_29col/expected_fills.csv
-  sha256: 5bd3900e57cbd1f0a909eff88a10e578a1f8575063f48a5eeb79c77699773240
-  bytes: 1044601
-  lines: 5739
+  sha256: 238a5ce4e5ef8f2ed716781ad3bb01deafd585414de1f7bc2ccfce8366f74816
+  bytes: 700924
+  lines: 3851
   tolerance: bit-exact
 driver: bash scripts/run_baselines.sh roll_29col

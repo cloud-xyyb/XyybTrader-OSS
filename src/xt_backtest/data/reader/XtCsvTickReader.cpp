@@ -3,6 +3,7 @@
 #include "XtLogger.h"
 #include "xt_util/string/XtStringUtil.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -21,6 +22,7 @@ bool XtCsvTickReader::init() {
         }
     }
     if (!has_readable) return false;
+    src_days_.assign(opts_.paths.size(), {});
     init_done_ = true;
     multi_ = opts_.paths.size() > 1;
     return true;
@@ -34,8 +36,19 @@ void XtCsvTickReader::reset() {
     seq_ = 0;
     last_single_key_ = 0;
     out_of_order_count_ = 0;
+    read_stats_ = ReadStats{};
+    src_days_.clear();
     init_done_ = false;
     io_error_ = false;
+}
+
+void XtCsvTickReader::note_source_day_(size_t path_idx, uint32_t trading_date) {
+    if (path_idx >= src_days_.size()) return;
+    auto& days = src_days_[path_idx];
+    if (!days.empty() && days.back() == trading_date) return;
+    const auto it = std::lower_bound(days.begin(), days.end(), trading_date);
+    if (it != days.end() && *it == trading_date) return;
+    days.insert(it, trading_date);
 }
 
 void XtCsvTickReader::note_key_regression_(const char* path_hint,
@@ -72,6 +85,7 @@ bool XtCsvTickReader::next_single(XtRawTick& out) {
     if (key < last_single_key_)
         note_key_regression_(opts_.paths.front().c_str(), last_single_key_, key);
     last_single_key_ = key;
+    note_source_day_(0, out.trading_date);
     return true;
 }
 
@@ -83,6 +97,8 @@ bool XtCsvTickReader::next_multi(XtRawTick& out) {
     if (node.reader_idx >= readers_.size()) return false;
     Reader& r = readers_[node.reader_idx];
     out = r.tick;
+
+    note_source_day_(r.path_idx, out.trading_date);
     if (read_next_tick(r)) {
         Node next;
         next.reader_idx = node.reader_idx;
@@ -96,8 +112,10 @@ bool XtCsvTickReader::next_multi(XtRawTick& out) {
 bool XtCsvTickReader::init_readers() {
     if (!readers_.empty() || opts_.paths.empty()) return !readers_.empty();
 
-    for (const auto& path : opts_.paths) {
+    for (size_t i = 0; i < opts_.paths.size(); ++i) {
+        const std::string& path = opts_.paths[i];
         Reader r;
+        r.path_idx = i;
         r.in = std::make_unique<std::ifstream>(path);
         if (!r.in->is_open()) {
             XtLogger::warn_m("MD", "init_readers: failed to open {} (errno={})", path, strerror(errno));
@@ -154,6 +172,8 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
                     spec.idx_instrument     = 0;
                     spec.idx_trading_day    = 1;
                     spec.idx_update_time_ms = 2;
+
+                    spec.idx_update_time    = 2;
                     spec.idx_turnover       = 3;
                     spec.idx_volume         = 4;
                     spec.idx_last_price     = 5;
@@ -179,9 +199,15 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
             }
             spec.inited = true;
         }
-        if (parse_tick_csv_line(line, spec, out, key, opts_.symbol_filter, opts_.qty_base, opts_.volume_mode)) {
+
+        ++read_stats_.lines_read;
+        TickParseDrop reason = TickParseDrop::None;
+        if (parse_tick_csv_line(line, spec, out, key, opts_.symbol_filter,
+                                opts_.qty_base, opts_.volume_mode, &reason)) {
             return true;
         }
+        if (reason == TickParseDrop::SymbolMiss) ++read_stats_.symbol;
+        else                                     ++read_stats_.bad_row;
     }
     return false;
 }
