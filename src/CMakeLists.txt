@@ -95,16 +95,16 @@ if(CLOUDTRADER_ENABLE_UBSAN)
     endif()
 endif()
 
-# ── binance_testnet plan Part 3a: 第三方库集成 ────────────────────────
-# Boost.Beast (WS/HTTP header-only) + libcurl (REST) + nlohmann/json + OpenSSL
-# 见 .claude/plans/binance_testnet.md D6（用户决定：Boost.Beast 工业化标准）。
+# ── 网络/序列化第三方库 ────────────────────────────────────
+# Boost.Beast = WS/HTTP（header-only）；libcurl = REST；nlohmann/json = JSON；
+# OpenSSL = TLS。
 include(FetchContent)
 
 # Boost.Beast 及其依赖：系统包（Ubuntu 24.04 libboost-dev 1.83 自带 Beast）。
 # 仅显式 link Boost::boost (header meta) + Boost::system（Asio/Beast 运行时依赖）。
 find_package(Boost 1.74 REQUIRED COMPONENTS system)
 
-# nlohmann/json：vendored 到 third_party/（与 pybind11 / spdlog / yaml-cpp 同模式）。
+# nlohmann/json：vendored 到 third_party/（与 spdlog / yaml-cpp 同模式）。
 # WSL 内 github HTTPS 不通，Windows 端 git clone v3.11.3 一次性入仓。
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")
@@ -186,7 +186,7 @@ endif()
 add_library(xt_arrow_parquet INTERFACE)
 target_link_libraries(xt_arrow_parquet INTERFACE ${XT_ARROW_TARGET} ${XT_PARQUET_TARGET})
 # 共享 parquet 读取 helper（read_parquet_table / col_array / typed accessor），
-# 消除 datalake + xt_backtest/data 三处逐字重复。下游 link xt_arrow_parquet 即获得。
+# 下游 link xt_arrow_parquet 即获得（datalake 与 backtest 读路径共用同一份实现）。
 # 该 helper 不放 xt_util：它 include Arrow / Parquet headers，必须随本 target 的
 # 外部依赖边界传播，避免通用工具库被 Arrow 污染。
 target_include_directories(xt_arrow_parquet INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/xt_arrow)
@@ -262,7 +262,7 @@ add_subdirectory(xt_account)
 add_subdirectory(xt_engine)
 add_subdirectory(xt_live/telemetry)
 # 参数底座小 lib (零业务依赖 leaf): frame-loop 读 + panel 写共用,
-# 必须先于 execution/cta/hft/sel/panel — 见 .claude/plans/xt_panel_lib_extraction
+# 必须先于 execution/cta/hft/sel/panel（这些目录的 target 都 link 它）。
 add_subdirectory(xt_live/paramdomain)
 # live config 四 TU + 公共装配基础设施 lib（TU 单一所有权）。
 # config 先于 common（common link config）。

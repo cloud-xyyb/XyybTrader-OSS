@@ -562,8 +562,7 @@ static bool assemble_engine_and_contexts_(HftEngineRuntime& st, const XtLiveConf
         XtLogger::warn_m("RT",
             "multi-strategy ({} strategies) on shared instrument: NET position "
             "fan-out may cause internal counter drift if same-symbol opposite "
-            "direction. Use different symbols per strategy. "
-            "See docs/architecture/hft_multi_strategy.md.", n);
+            "direction. Use different symbols per strategy.", n);
     }
 
     auto contexts = build_multi_contexts_(st, cfg);

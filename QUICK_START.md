@@ -93,8 +93,8 @@ bash scripts/regression_test.sh
 
 ## 2. 启动 Backtest Viewer
 
-1. 从本仓 GitHub Releases 下载对应平台的 zip（旁边的 `.sha256` 可选校验：
-   `sha256sum -c <zip名>.sha256`），解压后是扁平布局：
+1. 从本仓 GitHub Releases 下载对应平台的 zip（旁边的 `.sha256` 可选校验：Linux
+   `sha256sum -c <zip名>.sha256`，macOS `shasum -a 256 -c <zip名>.sha256`），解压后是扁平布局：
 
    ```
    xt-viewer               回测查看器（UI + 后端全内嵌，单文件；Windows 后补版为 xt-viewer.exe）

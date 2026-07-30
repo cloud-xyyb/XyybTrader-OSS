@@ -23,8 +23,8 @@
 /// 条目按 symbol 记（不分 sid）——盲窗内 sibling sid 的 force-exit 一并推迟
 /// 到下帧（latch Keep 重试），保守方向。
 ///
-/// 已接受残留（不做更重的收敛闸——那会在丢失一条回报时永久卡死平仓，
-/// 正是 T1.153 病灶的反面姿态）：重复 submit 速率受 hold 限制；存在 retry
+/// 已接受残留（不做更重的收敛闸——那会在丢失一条回报时永久卡死平仓）：
+/// 重复 submit 速率受 hold 限制；存在 retry
 /// driver（PanelForceExitLatch / PerSidLiquidator）时由其续帧收敛到 flat，
 /// 直接 RPC 的 ForceClosed 不 arm latch、latch 亦可 TTL Expired——此类情形
 /// 由 operator/驱动方后续触发兜底（Close-only 语义下无翻仓风险）：
