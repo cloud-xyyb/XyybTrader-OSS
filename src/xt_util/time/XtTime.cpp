@@ -2,12 +2,17 @@
 
 #include <ctime>
 
+/// civil-days 与 epoch days 换算，使用 Howard Hinnant 纯整型公式。
+/// 约定 epoch = 1970-01-01 本地 00:00:00，不做时区换算。
+
 namespace {
+
+// days_from_civil / civil_from_days 的单源在 XtTime.h（xt_time namespace）。
 
 constexpr int64_t kNsPerSec = 1'000'000'000LL;
 constexpr int64_t kSecPerDay = 86400LL;
 
-}
+}  // namespace
 
 namespace xt_time {
 
@@ -40,7 +45,7 @@ int64_t to_ns(uint32_t date, uint32_t time_ms) noexcept {
 }
 
 void from_ns(int64_t ns, uint32_t& out_date, uint32_t& out_time_ms) noexcept {
-
+    // floor 除法: 负 ns 时保证 (days, tod) 归一到 [0, 86400s)
     int64_t total_secs = ns / kNsPerSec;
     int64_t sub_sec_ns = ns - total_secs * kNsPerSec;
     if (sub_sec_ns < 0) { sub_sec_ns += kNsPerSec; --total_secs; }
@@ -108,4 +113,4 @@ uint32_t local_yyyymmdd_now() noexcept {
     return local_date_hhmm_now().yyyymmdd;
 }
 
-}
+}  // namespace xt_time

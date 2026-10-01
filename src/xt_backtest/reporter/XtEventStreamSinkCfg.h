@@ -11,9 +11,10 @@
 struct XtEventStreamSinkCfg {
     enum class TraceMode { Off, Full };
 
-    TraceMode     trace_mode                 = TraceMode::Off;
+    TraceMode     trace_mode                 = TraceMode::Off;  ///< Off 不记录；非法 YAML 值由配置 schema 拦截。
     bool          export_tick                = false;
-
+    // 输出目录不在 cfg 里：yaml backtest.report_dir 由 XtReportCfg 单点解析，
+    // runner resolve 后经 XtEventStreamSink 构造参数传入（单一 truth，免双写同步）。
     std::size_t   full_max_rows              = 2000000;
     std::uint64_t full_max_bytes             = 512ULL * 1024ULL * 1024ULL;
     std::size_t   sys_stats_sample_n_ticks   = 100;
@@ -25,4 +26,5 @@ struct XtEventStreamSinkCfg {
 
 namespace YAML { class Node; }
 
+/// @brief 从 YAML 根节点解析 event stream sink 配置。
 XtEventStreamSinkCfg parse_event_stream_sink_config(const YAML::Node& node);

@@ -36,11 +36,11 @@ void HftLifecycleTelemetry::on_fill(const XtTradeRecord& tr, const std::string& 
 void HftLifecycleTelemetry::emit_lifecycle_(const XtTradeRecord& tr,
                                             int64_t qty_before_fp, int64_t avg_before_fp,
                                             int64_t qty_after_fp,  int64_t avg_after_fp) {
-
-    const uint64_t ts_local_ns = tr.local_strategy_us * 1000ULL;
-    const uint64_t ts_exch_ns  = tr.fill_ts_us * 1000ULL;
-
-    const uint64_t wall_ms     = tr.fill_ts_us / 1000ULL;
+    // 事件同时携带 steady clock 和 exchange/replay wall clock。
+    const uint64_t ts_local_ns = tr.local_strategy_us * 1000ULL;  // steady, set at on_trade entry
+    const uint64_t ts_exch_ns  = tr.fill_ts_us * 1000ULL;          // wall, exchange μs → ns
+    // hold duration 使用成交 wall time；同一秒内开平允许为 0。
+    const uint64_t wall_ms     = tr.fill_ts_us / 1000ULL;          // exchange/replay ms (open_ts_map_ key)
 
     std::string key;
     key.reserve(tr.strategy_id.size() + 1 + tr.code.size());
@@ -48,6 +48,12 @@ void HftLifecycleTelemetry::emit_lifecycle_(const XtTradeRecord& tr,
     key.push_back('|');
     key.append(tr.code);
 
+    // close 边界 realized 直取 engine 已算的权威 per-fill realized（tr.realized_pnl_fp，
+    // read-delta：含 vol_scale + reducer int128 安全），始终是触发本 lifecycle 事件那笔
+    // fill 的权威 realized。单边持仓下 close 事件由"全平 qty_before 的 fill"触发，该值即
+    // 本次平仓 realized；锁仓(双边)书 net-based 边界分类与单笔 realized 非严格一一对应
+    // （一腿全平可能不跨 net-零），故此处仅作 hold-duration analytics 的近似，**权威
+    // per-fill PnL 单源是 aggregator（set_fill_realized_callback，每笔无条件）非本字段**。
     auto fire = [&](const char* event_type, int64_t qty_fp, int64_t avg_fp,
                     int64_t realized_fp, uint64_t hold_ms) {
         PositionLifecycleEvent ev;
@@ -73,7 +79,7 @@ void HftLifecycleTelemetry::emit_lifecycle_(const XtTradeRecord& tr,
     if (was_zero && !is_zero) {
         open_ts_map_[key] = wall_ms;
         map_mutated = true;
-        fire("open", qty_after_fp, avg_after_fp,  0,  0);
+        fire("open", qty_after_fp, avg_after_fp, /*realized_fp=*/0, /*hold_ms=*/0);
     } else if (!was_zero && is_zero) {
         uint64_t hold_ms = 0;
         auto it = open_ts_map_.find(key);
@@ -82,23 +88,23 @@ void HftLifecycleTelemetry::emit_lifecycle_(const XtTradeRecord& tr,
             open_ts_map_.erase(it);
             map_mutated = true;
         }
-        const int64_t realized_fp = tr.realized_pnl_fp;
+        const int64_t realized_fp = tr.realized_pnl_fp;  // 权威 per-fill realized（read-delta）
         fire("close", qty_before_fp, avg_before_fp, realized_fp, hold_ms);
     } else if (sign_flip) {
-
+        // 反手穿零按 close + open 两个 lifecycle 边界输出。
         uint64_t hold_ms = 0;
         auto it = open_ts_map_.find(key);
         if (it != open_ts_map_.end()) {
             hold_ms = (wall_ms >= it->second) ? (wall_ms - it->second) : 0;
             open_ts_map_.erase(it);
         }
-        const int64_t realized_fp = tr.realized_pnl_fp;
+        const int64_t realized_fp = tr.realized_pnl_fp;  // 权威 per-fill realized（read-delta）
         fire("close", qty_before_fp, avg_before_fp, realized_fp, hold_ms);
         open_ts_map_[key] = wall_ms;
         map_mutated = true;
-        fire("open", qty_after_fp, avg_after_fp,  0,  0);
+        fire("open", qty_after_fp, avg_after_fp, /*realized_fp=*/0, /*hold_ms=*/0);
     }
-
+    // 同向 add/reduce 不跨零，不发 lifecycle 事件。
     if (map_mutated) {
         save_();
     }
@@ -106,7 +112,7 @@ void HftLifecycleTelemetry::emit_lifecycle_(const XtTradeRecord& tr,
 
 void HftLifecycleTelemetry::on_resume(const std::vector<ResumeEntry>& entries) {
     if (!emit_cb_) return;
-
+    // PositionSnapshot 无 exchange ts；RESUME 使用 snapshot 到达时刻。
     const uint64_t now_ns_local = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -121,6 +127,7 @@ void HftLifecycleTelemetry::on_resume(const std::vector<ResumeEntry>& entries) {
         key.append(e.sid).push_back('|');
         key.append(e.code);
 
+        // 缺失持久化 open_ts 时，从 snapshot 到达时刻重新计时。
         uint64_t prior_open_ms = now_ms_wall;
         uint64_t hold_ms = 0;
         auto it = open_ts_map_.find(key);
@@ -150,12 +157,13 @@ void HftLifecycleTelemetry::on_resume(const std::vector<ResumeEntry>& entries) {
         }
     }
 
+    // 为缺失 open_ts 的继承持仓补 entry 后落盘。
     save_();
 }
 
 void HftLifecycleTelemetry::save_() const {
     if (state_path_.empty()) return;
-
+    // 持久化格式固定为 {"<sid>|<code>":open_ms,...}；key 不含 quote/backslash。
     std::ostringstream os;
     os << "{";
     bool first = true;
@@ -175,7 +183,7 @@ void HftLifecycleTelemetry::load_() {
     std::stringstream buf;
     buf << ifs.rdbuf();
     const std::string content = buf.str();
-
+    // 仅接受 save_() 写出的扁平对象；解析失败按空状态处理。
     std::size_t i = content.find('{');
     if (i == std::string::npos) return;
     ++i;
@@ -202,4 +210,4 @@ void HftLifecycleTelemetry::load_() {
     }
 }
 
-}
+}  // namespace xt_engine::hft

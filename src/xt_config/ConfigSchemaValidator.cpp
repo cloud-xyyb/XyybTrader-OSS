@@ -12,6 +12,9 @@ namespace {
 
 using Segments = std::vector<std::string>;
 
+// 路径模式字符串 → segment 列表（先按 '.' 切分，每段内再按 "[]" 切分）。
+// "[]" 作为独立 segment 保留，供 pattern 匹配时识别 sequence 层。
+// 示例："runtime.windows[].key" → ["runtime", "windows", "[]", "key"]
 Segments parse_path_segments(const std::string& path) {
     Segments out;
     if (path.empty()) return out;
@@ -23,6 +26,7 @@ Segments parse_path_segments(const std::string& path) {
                                       ? path.substr(start)
                                       : path.substr(start, dot - start);
 
+        // 在 dot-token 内切出所有 "[]" 标记，将其与两侧 key 片段分离
         std::size_t pos = 0;
         while (true) {
             const std::size_t br = token.find("[]", pos);
@@ -41,12 +45,18 @@ Segments parse_path_segments(const std::string& path) {
     return out;
 }
 
+// segment 级匹配：
+//   "*"  → 任意 map key（不匹配 "[]"；"*" 不跨越 sequence 层）
+//   "[]" → 仅匹配 "[]"（sequence 层标记）
+//   其他 → 精确匹配
 bool segment_match(const std::string& pattern_seg, const std::string& actual_seg) {
     if (pattern_seg == "*")  return actual_seg != "[]";
     if (pattern_seg == "[]") return actual_seg == "[]";
     return pattern_seg == actual_seg;
 }
 
+// DFS 遍历时叶子到达前只有 partial path 可用。
+// 若 pattern 足够长且已走各段均与 pattern 吻合，则该 path 仍可能命中此 pattern。
 bool pattern_can_reach(const Segments& pattern, const Segments& path) {
     if (pattern.size() < path.size()) return false;
     for (std::size_t i = 0; i < path.size(); ++i) {
@@ -55,6 +65,7 @@ bool pattern_can_reach(const Segments& pattern, const Segments& path) {
     return true;
 }
 
+// path 是否处于 prefix 子树内（prefix 是 path 的完整前缀）。
 bool is_prefix_of(const Segments& prefix, const Segments& path) {
     if (prefix.size() > path.size()) return false;
     for (std::size_t i = 0; i < prefix.size(); ++i) {
@@ -63,6 +74,10 @@ bool is_prefix_of(const Segments& prefix, const Segments& path) {
     return true;
 }
 
+// match_path 所指节点允许通过 schema 校验的两种路径：
+//   open_prefix 命中     → 当前节点及其子树放行（用于策略自定义参数等动态键）；
+//   allowed_pattern 覆盖 → 当前节点合规，子节点仍需各自命中规则或 open_prefix。
+// 子树放行依赖递归时持续扩展 match_path，因此 is_prefix_of 必须按完整前缀判断。
 bool is_path_allowed(const Segments&              match_path,
                       const std::vector<Segments>& allowed_patterns,
                       const std::vector<Segments>& open_prefixes) {
@@ -75,6 +90,7 @@ bool is_path_allowed(const Segments&              match_path,
     return false;
 }
 
+// 为错误消息拼接来源前缀，格式 "{prefix}: {msg}"（冷路径，仅在发现 unknown key 时调用）。
 std::string with_error_prefix(const std::string& msg, const char* prefix) {
     if (!prefix || prefix[0] == '\0') return msg;
     return std::string(prefix) + ": " + msg;
@@ -87,6 +103,8 @@ std::string to_lower_ascii(std::string s) {
     return s;
 }
 
+// yaml-cpp Node 赋值会共享底层 NodeData；路径游标必须从 Clone(root) 开始，
+// 否则逐段下钻时可能改写调用方持有的 root。
 YAML::Node find_path_node(const YAML::Node& root, const std::string& path) {
     YAML::Node cur = YAML::Clone(root);
     for (const auto& seg : parse_path_segments(path)) {
@@ -131,6 +149,11 @@ std::string yaml_type_name(const YAML::Node& node) {
     return "unknown";
 }
 
+// DFS 校验 YAML 节点树中的所有 map key，unknown key 追加到 errors。
+//
+// match_path   递归共享的路径栈，持续反映所处节点位置，入口传空；
+//              sequence 层使用 "[]"，map key 层使用实际 key。
+// display_path 人类可读路径字符串，仅用于错误消息，不参与 pattern 匹配。
 void validate_node(const YAML::Node&             node,
                    const std::vector<Segments>&  allowed_patterns,
                    const std::vector<Segments>&  open_prefixes,
@@ -141,7 +164,7 @@ void validate_node(const YAML::Node&             node,
     if (!node || node.IsNull()) return;
 
     if (node.IsSequence()) {
-
+        // 所有 item 共享同一 "[]" segment，push/pop 置于循环外
         match_path.push_back("[]");
         for (std::size_t i = 0; i < node.size(); ++i) {
             const std::string child_display = display_path + "[" + std::to_string(i) + "]";
@@ -178,7 +201,7 @@ void validate_node(const YAML::Node&             node,
     }
 }
 
-}
+}  // namespace
 
 void validate_unknown_config_keys(const YAML::Node&          root,
                                   const XtConfigSchemaRules& rules,

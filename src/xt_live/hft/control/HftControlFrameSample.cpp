@@ -1,3 +1,9 @@
+// ── 控制环采样与推进 stage ──────────────────────────────────────────────
+//
+// 每控制帧一次：先推进 risk frame / gateway health check 副作用
+//（advance_frame_side_effects），再构建只读 ControlSnapshot（事件循环 / 网关 /
+// 账户 / 风控 / 延迟 + 诊断队列 drain）。跨 TU 入口只有 collect_loop_frame，
+// 由 HftRunnerControl::run() 每帧调用。
 
 #include "xt_live/hft/control/HftControlStages.h"
 
@@ -12,9 +18,9 @@
 #include "state/AccountStateStore.h"
 #include "xt_account/api/AccountSnapshot.h"
 #include "XtFixedPoint.h"
-#include "xt_core/order/XtOrderTypes.h"
-#include "xt_identity/StrategySidRegistry.h"
-#include "xt_live/control/AdvanceRiskFrame.h"
+#include "xt_core/order/XtOrderTypes.h"  // XtOrderExecUpdate
+#include "xt_identity/StrategySidRegistry.h"    // integrity check 尺寸源（global registry）
+#include "xt_live/control/AdvanceRiskFrame.h"   // 每帧风控维护（三引擎共享实现）
 #include "xt_live/hft/runtime/XtHftEventLoop.h"
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
 #include "xt_util/time/XtSteadyClock.h"
@@ -22,6 +28,9 @@
 namespace xt_live::control::detail {
 namespace {
 
+// ---------------------------------------------------------------------------
+// ConsistencyReport：跨域一致性检查
+// ---------------------------------------------------------------------------
 ConsistencyReport build_consistency_report(const XtHftRunnerControlContext& ctx) {
     ConsistencyReport out;
     if (!ctx.order_book || !ctx.account_store) {
@@ -30,7 +39,8 @@ ConsistencyReport build_consistency_report(const XtHftRunnerControlContext& ctx)
     out.open_order_count   = ctx.order_book->open_order_count();
     out.tracked_code_count = ctx.order_book->tracked_code_count();
     account_audit::XtFrozenAuditReport audit;
-
+    // 1Hz frame loop 与 worker 并发：必须走 snapshot 版审计（同帧自洽对）；
+    // 直读版 frozen_audit_report 迭代 worker 拥有的 order_slots_，并发调用是 UB race。
     ctx.account_store->frozen_audit_from_snapshot(audit);
     out.ok                    = audit.ok;
     out.frozen_cash           = audit.frozen_cash;
@@ -39,6 +49,8 @@ ConsistencyReport build_consistency_report(const XtHftRunnerControlContext& ctx)
     return out;
 }
 
+
+// steady clock 用于控制环节拍计时——不受 NTP 跳变影响
 int64_t now_ms_steady() {
     return XtSteadyClock::steady_now_ms();
 }
@@ -47,7 +59,7 @@ ControlParamSnapshot read_control_params(const XtRunnerControlConfig& cfg,
                                          const XtHftRunnerControlContext& ctx) {
     ControlParamSnapshot out;
     out.log_stats_enabled = cfg.log_stats;
-    out.strategy_metrics_flush_sec = std::max(1, cfg.strategy_metrics_flush_sec);
+    out.strategy_metrics_flush_sec = std::max(1, cfg.strategy_metrics_flush_sec);  // 下限 1s 防除零
     if (ctx.latency_tracker) {
         out.latency_enabled = ctx.latency_tracker->enabled();
         out.latency_stale_ttl_us = ctx.latency_tracker->stale_ttl_us();
@@ -87,6 +99,14 @@ void apply_control_params(const ControlParamSnapshot& params,
     }
 }
 
+// 显式副作用推进（每帧一次，采样前调用）：
+// 1. 用账户权益推进 active risk frame（session_begin dedup + annual-loss arm +
+//    on_frame + 10 帧周期 integrity check）；
+// 2. 触发 MD/TD gateway health check，由 gateway 自治 reconnect/retry。
+// 实现单源在 xt_live::control::advance_risk_frame（三引擎共享）；本函数只做
+// HFT ctx → 窄依赖 struct 的映射。integrity 节拍随 ControlLoopState 生命周期。
+// risk 推进与随后的采样各取一次 snapshot_account()，两快照间 worker 可能 publish
+// 新状态 —— µs 级观测口径 skew，无决策路径比较两值。
 void advance_frame_side_effects(XtHftRunnerControlContext& ctx,
                                 const std::string& venue_label,
                                 ControlLoopState& st) {
@@ -99,9 +119,17 @@ void advance_frame_side_effects(XtHftRunnerControlContext& ctx,
     deps.md            = ctx.md_gateway;
     deps.td            = ctx.td_gateway;
     deps.venue_label   = venue_label;
+    deps.post_publish_request = ctx.post_account_publish_request;
+    deps.shutdown_flag = ctx.shutdown_flag;
     xt_live::control::advance_risk_frame(deps, st.risk_frame);
 }
 
+// 单帧 control snapshot 采样（只读观测 + 诊断队列 drain）：
+// 1. 采样 event-loop / gateway / account / risk / latency 观测值；
+// 2. drain 订单/成交诊断 SPSC 队列，事件只报告一次（consume-once 采样，
+//    不改变 runtime 决策状态）。
+// risk frame 推进 / health check 等副作用在 advance_frame_side_effects，本函数
+// 不再隐藏写路径。relaxed 读只服务观测口径；时间戳一致性字段单独用 acquire。
 ControlSnapshot sample_control_snapshot(const XtHftRunnerControlContext& ctx,
                                         const ControlParamSnapshot& params,
                                         ITradeGateway* td) {
@@ -127,7 +155,7 @@ ControlSnapshot sample_control_snapshot(const XtHftRunnerControlContext& ctx,
         out.equity     = xt_fp::from_fp(m.equity);
         out.unrealized = xt_fp::from_fp(m.unrealized_pnl);
     }
-
+    // relaxed counters 只用于监控统计，精确到轮次即可。
     out.md_in = ctx.runtime_shared_state.md_in_cnt.load(std::memory_order_relaxed);
     out.enq = ctx.runtime_shared_state.enq_cnt.load(std::memory_order_relaxed);
     out.proc = ctx.runtime_shared_state.tick_proc_cnt.load(std::memory_order_relaxed);
@@ -138,13 +166,14 @@ ControlSnapshot sample_control_snapshot(const XtHftRunnerControlContext& ctx,
     out.ready = ctx.runtime_shared_state.trading_ready.load(std::memory_order_relaxed);
     out.md_ready = ctx.runtime_shared_state.md_ready.load(std::memory_order_relaxed);
     out.td_ready = ctx.runtime_shared_state.td_ready.load(std::memory_order_relaxed);
-
+    // last_tick 时间戳需要 acquire：heartbeat 日志依赖 date/time 的一致性，
+    // 如果两者被撕裂（date 新、time 旧），输出的时间戳会误导运维判断。
     out.last_tick_date = ctx.runtime_shared_state.last_tick_date.load(std::memory_order_acquire);
     out.last_tick_time = ctx.runtime_shared_state.last_tick_time.load(std::memory_order_acquire);
     out.param_ver = params.param_ver;
     out.param_count = params.param_count;
     out.log_stats_enabled = params.log_stats_enabled;
-
+    // SPSC 诊断队列在这里 drain；每条 order update / trade 只报告一次。
     if (ctx.order_update_drain_q) {
         XtOrderExecUpdate upd;
         while (ctx.order_update_drain_q->pop(upd))
@@ -158,7 +187,7 @@ ControlSnapshot sample_control_snapshot(const XtHftRunnerControlContext& ctx,
     return out;
 }
 
-}
+} // namespace
 
 LoopFrame collect_loop_frame(const XtRunnerControlConfig& cfg,
                              XtHftRunnerControlContext& ctx,
@@ -173,4 +202,4 @@ LoopFrame collect_loop_frame(const XtRunnerControlConfig& cfg,
     return out;
 }
 
-}
+}  // namespace xt_live::control::detail

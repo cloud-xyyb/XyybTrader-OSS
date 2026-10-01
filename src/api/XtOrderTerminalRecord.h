@@ -16,6 +16,6 @@
 ///
 /// 按值出参（不含内部引用），跨 gateway 锁边界安全。
 struct XtOrderTerminalRecord {
-    XtOrderStatus status = XtOrderStatus::Canceled;
-    int64_t filled_fp = -1;
+    XtOrderStatus status = XtOrderStatus::Canceled;  ///< 终态；仅终态值合法
+    int64_t filled_fp = -1;  ///< 终态时刻累计成交量（fp）；<0 = 不可得
 };

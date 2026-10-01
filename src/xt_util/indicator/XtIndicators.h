@@ -36,14 +36,14 @@ struct XtIndicatorRingBuf {
             head_ = (head_ + 1) % data_.size();
         }
     }
-
+    /// @return 按 oldest -> newest 顺序读取窗口内第 i 个样本；不做边界检查。
     double operator[](size_t i) const { return data_[(head_ + i) % data_.size()]; }
     double newest() const { assert(sz_ > 0); return (*this)[sz_ - 1]; }
     double oldest() const { assert(sz_ > 0); return (*this)[0]; }
 
 private:
-    std::vector<double> data_;
-    size_t head_ = 0, sz_ = 0;
+    std::vector<double> data_;  ///< 预分配存储（pre-allocated storage）。
+    size_t head_ = 0, sz_ = 0;  ///< head_ 指向 oldest，sz_ 为有效元素数。
 };
 
 // SMA（简单移动平均）
@@ -67,7 +67,7 @@ public:
 private:
     int period_;
     XtIndicatorRingBuf buf_;
-    double sum_ = 0.0;
+    double sum_ = 0.0;  ///< 当前窗口内累加和（running sum）。
 };
 
 // EMA（指数移动平均）
@@ -93,9 +93,9 @@ public:
 
 private:
     int period_;
-    double k_;
-    double ema_ = 0.0;
-    int cnt_ = 0;
+    double k_;          ///< 平滑因子（smoothing factor），等于 2 / (period + 1)。
+    double ema_ = 0.0;  ///< 当前 EMA 观测值。
+    int cnt_ = 0;       ///< 已输入样本数（warm-up 计数）。
 };
 
 // ATR（真实波幅均值）
@@ -107,6 +107,9 @@ class CtATR {
 public:
     explicit CtATR(int period = 14) : period_(period) {}
 
+    /// @param high 当前 bar 最高价。
+    /// @param low 当前 bar 最低价。
+    /// @param prev_close 前一根 bar 收盘价；第一根 bar 的取值由调用方策略约定。
     void push(double high, double low, double prev_close) {
         const double tr = std::max({high - low,
                                     std::abs(high - prev_close),
@@ -126,9 +129,9 @@ public:
 
 private:
     int period_;
-    int cnt_ = 0;
-    double sum_tr_ = 0.0;
-    double atr_ = 0.0;
+    int cnt_ = 0;          ///< 已输入 bar 数（warm-up 计数）。
+    double sum_tr_ = 0.0;  ///< seed 阶段 TR 累加和。
+    double atr_ = 0.0;     ///< 当前 ATR 观测值。
 };
 
 // ADX（平均趋向指数）
@@ -152,7 +155,7 @@ public:
                                         std::abs(low  - prev_close_)});
 
             if (count_ <= period_) {
-
+                // Wilder seed 要先累积 period 个 +DM/-DM/TR，再进入递推平滑。
                 sum_plus_dm_  += plus_dm;
                 sum_minus_dm_ += minus_dm;
                 sum_tr_       += tr;
@@ -165,7 +168,7 @@ public:
                     dx_count_ = 1;
                 }
             } else {
-
+                // 这里使用 Wilder 递推式，等价于 k = 1 / period 的 EMA。
                 smooth_plus_dm_  = smooth_plus_dm_  - smooth_plus_dm_  / period_ + plus_dm;
                 smooth_minus_dm_ = smooth_minus_dm_ - smooth_minus_dm_ / period_ + minus_dm;
                 smooth_tr_       = smooth_tr_       - smooth_tr_       / period_ + tr;
@@ -199,14 +202,14 @@ private:
     }
 
     int period_;
-    int count_ = 0;
+    int count_ = 0;  ///< 已输入 bar 数。
     double prev_high_ = 0, prev_low_ = 0, prev_close_ = 0;
-    double sum_plus_dm_ = 0, sum_minus_dm_ = 0, sum_tr_ = 0;
-    double smooth_plus_dm_ = 0, smooth_minus_dm_ = 0, smooth_tr_ = 0;
+    double sum_plus_dm_ = 0, sum_minus_dm_ = 0, sum_tr_ = 0;  ///< seed 阶段累加和（+DM/-DM/TR）。
+    double smooth_plus_dm_ = 0, smooth_minus_dm_ = 0, smooth_tr_ = 0;  ///< Wilder 平滑后的 +DM/-DM/TR。
     double plus_di_ = 0, minus_di_ = 0, dx_ = 0;
-    double sum_dx_ = 0;
-    int dx_count_ = 0;
-    double adx_ = 0;
+    double sum_dx_ = 0;    ///< ADX seed 阶段 DX 累加和。
+    int dx_count_ = 0;     ///< 已累计的 DX 样本数。
+    double adx_ = 0;       ///< 当前 ADX 观测值。
 };
 
 // ATR 百分位排名
@@ -227,6 +230,8 @@ public:
     bool   ready() const { return buf_.full(); }
     double atr()   const { return atr_.value(); }
 
+    /// @return [0, 1] 区间的严格低于占比；ready() 前返回中性值 0.5。
+    /// @note O(rank_window) 线性遍历，仅适合 bar 级调用，不可在 tick hot path 中调用。
     double percentile() const {
         if (!buf_.full()) return 0.5;
         const double cur = atr_.value();
@@ -238,7 +243,7 @@ public:
 
 private:
     CtATR atr_;
-    XtIndicatorRingBuf buf_;
+    XtIndicatorRingBuf buf_;  ///< ATR 历史值窗口，用于百分位排名。
 };
 
 // 布林带
@@ -263,7 +268,7 @@ public:
     }
     bool   ready()  const { return static_cast<int>(buf_.size()) >= period_; }
     double middle() const { return ready() ? sum_ / period_ : 0.0; }
-
+    /// @warning 差值法（sum2_ - mean^2）在价格绝对值很大时有 catastrophic cancellation 风险。
     double std_dev() const {
         if (!ready()) return 0.0;
         const double mean = sum_ / period_;
@@ -277,10 +282,10 @@ public:
 
 private:
     int period_;
-    double n_std_;
+    double n_std_;  ///< 标准差倍数（standard deviation multiplier）。
     XtIndicatorRingBuf buf_;
-    double sum_ = 0.0;
-    double sum2_ = 0.0;
+    double sum_ = 0.0;   ///< 当前窗口内累加和（sum x）。
+    double sum2_ = 0.0;  ///< 当前窗口内平方累加和（sum x^2）。
 };
 
 // RSI（相对强弱指数）
@@ -322,10 +327,10 @@ public:
 
 private:
     int period_;
-    double prev_ = 0.0;
-    double avg_gain_ = 0.0;
-    double avg_loss_ = 0.0;
-    int cnt_ = 0;
+    double prev_ = 0.0;      ///< 前一个输入价格。
+    double avg_gain_ = 0.0;  ///< Wilder 平滑后的平均涨幅。
+    double avg_loss_ = 0.0;  ///< Wilder 平滑后的平均跌幅。
+    int cnt_ = 0;            ///< 已输入样本数。
 };
 
 // MACD（DIF / DEA / Histogram）
@@ -357,9 +362,9 @@ public:
 
 private:
     CtEMA ema_fast_, ema_slow_, ema_signal_;
-    double dif_ = 0.0;
-    double dea_ = 0.0;
-    double hist_ = 0.0;
+    double dif_ = 0.0;   ///< DIF（快线 EMA - 慢线 EMA）。
+    double dea_ = 0.0;   ///< DEA（DIF 的 signal EMA）。
+    double hist_ = 0.0;  ///< MACD 柱状值，等于 2 * (DIF - DEA)。
 };
 
 // Donchian Channel（唐奇安通道）
@@ -391,7 +396,7 @@ public:
 
 private:
     int period_;
-    XtIndicatorRingBuf highs_, lows_;
+    XtIndicatorRingBuf highs_, lows_;  ///< 最高价 / 最低价滑动窗口。
 };
 
-}
+}  // namespace xt_indicator

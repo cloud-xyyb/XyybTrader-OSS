@@ -93,4 +93,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_libraries(xt_data PUBLIC stdc++fs)
 endif()
 
+# 共享数据湖 datalake/：root 解析、schema_version 校验与 parquet reader。
+add_subdirectory(datalake)
 

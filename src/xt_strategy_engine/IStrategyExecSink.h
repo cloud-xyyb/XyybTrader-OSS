@@ -19,4 +19,4 @@ public:
     virtual void on_account(const XtAccountUpdate& upd) = 0;
 };
 
-}
+}  // namespace xt_strategy_engine

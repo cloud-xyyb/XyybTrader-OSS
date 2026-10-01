@@ -8,6 +8,14 @@
 
 namespace xt_runtime::market::detail {
 
+/// @brief 取出 code 对应的值；没有这个 code 时插入默认值。
+///
+/// 只给 market 的 string-key 热路径使用；调用方必须在进入本 helper 前完成
+/// 空 code 过滤。
+///
+/// @note C++17 下 const char* 查找仍可能临时构造 std::string；C++20 transparent
+///       lookup 生效后，已存在 code 的查找才不需要构造 std::string。
+/// @pre code 不能为 nullptr。
 template <typename Map>
 typename Map::mapped_type& slot_for(Map& m, const char* code) {
     auto it = m.find(code);
@@ -15,4 +23,4 @@ typename Map::mapped_type& slot_for(Map& m, const char* code) {
     return it->second;
 }
 
-}
+}  // namespace xt_runtime::market::detail

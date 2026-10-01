@@ -16,7 +16,7 @@ void FillCostApplier::init(XtTradeCostConfig cost,
 
 void FillCostApplier::apply(XtTradeRecord& trade) const {
     const XtCommodityInfo* comm = commodities_ ? commodities_->find(trade.code.c_str()) : nullptr;
-
+    // 优先使用已有 exec_price，与 live normalize_trade_cost 口径一致。
     const double base_price = (trade.exec_price > 0.0) ? trade.exec_price : trade.price;
     const XtAppliedTradeCost cost_applied =
         xt_fill_cost::apply(base_price, trade, cost_, fees_, comm, true);
@@ -29,4 +29,4 @@ void FillCostApplier::apply(std::vector<XtTradeRecord>& trades) const {
     for (auto& tr : trades) apply(tr);
 }
 
-}
+} // namespace xt_fill_cost

@@ -30,7 +30,7 @@ YAML::Node clone_if_defined(const YAML::Node& node) {
     return YAML::Clone(node);
 }
 
-}
+}  // namespace
 
 namespace XtConfigYamlUtil {
 
@@ -72,7 +72,7 @@ bool load_profile_with_common(const std::string& profile_path,
             out = profile;
             return true;
         }
-
+        // common 只提供默认值；profile 始终作为 overlay 覆盖 common。
         YAML::Node common = YAML::LoadFile(common_path);
         out = deep_merge(common, profile);
         return true;
@@ -103,7 +103,7 @@ bool load_profile_with_common_and_market(const std::string& profile_path,
 
         const std::string common_path = join_path(parent_dir(profile_path), common_file_name);
         if (file_exists(common_path)) {
-
+            // common 可选，且只作为 profile 的默认配置层。
             YAML::Node common = YAML::LoadFile(common_path);
             merged = deep_merge(common, merged);
         }
@@ -114,9 +114,10 @@ bool load_profile_with_common_and_market(const std::string& profile_path,
             return false;
         }
         YAML::Node market = YAML::LoadFile(market_path);
-
+        // market 是调用方指定的市场参数层，缺失时 fail-closed。
         YAML::Node result = deep_merge(merged, market);
 
+        // secrets.yaml 是最后一层本地 overlay。
         const std::string secrets_path = join_path(parent_dir(profile_path), "secrets.yaml");
         if (file_exists(secrets_path)) {
             YAML::Node secrets = YAML::LoadFile(secrets_path);
@@ -134,4 +135,4 @@ bool load_profile_with_common_and_market(const std::string& profile_path,
     }
 }
 
-}
+}  // namespace XtConfigYamlUtil

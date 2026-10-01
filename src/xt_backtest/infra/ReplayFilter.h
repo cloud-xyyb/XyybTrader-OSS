@@ -36,7 +36,9 @@ struct ReplayFilter {
         if (roll.active() && !roll.accepts_tick(trading_date, code)) {
             return false;
         }
-
+        // 与 engine 内 session 过滤一致：用 in_session_closed（minute-level 两端闭区间）。
+        // in_section_halfopen 的半开区间会把 15:00:00.xxx auction tick 误过滤掉，导致 engine
+        // 永远看不到 section 末 tick（ag2212 对账 -2 的根因）。
         if (xt_core::is_enabled(session) &&
             !xt_core::in_session_closed(action_time, session.sections)) {
             return false;

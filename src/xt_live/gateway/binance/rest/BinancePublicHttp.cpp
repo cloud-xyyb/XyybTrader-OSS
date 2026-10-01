@@ -1,6 +1,6 @@
 #include "BinancePublicHttp.h"
 
-#include "BinanceCurlDetail.h"
+#include "BinanceCurlDetail.h"  // curl_write_cb
 
 #include <sstream>
 
@@ -10,15 +10,17 @@ namespace binance_u {
 
 namespace {
 
+// libcurl progress callback：cancel 置位后，仍在 TLS handshake/read 中的请求可尽快
+// 返回 CURLE_ABORTED_BY_CALLBACK，而不是等到 timeout_sec。
 int curl_xferinfo_cancel(void* clientp,
-                         curl_off_t  , curl_off_t  ,
-                         curl_off_t  , curl_off_t  ) {
+                         curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                         curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
     auto* cancel = static_cast<std::atomic<bool>*>(clientp);
     if (cancel && cancel->load(std::memory_order_acquire)) return 1;
     return 0;
 }
 
-}
+}  // namespace
 
 bool binance_public_http_get(const std::string& host,
                              const std::string& port,
@@ -44,7 +46,7 @@ bool binance_public_http_get(const std::string& host,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "XyybTrader/binance_u/1.0");
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");  // accept default encodings
     if (cancel) {
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &curl_xferinfo_cancel);
@@ -73,4 +75,4 @@ bool binance_public_http_get(const std::string& host,
     return true;
 }
 
-}
+}  // namespace binance_u

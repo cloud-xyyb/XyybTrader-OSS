@@ -1,8 +1,8 @@
 #include "XtTickClosureIndex.h"
 
-#include "TickFileUtil.h"
-#include "xt_util/path/PathUtil.h"
-#include "xt_util/time/XtTime.h"
+#include "TickFileUtil.h"           // extract_date_from_filename / kTickNightCarryGuardDays
+#include "xt_util/path/PathUtil.h"  // write_atomic
+#include "xt_util/time/XtTime.h"    // yyyymmdd_add_days / is_valid_yyyymmdd
 
 #include <nlohmann/json.hpp>
 
@@ -22,6 +22,7 @@ void sort_unique(std::vector<uint32_t>& v) {
     v.erase(std::unique(v.begin(), v.end()), v.end());
 }
 
+/// @brief 文件名解析出的自然日；无法识别或非法日期返回 0。
 uint32_t filename_day_of(const std::string& path) {
     uint32_t day = 0;
     const std::string name = std::filesystem::path(path).filename().string();
@@ -30,6 +31,8 @@ uint32_t filename_day_of(const std::string& path) {
     return day;
 }
 
+/// @brief 冷启（一天都没入册）时的候选上界：文件名日往后 `guard_days` 天。
+/// @return 全 1 表示不设上界（`filename_day` 非法，算不出自然日偏移时宁可多圈去读）。
 uint32_t guard_band_ceiling(uint32_t filename_day, uint32_t guard_days) {
     if (!xt_time::is_valid_yyyymmdd(filename_day)) {
         return (std::numeric_limits<uint32_t>::max)();
@@ -37,7 +40,7 @@ uint32_t guard_band_ceiling(uint32_t filename_day, uint32_t guard_days) {
     return xt_time::yyyymmdd_add_days(filename_day, static_cast<int>(guard_days));
 }
 
-}
+}  // namespace
 
 XtTickClosureIndex build_closure_index(const std::string& root,
                                        const std::vector<std::string>& ordered_files,
@@ -50,7 +53,7 @@ XtTickClosureIndex build_closure_index(const std::string& root,
     seen.reserve(ordered_files.size());
     for (size_t i = 0; i < ordered_files.size(); ++i) {
         const std::string& path = ordered_files[i];
-        if (!seen.insert(path).second) continue;
+        if (!seen.insert(path).second) continue;  // 重复路径：首次出现胜出
         XtClosureSource src;
         src.path = path;
         if (i < stamps.size()) src.stamp = stamps[i];
@@ -70,9 +73,10 @@ void carry_over_registrations(const XtTickClosureIndex& prior, XtTickClosureInde
         if (it == by_path.end()) continue;
         const XtClosureSource& src = *it->second;
         if (!src.registered) continue;
-
+        // 签名背书清单：mtime/size 任一不同就认为内容变了，清单作废等重扫。
         if (src.stamp.mtime_ns != dst.stamp.mtime_ns || src.stamp.size != dst.stamp.size) {
-
+            // 签名不符 = 内容可能变了，清单不能再当身份用；但那些天此刻只有这一份线索，
+            // 降级留作 provisional 圈范围，等这一轮重扫用实测集合顶掉。
             dst.provisional_days = src.days;
             continue;
         }
@@ -88,7 +92,7 @@ bool register_source_days(XtTickClosureIndex& index, const std::string& path,
         sort_unique(days);
         s.days = std::move(days);
         s.registered = true;
-        s.provisional_days.clear();
+        s.provisional_days.clear();  // 实测已到手，旧线索让位
         return true;
     }
     return false;
@@ -121,7 +125,8 @@ std::vector<uint32_t> closure_days(const XtTickClosureIndex& index) {
 }
 
 std::vector<uint32_t> closure_candidate_days(const XtTickClosureIndex& index) {
-
+    // 地标 = 索引已知的「有东西的日子」：已入册的真交易日 + 全部文件名日。未入册文件的
+    // 夜盘段属于它之后的第一个 session，没读过就只能拿地标里的下一天顶上。
     std::vector<uint32_t> landmarks;
     std::vector<uint32_t> out;
     for (const auto& s : index.sources) {
@@ -135,11 +140,14 @@ std::vector<uint32_t> closure_candidate_days(const XtTickClosureIndex& index) {
 
     for (const auto& s : index.sources) {
         if (s.registered) continue;
-
+        // 旧线索先进：某天可能只在这个源里出现过（它自己那个 session 的文件根本不存在），
+        // 丢掉就是交易日全集缺口 —— 建库读到那天会撞 known_days 闸，整批放弃。
+        // 刻意不进 landmarks：地标只用来挑「下一个 session」，多一个地标只会把上界压低。
         out.insert(out.end(), s.provisional_days.begin(), s.provisional_days.end());
         if (s.filename_day == 0) continue;
         out.push_back(s.filename_day);
-
+        // 地标之后再无日子（语料末尾那个文件）→ 退回日历次日。多圈一天最多让调用方
+        // 多规划一个空分片；少圈一天则是那一天彻底没人建，代价不对等。
         const auto it = std::upper_bound(landmarks.begin(), landmarks.end(), s.filename_day);
         out.push_back(it != landmarks.end()
                           ? *it
@@ -177,7 +185,7 @@ XtClosureDayLookup::XtClosureDayLookup(const XtTickClosureIndex& index) : index_
     filename_days.reserve(index.sources.size());
     for (uint32_t i = 0; i < index.sources.size(); ++i) {
         const XtClosureSource& s = index.sources[i];
-        filename_days.push_back(s.filename_day);
+        filename_days.push_back(s.filename_day);  // 无日期记 0：条数即语料规模
         if (s.registered) {
             for (uint32_t day : s.days) by_day_[day].push_back(i);
             continue;
@@ -193,12 +201,15 @@ XtClosureDayLookup::XtClosureDayLookup(const XtTickClosureIndex& index) : index_
     known_days_.reserve(by_day_.size());
     for (const auto& kv : by_day_) known_days_.push_back(kv.first);
     std::sort(known_days_.begin(), known_days_.end());
-
+    // guard 由语料自己的文件名日集合推出（索引已持有，无额外 I/O），见
+    // derive_night_carry_guard_days：休市多长，冷启候选就往后放宽多长。
     guard_days_ = derive_night_carry_guard_days(filename_days);
 }
 
 uint32_t XtClosureDayLookup::candidate_ceiling(uint32_t filename_day) const {
-
+    // 按自然日 filename_day 命名的文件最多贡献两个交易日：它自己那天，以及当晚夜盘所属
+    // 的下一个 session。已入册那部分给出的是真交易日（内容派生），取其中大于
+    // filename_day 的最小者即上界；它只是真交易日集合的子集，故上界只会偏大不会偏小。
     const auto it = std::upper_bound(known_days_.begin(), known_days_.end(), filename_day);
     if (it != known_days_.end()) return *it;
     return guard_band_ceiling(filename_day, guard_days_);
@@ -206,17 +217,18 @@ uint32_t XtClosureDayLookup::candidate_ceiling(uint32_t filename_day) const {
 
 void XtClosureDayLookup::collect_candidates(uint32_t day, std::vector<uint32_t>& picked) const {
     picked.insert(picked.end(), pending_undated_.begin(), pending_undated_.end());
-
+    // 旧线索命中：这个源上一代就登记过 day，比文件名圈定硬——即便它的文件名日已经被
+    // 上界挡在门外（例如该 session 自己的文件不存在，行全靠更早的文件承载）也要读。
     const auto prov = provisional_by_day_.find(day);
     if (prov != provisional_by_day_.end()) {
         picked.insert(picked.end(), prov->second.begin(), prov->second.end());
     }
-
+    // 文件名日 > day 的文件承载的最早交易日就是它自己那天，含不了 day —— 从 day 往前扫。
     auto it = std::upper_bound(pending_dated_.begin(), pending_dated_.end(),
                                std::make_pair(day, (std::numeric_limits<uint32_t>::max)()));
     while (it != pending_dated_.begin()) {
         --it;
-
+        // 上界对文件名日单调不减，故一旦越界，更早的文件只会更越界 —— 可以收手。
         if (candidate_ceiling(it->first) < day) break;
         picked.push_back(it->second);
     }
@@ -267,12 +279,13 @@ std::string serialize_closure_index(const XtTickClosureIndex& index) {
         sources.push_back(std::move(e));
     }
     j["sources"] = std::move(sources);
-
+    // dump(2)：索引是人要读的 forensic 产物；nlohmann::json 的对象键按字典序输出，
+    // 同一索引恒得同一字节串（generation digest 对照依赖这一点）。
     return j.dump(2) + "\n";
 }
 
 bool parse_closure_index(const std::string& text, XtTickClosureIndex& out) {
-    nlohmann::json j = nlohmann::json::parse(text, nullptr,  false);
+    nlohmann::json j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return false;
 
     if (!j.contains("schema") || !j["schema"].is_number_unsigned()) return false;
@@ -294,7 +307,7 @@ bool parse_closure_index(const std::string& text, XtTickClosureIndex& out) {
         XtClosureSource s;
         s.path = e["path"].get<std::string>();
         if (s.path.empty()) return false;
-
+        // 路径重复 = 索引与源集不配套（清单归属不唯一），整份不要。
         if (!seen.insert(s.path).second) return false;
         s.stamp.mtime_ns = e["mtime_ns"].get<uint64_t>();
         s.stamp.size = e["size"].get<uint64_t>();
@@ -305,14 +318,15 @@ bool parse_closure_index(const std::string& text, XtTickClosureIndex& out) {
             if (!d.is_number_unsigned()) return false;
             const auto day = d.get<uint64_t>();
             if (day == 0 || day > 99999999ull) return false;
-
+            // 升序且无重复：清单要倒排成 day → files，乱序说明写它的不是本实现。
             if (prev != 0 && day <= prev) return false;
             prev = static_cast<uint32_t>(day);
             s.days.push_back(static_cast<uint32_t>(day));
         }
-
+        // 未入册就没有内容派生的日集合可言；带着日集合说明这份索引不是本实现写的。
         if (!s.registered && !s.days.empty()) return false;
 
+        // 文件名日是路径的函数，不入 JSON——存了就多一份可能与路径矛盾的真相。
         s.filename_day = filename_day_of(s.path);
         parsed.sources.push_back(std::move(s));
     }

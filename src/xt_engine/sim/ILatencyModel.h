@@ -16,9 +16,20 @@ class ILatencyModel {
 public:
     virtual ~ILatencyModel() = default;
 
+    /// @brief submit 后到订单可进入撮合的延迟。
+    /// @param event_ts_ns event-axis 时刻；时变模型用它查询延迟样本
+    /// @return entry latency ns；0 表示立即可撮合
     virtual int64_t entry_latency_ns(int64_t event_ts_ns) const = 0;
 
+    /// @brief 成交后到策略可见的延迟。
+    /// @param event_ts_ns event-axis 时刻；时变模型用它查询延迟样本
+    /// @return response latency ns；0 表示立即可见
     virtual int64_t response_latency_ns(int64_t event_ts_ns) const = 0;
 
+    /// @brief 是否要求调用方提供真实 event timestamp。
+    ///
+    /// true（如 InterpolatedLatencyModel）时，首个 event 前的 submit/cancel
+    /// fail-fast——静默以 ts=0 取首样本正是 T2.SIM-1 的病；constant/CDF
+    /// 忽略 ts，保持默认 false。
     virtual bool requires_event_timestamp() const { return false; }
 };

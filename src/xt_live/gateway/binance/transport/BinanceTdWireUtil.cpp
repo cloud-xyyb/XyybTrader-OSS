@@ -9,7 +9,7 @@ namespace {
 
 constexpr char kBase36Alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-}
+}  // namespace
 
 std::string base36_encode(uint64_t value) {
     if (value == 0) return "0";
@@ -34,7 +34,7 @@ std::optional<uint64_t> base36_decode(std::string_view s) {
         } else {
             return std::nullopt;
         }
-
+        // 在乘 36 前做上界检查，避免非法 clientOrderId 触发 uint64 wrap。
         if (value > (std::numeric_limits<uint64_t>::max() - digit) / 36) {
             return std::nullopt;
         }
@@ -48,7 +48,7 @@ std::string make_client_order_id(uint64_t local_id, uint64_t nonce) {
 }
 
 uint64_t parse_local_id(std::string_view client_order_id) {
-
+    // 只接受 make_client_order_id() 生成的 `ct_<local_id>_<nonce>` 格式。
     if (client_order_id.size() < 5) return 0;
     if (client_order_id.substr(0, 3) != "ct_") return 0;
     const auto p1 = client_order_id.find('_', 3);
@@ -81,15 +81,15 @@ std::optional<XtOrderStatus> parse_binance_status_opt(std::string_view s) {
     if (s == "PARTIALLY_FILLED") return XtOrderStatus::PartiallyFilled;
     if (s == "FILLED") return XtOrderStatus::Filled;
     if (s == "CANCELED") return XtOrderStatus::Canceled;
-    if (s == "EXPIRED") return XtOrderStatus::Canceled;
-    if (s == "EXPIRED_IN_MATCH") return XtOrderStatus::Canceled;
+    if (s == "EXPIRED") return XtOrderStatus::Canceled;           // IOC/FOK 未成交在本地撤单语义下收敛。
+    if (s == "EXPIRED_IN_MATCH") return XtOrderStatus::Canceled;  // STP 自成交防护过期，终态按撤单口径。
     if (s == "REJECTED") return XtOrderStatus::Rejected;
     return std::nullopt;
 }
 
 XtOrderStatus parse_binance_status(std::string_view s) {
-
+    // ack 路径：未知状态串保守按业务拒绝处理。
     return parse_binance_status_opt(s).value_or(XtOrderStatus::Rejected);
 }
 
-}
+}  // namespace binance_u

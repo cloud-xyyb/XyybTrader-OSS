@@ -22,3 +22,6 @@ data/ticks/cache/
 .idea/
 .vscode/
 __pycache__/
+
+# SEL demo output
+/reports/

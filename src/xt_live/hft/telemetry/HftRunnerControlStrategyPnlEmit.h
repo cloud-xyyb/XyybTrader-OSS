@@ -23,11 +23,13 @@ class XtDeclaredSymbolRegistry;
 namespace xt_live::control {
 
 struct StrategyPnlEmitResult {
-    std::size_t row_count = 0;
-    std::size_t zero_target_count = 0;
-    bool baseline_ready = false;
+    std::size_t row_count = 0;         ///< 实际 emit 的非零/有 row 记录数。
+    std::size_t zero_target_count = 0; ///< declared target 中需要补零 heartbeat 的数量。
+    bool baseline_ready = false;       ///< false 表示 baseline 尚未初始化，本轮不 emit today PnL。
 };
 
+/// @brief 写入 `xt_today_pnl_net_v2{strategy,book,venue,symbol}` 矩阵。
+/// @param last_baseline_day_id in/out；检测到 trading day rollover 时更新。
 StrategyPnlEmitResult emit_strategy_pnl_metrics(
     const XtRunnerControlConfig& cfg,
     ct::metrics::XtStrategyPnlBaseline* baseline,
@@ -35,4 +37,4 @@ StrategyPnlEmitResult emit_strategy_pnl_metrics(
     const std::vector<ct::metrics::XtStrategyPnlAggregator::Row>& rows,
     int& last_baseline_day_id);
 
-}
+}  // namespace xt_live::control

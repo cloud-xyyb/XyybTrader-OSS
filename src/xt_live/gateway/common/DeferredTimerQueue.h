@@ -28,6 +28,11 @@ public:
     DeferredTimerQueue(const DeferredTimerQueue&) = delete;
     DeferredTimerQueue& operator=(const DeferredTimerQueue&) = delete;
 
+    /// @brief 安排 action 在 `delay_ms` 毫秒后于 worker 线程执行。
+    /// @param delay_ms 延时；`<= 0` 视为尽快执行。
+    /// @param action   回调；为空则忽略。
+    /// @note worker 线程在首次 `schedule()` 时懒启动。
+    /// @note `stop()` 之后调用为 no-op（不再接受新任务）。
     void schedule(int delay_ms, std::function<void()> action) {
         if (!action) return;
         std::lock_guard<std::mutex> lk(mu_);
@@ -40,6 +45,8 @@ public:
         cv_.notify_all();
     }
 
+    /// @brief 停止并 join worker，丢弃所有未触发任务。幂等。
+    /// @warning 不得从 worker 线程（即 action 内）调用——会自 join 死锁。
     void stop() {
         std::thread worker;
         {
@@ -48,7 +55,7 @@ public:
             stopping_ = true;
             pending_.clear();
             cv_.notify_all();
-            worker = std::move(worker_);
+            worker = std::move(worker_);  // 锁外 join，避免与 run_() 争锁
         }
         if (worker.joinable()) worker.join();
     }
@@ -63,23 +70,23 @@ private:
             }
             const auto due = pending_.begin()->first;
             if (Clock::now() < due) {
-
+                // 新的更早任务入队时 schedule() 会 notify，唤醒后重判队首。
                 cv_.wait_until(lk, due);
                 continue;
             }
             std::function<void()> action = std::move(pending_.begin()->second);
             pending_.erase(pending_.begin());
             lk.unlock();
-            action();
+            action();  // 锁外执行；可调 schedule() re-arm
             lk.lock();
         }
     }
 
     std::mutex                                              mu_;
     std::condition_variable                                 cv_;
-    std::multimap<Clock::time_point, std::function<void()>> pending_;
+    std::multimap<Clock::time_point, std::function<void()>> pending_;  ///< 按到期时间排序的待执行任务
     std::thread                                             worker_;
     bool                                                    stopping_ = false;
 };
 
-}
+}  // namespace xt_live::gateway

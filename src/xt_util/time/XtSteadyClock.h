@@ -11,6 +11,7 @@
 
 namespace XtSteadyClock {
 
+/// @brief 返回单调时钟纳秒计数；仅用于相对 delta。
 inline uint64_t steady_now_ns() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -18,6 +19,7 @@ inline uint64_t steady_now_ns() {
             .count());
 }
 
+/// @brief 返回单调时钟微秒计数；仅用于相对 delta。
 inline uint64_t steady_now_us() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -25,10 +27,11 @@ inline uint64_t steady_now_us() {
             .count());
 }
 
+/// @brief 返回单调时钟毫秒计数；仅用于相对 delta。
 inline int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
-}
+}  // namespace XtSteadyClock

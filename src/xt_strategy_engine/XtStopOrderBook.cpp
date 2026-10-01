@@ -12,7 +12,7 @@ void copy_bounded(char* dst, std::size_t cap, const char* src) {
     dst[cap - 1] = '\0';
 }
 
-}
+} // namespace
 
 bool XtStopOrderBook::code_matches_(const StopSlot& s, const char* code) {
     return code && std::strncmp(s.code, code, sizeof(s.code)) == 0;
@@ -54,7 +54,7 @@ uint64_t XtStopOrderBook::arm_trailing(const char* code, bool is_buy,
     if (!s) return 0;
     s->is_trailing = true;
     s->distance_fp = distance_fp;
-    s->watermark_fp = seed_price_fp;
+    s->watermark_fp = seed_price_fp; // 0 = lazy-seed
     return s->stop_id;
 }
 
@@ -75,7 +75,8 @@ void XtStopOrderBook::check(const char* code, int64_t last_fp,
     for (StopSlot& s : slots_) {
         if (!code_matches_(s, code)) continue;
         if (s.is_trailing) {
-
+            // 水位对含 Fired 的全部 slot 持续更新；lazy-seed 当 tick 不会
+            // 触发（|last - 水位| = 0 < distance）。
             if (s.watermark_fp == 0) {
                 s.watermark_fp = last_fp;
             } else if (s.is_buy) {
@@ -129,11 +130,11 @@ StopTerminalAction XtStopOrderBook::on_order_terminal(uint64_t order_id,
         StopSlot& s = slots_[i];
         if (s.state != StopSlotState::Fired || s.fired_order_id != order_id) continue;
 
-        if (remaining_fp <= 0) {
+        if (remaining_fp <= 0) { // 本次 fire 足额成交
             erase_at_(i);
             return StopTerminalAction::kConsumed;
         }
-
+        // 零/部分成交：登记量按实际成交递减后余量重挂。
         const int64_t filled_fp = s.fired_qty_fp > remaining_fp
                                       ? s.fired_qty_fp - remaining_fp
                                       : 0;
@@ -149,7 +150,7 @@ StopTerminalAction XtStopOrderBook::on_order_terminal(uint64_t order_id,
         s.state = StopSlotState::Armed;
         s.fired_order_id = 0;
         s.fired_qty_fp = 0;
-
+        // 水位保留：re-arm 后 trailing 以最新水位继续，不重播种。
         return StopTerminalAction::kRearmed;
     }
     return StopTerminalAction::kIgnored;
@@ -174,4 +175,4 @@ void XtStopOrderBook::erase_at_(std::size_t idx) {
     slots_.pop_back();
 }
 
-}
+} // namespace xt_strategy_engine

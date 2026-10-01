@@ -25,12 +25,16 @@ public:
         buf_.push(val);
     }
 
+    /// @return true 表示窗口已累计 window 个样本，统计值可用于交易信号。
     bool ready() const { return static_cast<int>(buf_.size()) >= window_; }
 
+    /// @pre 至少已经 push 过一个样本；空窗口下会触发底层 assert。
     double latest() const { return buf_.newest(); }
 
+    /// @return ready() 前返回 0.0，ready() 后返回当前滑动窗口均值。
     double mean() const { return sma_.value(); }
 
+    /// @return ready() 前返回 0.0；ready() 后返回 sqrt(sum((x_i - mean)^2) / window)。
     double std_dev() const {
         if (!ready()) return 0.0;
         const double m = sma_.value();
@@ -42,6 +46,7 @@ public:
         return std::sqrt(sum2 / static_cast<double>(window_));
     }
 
+    /// @return Z-Score = (latest - mean) / std_dev；未就绪或标准差接近 0 时返回 0.0。
     double z_score() const {
         if (!ready()) return 0.0;
         const double sd = std_dev();
@@ -51,8 +56,8 @@ public:
 
 private:
     CtSMA sma_;
-    XtIndicatorRingBuf buf_;
-    int window_;
+    XtIndicatorRingBuf buf_;  ///< 存储最近 window 个样本，索引顺序为 oldest -> newest。
+    int window_;              ///< 滑动窗口大小，要求与 sma_/buf_ 容量一致。
 };
 
-}
+}  // namespace xt_indicator

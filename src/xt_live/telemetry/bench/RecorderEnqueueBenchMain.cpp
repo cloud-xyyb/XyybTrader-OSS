@@ -30,7 +30,7 @@ uint64_t percentile_ns(const std::vector<uint64_t>& samples, double pct) {
     return samples[static_cast<size_t>(rank)];
 }
 
-}
+}  // namespace
 
 int main(int argc, char** argv) {
     const uint64_t samples = arg_u64(argc, argv, 1, 100000);

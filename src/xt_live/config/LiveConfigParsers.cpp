@@ -11,11 +11,11 @@
 #include "xt_util/time/CtHHMM.h"
 #include "xt_util/string/secure_string.h"
 #include "xt_util/string/secure_string_yaml.h"
-#include "xt_core/session/XtSessionWindow.h"
+#include "xt_core/session/XtSessionWindow.h"  // XtSessionWindow (用于 parse_closeout_windows)
 
 namespace {
 
-namespace YamlNodeUtil = ::XtConfigYamlUtil;
+namespace YamlNodeUtil = ::XtConfigYamlUtil;  // typed-read helpers (as_or 等)
 using xt_hhmm::valid_hhmm;
 
 void to_lower_ascii(std::string& s) {
@@ -25,6 +25,7 @@ void to_lower_ascii(std::string& s) {
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 }
 
+// 通过 secure_string 中转读取 YAML 凭证，减少临时明文副本停留时间。
 std::string read_secret_via_secure_string(const YAML::Node& node) {
     if (!node) return std::string{};
     XtUtil::secure_string s = XtUtil::secure_string_from_yaml(node);
@@ -35,7 +36,7 @@ YAML::Node provider_secret_node(const YAML::Node& node) {
     if (!node || !node.IsMap()) return YAML::Node();
     const std::string provider =
         node["provider"] ? node["provider"].as<std::string>() : std::string();
-
+    // Missing provider is rejected by validation; do not apply any legacy secret overlay here.
     if (provider.empty()) return YAML::Node();
     if (provider == "binance_u") return node["binance"];
     return node[provider];
@@ -51,7 +52,9 @@ void apply_provider_credential_overrides(const YAML::Node& node, ConfigT& cfg) {
     }
 }
 
-}
+}  // anon namespace
+
+// ── Gateway-common parsers ────────────────────────────────────────────────────
 
 IMdGateway::Config parse_md_gateway_config(const YAML::Node& node) {
     IMdGateway::Config cfg;
@@ -74,12 +77,12 @@ ITradeGateway::Config parse_trade_gateway_config(const YAML::Node& node) {
     if (node["account_refresh_ms"]) cfg.account_refresh_ms = node["account_refresh_ms"].as<int>();
     if (node["position_refresh_ms"]) cfg.position_refresh_ms = node["position_refresh_ms"].as<int>();
     if (node["account_snapshot_max_abs"]) cfg.account_snapshot_max_abs = node["account_snapshot_max_abs"].as<double>();
-
+    // TD stuck-disconnect self-heal 阈值 ms. 0=禁用, 推荐 60000.
     if (node["stale_reconnect_ms"]) {
         const int v = node["stale_reconnect_ms"].as<int>();
         cfg.stale_reconnect_ms = v > 0 ? static_cast<uint32_t>(v) : 0u;
     }
-
+    // multibook identity 自证锚（非密字段；空 = 不校验）。
     if (node["expected_investor_id"]) {
         cfg.expected_investor_id = node["expected_investor_id"].as<std::string>();
     }
@@ -97,7 +100,9 @@ xt_live::control::XtHftReconcileLoopCfg parse_reconcile_cfg(const YAML::Node& td
     if (r["cycle_ms"]) {
         cfg.cycle_ms = static_cast<uint32_t>(std::max<int64_t>(0, r["cycle_ms"].as<int64_t>()));
     }
-
+    // uint8 阈值经 int 中转 + clamp：越界/负值由 validator 拒（fail startup），
+    // clamp 只兜防御性窄化，不是静默截断语义；禁用 .as<uint8_t>（越界直接 throw，
+    // 报错不可读）与裸窄化（256→0 = 静默反转 kill 禁用语义）。
     if (r["reconnect_after_n"]) {
         cfg.reconnect_after_n =
             static_cast<uint8_t>(std::clamp(r["reconnect_after_n"].as<int>(), 0, 255));
@@ -117,6 +122,8 @@ xt_live::control::XtHftReconcileLoopCfg parse_reconcile_cfg(const YAML::Node& td
     }
     return cfg;
 }
+
+// ── Provider-specific Cfg parse（CTP）─────────────────────────────────────────
 
 CTPMdCfg parse_ctp_md_cfg(const YAML::Node& node) {
     CTPMdCfg cfg;
@@ -140,6 +147,10 @@ CTPTdCfg parse_ctp_td_cfg(const YAML::Node& node) {
     return cfg;
 }
 
+// ── Provider-specific Cfg parse（Binance）──────────────────────────────────────
+
+// md.binance.tick_source：控制 bookTicker 是否额外推 quote tick（aggTrade 永推）。
+// 非法值 fail-fast（与 binance.transport / xtp.protocol 同口径）。
 static BinanceMdCfg::TickSource parse_binance_tick_source(const YAML::Node& b) {
     if (!b || !b["tick_source"]) return BinanceMdCfg::TickSource::TradeAndQuote;
     const std::string raw = b["tick_source"].as<std::string>();
@@ -171,7 +182,7 @@ BinanceTdCfg::Transport parse_binance_td_transport(const YAML::Node& node) {
     throw std::invalid_argument("expected 'rest' or 'ws', got: '" + raw + "'");
 }
 
-}
+}  // anon namespace
 
 BinanceTdCfg parse_binance_td_cfg(const YAML::Node& node) {
     BinanceTdCfg cfg;
@@ -198,6 +209,8 @@ BinanceTdCfg parse_binance_td_cfg(const YAML::Node& node) {
     return cfg;
 }
 
+// ── Provider-specific Cfg parse（XTP）─────────────────────────────────────────
+
 namespace {
 
 XTPMdCfg::Protocol parse_xtp_md_protocol(const YAML::Node& node) {
@@ -208,7 +221,7 @@ XTPMdCfg::Protocol parse_xtp_md_protocol(const YAML::Node& node) {
     throw std::invalid_argument("xtp.protocol: expected 'tcp' or 'udp', got: '" + raw + "'");
 }
 
-}
+}  // anon namespace
 
 XTPMdCfg parse_xtp_md_cfg(const YAML::Node& node) {
     XTPMdCfg cfg;
@@ -246,14 +259,17 @@ XTPTdCfg parse_xtp_td_cfg(const YAML::Node& node) {
     return cfg;
 }
 
+// ── Commodity / strategy contract info / runtime state parsers ────────────────
+
 namespace {
 
 std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML::Node& node) {
-
+    // 委托 xt_config 全量解析（normalize_key + 全字段含 offset_policy），
+    // 单点维护字段覆盖；既有 canonical 大写品种键下 key 归一化等价。
     return parse_commodity_catalog_config(node).map;
 }
 
-}
+}  // anon namespace
 
 std::unordered_map<std::string, xt_runtime::XtStraContractInfo>
 parse_stra_contract_info(const YAML::Node& node) {
@@ -305,18 +321,20 @@ XtLiveRuntimeStateCfg parse_live_runtime_state_config(const YAML::Node& runtime_
     if (trading_node && trading_node["offset_policy_default"]) {
         const std::string v = trading_node["offset_policy_default"].as<std::string>();
         if (!parse_offset_policy(v, cfg.offset_policy_default))
-
+            // fail-fast：与 commodities.offset_policy 同口径，非法值拒启动。
             throw std::runtime_error(
                 "runtime.trading.offset_policy_default 非法值 '" + v +
                 "'（合法: close_first | open_allowed）");
     }
-
+    // bool 走 as_or 容错（非法/缺省回退 false），不 fail-fast。
     cfg.conditional_orders_enabled =
         YamlNodeUtil::as_or<bool>(trading_node, "conditional_orders_enabled", false);
 
     cfg.commodity_map = parse_commodity_map(commodities_node);
     return cfg;
 }
+
+// ── Session sections / closeout windows ───────────────────────────────────────
 
 namespace {
 
@@ -334,7 +352,7 @@ void parse_closeout_windows(const YAML::Node& closeout_node,
     }
 }
 
-}
+}  // anon namespace
 
 void parse_session_sections(const YAML::Node& sections_list_node,
                             std::vector<std::pair<int, int>>& out) {
@@ -350,19 +368,21 @@ void parse_session_sections(const YAML::Node& sections_list_node,
     }
 }
 
+// ── Live order gateway parser ─────────────────────────────────────────────────
+
 XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_node) {
     XtLiveOrderGatewayCfg cfg;
     const YAML::Node raw_risk_node =
         (runtime_node && runtime_node["risk"]) ? runtime_node["risk"] : YAML::Node();
     const YAML::Node risk_node =
         (raw_risk_node && raw_risk_node.IsMap()) ? raw_risk_node : YAML::Node();
-
+    // ── XtRiskCfg（与 Backtest 共用同一结构）──────────────────────
     cfg.risk.max_order_qty      = YamlNodeUtil::as_or<double>(risk_node, "max_order_qty", 0.0);
     cfg.risk.max_order_notional = YamlNodeUtil::as_or<double>(risk_node, "max_order_notional", 0.0);
     cfg.risk.min_order_notional = YamlNodeUtil::as_or<double>(risk_node, "min_order_notional", 0.0);
     cfg.risk.max_pos_qty        = YamlNodeUtil::as_or<double>(risk_node, "max_pos_qty", 0.0);
     cfg.risk.allow_short        = YamlNodeUtil::as_or<bool>(runtime_node["trading"], "allow_short", false);
-    cfg.risk.enforce_long_t_plus_1 = YamlNodeUtil::as_or<bool>(risk_node, "enforce_long_t_plus_1", false);
+    cfg.risk.enforce_long_t_plus_1 = YamlNodeUtil::as_or<bool>(risk_node, "enforce_long_t_plus_1", false);  // A 股 T+1
     cfg.risk.max_daily_loss     = YamlNodeUtil::as_or<double>(risk_node, "max_daily_loss", 0.0);
     cfg.risk.max_order_count_per_symbol = YamlNodeUtil::as_or<uint64_t>(
         risk_node, "max_order_count_per_symbol", 0ULL);
@@ -373,6 +393,13 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
     cfg.risk.blacklist_persist_across_session = YamlNodeUtil::as_or<bool>(
         risk_node, "blacklist_persist_across_session", false);
 
+    // ── per-strategy quota yaml string-keyed staging ──
+    //
+    // yaml: runtime.risk.per_strategy_max_pos_qty:
+    //         tick_revert_dual: 0.02
+    //         mm_dual: 0.03
+    // 解析到 staging map (string-keyed),Runner boot 期 sid registry 翻译 → uint32-keyed
+    // (见 XtRiskCfg::per_strategy_max_pos_qty_by_sid_string 注释)。
     const YAML::Node quota_node =
         (risk_node && risk_node["per_strategy_max_pos_qty"])
             ? risk_node["per_strategy_max_pos_qty"]
@@ -392,6 +419,11 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
         }
     }
 
+    // per-strategy daily_loss_pct yaml staging (string-keyed)。
+    // yaml: runtime.risk.per_strategy_daily_loss_pct:
+    //         tick_revert_dual: 0.02   # 2% of starting_balance
+    //         mm_dual: 0.03            # 3%
+    // Runner boot 期 sid_registry 翻译 string -> uint32_t (per_strategy_daily_loss_pct map)。
     const YAML::Node dll_node =
         (risk_node && risk_node["per_strategy_daily_loss_pct"])
             ? risk_node["per_strategy_daily_loss_pct"]
@@ -407,6 +439,8 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
         }
     }
 
+    // per-strategy 主动强平（auto-liquidation）：reject-only daily-loss 之上的平仓层。
+    // 总开关 + dry-run + per-sid 阈值 map（string-keyed staging，Runner boot 翻译 uint32）。
     cfg.risk.per_strategy_auto_liquidate =
         YamlNodeUtil::as_or<bool>(risk_node, "per_strategy_auto_liquidate", false);
     cfg.risk.per_strategy_auto_liquidate_dry_run =
@@ -426,17 +460,22 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
         }
     }
 
+    // cross-strategy 同 symbol 重叠 escape hatch，默认 strict false。true 时
+    // B1 validator 与运行期 run_overlap_check 同步放行 — 仅限 conformance multi
+    // 类压测档; release_scope 政策门 + per-sid 配额由 check_release_scope.py 把守。
     cfg.risk.allow_strategy_symbol_overlap =
         YamlNodeUtil::as_or<bool>(risk_node, "allow_strategy_symbol_overlap", false);
 
+    // ── Gateway 自有配置 ──────────────────────────────────────────
     cfg.max_orders_per_sec = YamlNodeUtil::as_or<int>(risk_node, "max_orders_per_sec", 0);
     cfg.max_cancels_per_sec = YamlNodeUtil::as_or<int>(risk_node, "max_cancels_per_sec", 0);
     cfg.max_rejects_per_min = YamlNodeUtil::as_or<int>(risk_node, "max_rejects_per_min", 0);
     cfg.cooldown_ms = YamlNodeUtil::as_or<int>(risk_node, "cooldown_ms", 0);
     cfg.require_l2_orderflow = YamlNodeUtil::as_or<bool>(risk_node, "require_l2_orderflow", false);
-    cfg.stp_enabled = YamlNodeUtil::as_or<bool>(risk_node, "stp_enabled", true);
+    cfg.stp_enabled = YamlNodeUtil::as_or<bool>(risk_node, "stp_enabled", true);  // 默认开（fail-safe 自成交防护）
     cfg.stp_disabled_reason = YamlNodeUtil::as_or<std::string>(risk_node, "stp_disabled_reason", std::string(""));
-
+    // “关闭须给 reason”的 fail-closed 校验在 load_live_config 末尾（产 validation_error → runner abort）；
+    // 校验统一归 validator 层（parser 只做类型读取），故不在此 enforce。
     cfg.velocity_enabled = YamlNodeUtil::as_or<bool>(risk_node, "velocity_enabled", false);
     cfg.velocity_window_ms = YamlNodeUtil::as_or<int64_t>(risk_node, "velocity_window_ms", 100);
     cfg.velocity_max_qty = YamlNodeUtil::as_or<double>(risk_node, "velocity_max_qty", 0.0);
@@ -457,19 +496,20 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
     cfg.closeout_aggressive_buffer_bps = std::max(1, YamlNodeUtil::as_or<int>(closeout_node, "aggressive_buffer_bps", 10));
     cfg.closeout_force_exit_latch_enabled =
         YamlNodeUtil::as_or<bool>(closeout_node, "force_exit_latch_enabled", true);
-
+    // <=0 = 永不过期（TTL 关闭是合法配置），故不 clamp 下限。
     cfg.closeout_force_exit_latch_ttl_ms =
         YamlNodeUtil::as_or<int>(closeout_node, "force_exit_latch_ttl_ms", 30'000);
 
+    // runtime.recovery：cross-restart 孤儿在途单回收（orphan reaper）。
     const YAML::Node recovery_node =
         (runtime_node && runtime_node["recovery"]) ? runtime_node["recovery"] : YAML::Node();
     cfg.orphan_reap_enabled = YamlNodeUtil::as_or<bool>(recovery_node, "orphan_reap_enabled", true);
     cfg.orphan_reap_grace_ms = std::max<int64_t>(
         0, YamlNodeUtil::as_or<int64_t>(recovery_node, "orphan_reap_grace_ms", 60'000));
-
+    // 下限 1s：sweep 走 1Hz frame loop，更密无意义且浪费 worker 预算。
     cfg.orphan_reap_interval_ms = std::max<int64_t>(
         1'000, YamlNodeUtil::as_or<int64_t>(recovery_node, "orphan_reap_interval_ms", 30'000));
-
+    // 上限 256：engine sweep 缓冲区容量；下限 1 防配成 0 变相禁用（禁用走 enabled）。
     cfg.orphan_reap_max_per_sweep = std::min(
         256, std::max(1, YamlNodeUtil::as_or<int>(recovery_node, "orphan_reap_max_per_sweep", 50)));
     cfg.lost_terminal_reconcile_enabled =
@@ -483,9 +523,18 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
         (session_node && session_node["active_sections"]) ? session_node["active_sections"] : YAML::Node();
     parse_session_sections(active_sections_node, cfg.session_gate_sections);
 
+    // runtime.risk.reject_on_position_unknown.
+    // Default false = trust strategy ledger when account_store closeable is
+    // unconfirmed (CTP bootstrap gap); true = reject with PositionStateUnknown.
+    // Reuses risk_node declared at the top of this function.
     cfg.reject_on_position_unknown =
         YamlNodeUtil::as_or<bool>(risk_node, "reject_on_position_unknown", false);
 
+    // ── order_strategy_ sidecar grace window (yaml override) ──
+    //
+    // prune cutoff 默认 60s 硬编码。运维监控 dropped_fill metric 后可调高
+    // (e.g. 5-10 分钟) 应对长 binance ws outage。
+    // yaml 路径: runtime.gateway.order_strategy_grace_us
     const YAML::Node gateway_node = runtime_node["gateway"];
     if (gateway_node && !gateway_node.IsNull()) {
         cfg.order_strategy_grace_us = YamlNodeUtil::as_or<int64_t>(
@@ -494,6 +543,14 @@ XtLiveOrderGatewayCfg parse_live_order_gateway_config(const YAML::Node& runtime_
     return cfg;
 }
 
+// ── Runner control / process tuning parsers ───────────────────────────────────
+
+// YAML 路径映射（YAML path mapping）：
+//   md_node         ← runtime.md
+//   debug_node      ← runtime.debug
+//   strategy_node   ← runtime.strategies[0]
+//   instrument_node ← runtime.instrument
+//   account_node    ← runtime.account
 XtRunnerControlConfig parse_runner_control_config(const YAML::Node& md_node,
                                                   const YAML::Node& debug_node,
                                                   const YAML::Node& strategy_node,
@@ -503,14 +560,18 @@ XtRunnerControlConfig parse_runner_control_config(const YAML::Node& md_node,
 
     XtRunnerControlConfig cfg;
 
+    // ── MD 统计日志（MD stats log）─────────────────────────────────────────
     cfg.log_stats = as_or<bool>(md_node, "log_stats", false);
     const int interval_ms = as_or<int>(md_node, "log_interval_ms", 1000);
     cfg.sleep_ms  = interval_ms > 0 ? interval_ms : 1000;
 
+    // ── 健康心跳（health heartbeat）────────────────────────────────────────
     cfg.heartbeat_tick_count     = as_or<bool>(debug_node, "tick_count",               false);
     cfg.heartbeat_ms             = std::max(0, as_or<int>(debug_node, "heartbeat_ms",   0));
     cfg.fail_on_critical_td_drop = as_or<bool>(debug_node, "fail_on_critical_td_drop", true);
 
+    // ── 一致性检查阈值（consistency thresholds）：必须满足 warn ≤ block ≤ kill ──
+    // 违反约束立即 throw：配置错误在启动期暴露，不静默修改用户意图
     {
         const int warn  = std::max(1, as_or<int>(debug_node, "consistency_warn_loops",  1));
         const int block =             as_or<int>(debug_node, "consistency_block_loops", 3);
@@ -527,6 +588,9 @@ XtRunnerControlConfig parse_runner_control_config(const YAML::Node& md_node,
         cfg.consistency_kill_loops  = kill;
     }
 
+    // ── unmatched drop 预算（unmatched budget → kill_switch 自动 trip）────────
+    // yaml 路径: runtime.debug.unmatched_budget.{window_sec,max_drops,max_ratio}。
+    // 阈值语义（AND）与关闭方式见 HftUnmatchedBudget.h。
     {
         const YAML::Node ub_node = debug_node ? debug_node["unmatched_budget"] : YAML::Node();
         cfg.unmatched_budget_window_sec = as_or<int>(ub_node, "window_sec", 60);
@@ -534,16 +598,19 @@ XtRunnerControlConfig parse_runner_control_config(const YAML::Node& md_node,
         cfg.unmatched_budget_max_ratio  = as_or<double>(ub_node, "max_ratio", 0.001);
     }
 
+    // ── 统一报告元数据（unified report metadata）──────────────────────────
     cfg.unified_report_flush_ms    = std::max(0, as_or<int>(debug_node, "report_contract_flush_ms", 1000));
     cfg.strategy_metrics_flush_sec = std::max(1, as_or<int>(debug_node, "strategy_metrics_flush_sec", 5));
     cfg.unified_report_dir    = as_or<std::string>(debug_node,    "report_contract_dir",   std::string("var/live_metrics/report_contract"));
     cfg.unified_run_id        = as_or<std::string>(debug_node,    "report_run_id",         std::string(""));
-
+    // multi 下取 strategies[0].id 作 report_contract 单值标签（部署级归因走
+    // deployment_id，per-strategy 归因走 per-sid metric，此字段仅元数据）。
     cfg.unified_strategy_id   = as_or<std::string>(strategy_node, "id",                    std::string(""));
     cfg.unified_symbol        = as_or<std::string>(instrument_node,"symbol",               std::string(""));
     cfg.unified_config_hash   = as_or<std::string>(debug_node,    "report_config_hash",    std::string(""));
     cfg.unified_code_version  = as_or<std::string>(debug_node,    "report_code_version",   std::string(""));
 
+    // ── 停机账户对账（runtime vs broker 直比）────────────────────────
     cfg.account_reconcile_on_stop = as_or<bool>(account_node, "reconcile_on_stop", false);
 
     return cfg;
@@ -561,11 +628,18 @@ XtProcessUtil::RuntimeTuningConfig parse_runner_process_tuning_config(const YAML
     return cfg;
 }
 
+// ── Event loop parser ─────────────────────────────────────────────────────────
+
+// YAML 路径映射（YAML path mapping）：
+//   queue_node   ← queue
+//   md_node      ← runtime.md
 XtHftEventLoop::Config parse_event_loop_cfg(const YAML::Node& queue_node,
                                             const YAML::Node& md_node) {
     using namespace YamlNodeUtil;
     using CfgQueueMode = XtHftEventLoopCfg::QueueMode;
 
+    // 字符串 → 枚举（string → QueueMode）
+    // event loop 始终单消费者，MPMC 折叠为 MPSC；无效值立即 throw，启动期 fail-fast
     auto to_mode = [](const std::string& s, const char* field) -> CfgQueueMode {
         if (s == "spsc")                return CfgQueueMode::SPSC;
         if (s == "mpsc" || s == "mpmc") return CfgQueueMode::MPSC;
@@ -575,6 +649,7 @@ XtHftEventLoop::Config parse_event_loop_cfg(const YAML::Node& queue_node,
 
     XtHftEventLoop::Config cfg;
 
+    // ── 队列容量（queue capacities）──────────────────────────────────────
     const size_t tick_cap  = as_positive_size_or(queue_node, "capacity",            65536);
     const size_t event_cap = as_positive_size_or(queue_node, "event_capacity",      tick_cap);
     const size_t td_cap    = as_positive_size_or(queue_node, "td_event_capacity",   event_cap);
@@ -584,20 +659,25 @@ XtHftEventLoop::Config parse_event_loop_cfg(const YAML::Node& queue_node,
     cfg.td_event_queue_capacity   = td_cap;
     cfg.flow_event_queue_capacity = flow_cap;
 
+    // ── 队列模式（queue modes）───────────────────────────────────────────
     cfg.tick_queue_mode       = to_mode(as_or<std::string>(queue_node, "mode",            std::string("spsc")), "queue.mode");
     cfg.td_event_queue_mode   = to_mode(as_or<std::string>(queue_node, "td_event_mode",   std::string("mpsc")), "queue.td_event_mode");
     cfg.flow_event_queue_mode = to_mode(as_or<std::string>(queue_node, "flow_event_mode", std::string("mpsc")), "queue.flow_event_mode");
 
+    // ── 高水位（high watermarks，clamp 至对应容量）────────────────────────
     cfg.tick_high_watermark      = std::min(as_positive_size_or(queue_node, "tick_high_watermark",      tick_cap * XtHftEventLoopCfg::kTickHighWatermarkPctDefault    / 100), tick_cap);
     cfg.td_event_high_watermark  = std::min(as_positive_size_or(queue_node, "td_event_high_watermark",  td_cap   * XtHftEventLoopCfg::kTdEventHighWatermarkPctDefault  / 100), td_cap);
     cfg.flow_event_high_watermark= std::min(as_positive_size_or(queue_node, "flow_event_high_watermark",flow_cap * XtHftEventLoopCfg::kFlowEventHighWatermarkPctDefault / 100), flow_cap);
 
+    // ── 批次大小与每轮预算（batch sizes & per-loop budgets）───────────────
     cfg.tick_batch_size            = as_positive_size_or(queue_node, "tick_batch_size",         XtHftEventLoopCfg::kTickBatchDefault);
     cfg.td_event_batch_size        = as_positive_size_or(queue_node, "td_event_batch_size",     XtHftEventLoopCfg::kTdEventBatchDefault);
     cfg.flow_event_batch_size      = as_positive_size_or(queue_node, "flow_event_batch_size",   XtHftEventLoopCfg::kFlowEventBatchDefault);
     cfg.td_event_budget_per_loop   = as_positive_size_or(queue_node, "td_event_budget_per_loop",XtHftEventLoopCfg::kTdEventBudgetPerLoopDefault);
     cfg.flow_event_budget_per_loop = as_positive_size_or(queue_node, "flow_event_budget_per_loop", XtHftEventLoopCfg::kFlowEventBudgetPerLoopDefault);
 
+    // ── Tick 饥饿保护（tick starvation guard）────────────────────────────
+    // 使用 int64_t 中转：负值 → clamp 为 0，超出目标类型上界为不切实际的配置值
     cfg.tick_max_wait_us = static_cast<uint64_t>(std::max<int64_t>(
         0, as_or<int64_t>(queue_node, "tick_max_wait_us",
                           static_cast<int64_t>(XtHftEventLoopCfg::kTickMaxWaitUsDefault))));
@@ -608,6 +688,7 @@ XtHftEventLoop::Config parse_event_loop_cfg(const YAML::Node& queue_node,
         as_positive_size_or(queue_node, "td_backlog_warn_threshold", cfg.td_event_high_watermark),
         td_cap);
 
+    // ── Worker 亲和性（worker affinity / priority）────────────────────────
     cfg.worker_affinity = as_or<int>(md_node, "worker_affinity",
                           as_or<int>(md_node, "md_worker_affinity", -1));
     cfg.worker_priority = as_or<std::string>(md_node, "worker_priority",
@@ -616,6 +697,8 @@ XtHftEventLoop::Config parse_event_loop_cfg(const YAML::Node& queue_node,
 
     return cfg;
 }
+
+// ── Recording / event store / risk monitor parsers ────────────────────────────
 
 XtLiveRecorder::Config parse_recording_cfg(const YAML::Node& runtime_node) {
     XtLiveRecorder::Config cfg;
@@ -627,7 +710,7 @@ XtLiveRecorder::Config parse_recording_cfg(const YAML::Node& runtime_node) {
     const int qc = YamlNodeUtil::as_or<int>(node, "queue_capacity",
                                             static_cast<int>(cfg.queue_capacity));
     if (qc > 0) cfg.queue_capacity = static_cast<size_t>(qc);
-
+    // 运行时滚动：<=0 显式禁用该维度；缺省保留 Config 非零默认（防 live.jsonl 长跑无界增长）。
     const int64_t rb = YamlNodeUtil::as_or<int64_t>(node, "rotate_bytes",
                                                     static_cast<int64_t>(cfg.rotate_bytes));
     cfg.rotate_bytes = rb > 0 ? static_cast<uint64_t>(rb) : 0;
@@ -647,6 +730,7 @@ XtLiveRecorder::Config parse_recording_cfg(const YAML::Node& runtime_node) {
     return cfg;
 }
 
+// runtime.recording.event_store { enabled, root_path }
 XtEventStoreCfg parse_event_store_cfg(const YAML::Node& runtime_node) {
     XtEventStoreCfg cfg;
     const YAML::Node rec = runtime_node["recording"];

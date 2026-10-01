@@ -26,4 +26,4 @@ struct IntentResult {
     }
 };
 
-}
+} // namespace xt_runtime

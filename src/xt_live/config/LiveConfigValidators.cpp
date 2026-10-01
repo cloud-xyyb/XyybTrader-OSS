@@ -1,5 +1,7 @@
 #include "LiveConfigValidators.h"
 
+// Live config 校验入口与 file-local validator 实现。
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -14,17 +16,20 @@
 
 #include "xt_core/order/XtOffsetPolicy.h"
 
-#include "XtLiveRuntimeStateCfg.h"
-#include "XtLiveConfig.h"
-#include "ConfigValidationCtx.h"
-#include "xt_config/yaml/ConfigYamlUtil.h"
-#include "xt_util/net/XtLoopbackHost.h"
-#include "xt_util/time/CtHHMM.h"
-#include "xt_config/catalog/XtFeeRuleBook.h"
-#include "xt_live/hft/runtime/XtHftEventLoop.h"
+#include "XtLiveRuntimeStateCfg.h"   // XtLoggerCfg / XtStrategyFactoryCfg / XtLiveRuntimeStateCfg
+#include "XtLiveConfig.h"            // XtLiveControlGrpcConfig + fill_control_grpc_cfg（requested 单源）
+#include "DeclaredUniverse.h"        // xt_live::kMaxDeclaredSymbols（declared 上限 SSOT）
+#include "ConfigValidationCtx.h"     // XtConfigValidationCtx
+#include "xt_config/yaml/ConfigYamlUtil.h"          // as_or / as_positive_size_or templates
+#include "xt_util/net/XtLoopbackHost.h"   // dev_insecure loopback 字面量判定 SSOT
+#include "xt_util/time/CtHHMM.h"          // valid_hhmm SSOT
+#include "xt_config/catalog/XtFeeRuleBook.h"           // XtFeeRuleBook full type (rules.empty() check)
+#include "xt_live/hft/runtime/XtHftEventLoop.h"          // XtHftEventLoop::kFlowEventBatchMax constant
+#include "xt_risk/live/XtLiveRiskGuardContext.h"   // kBrokerFrozenStaleMs（broker-frozen 时效窗 SSOT）
 
-#include "api/XtStrategyRuntimeTypes.h"
+#include "api/XtStrategyRuntimeTypes.h"  // xt_runtime::XtStraContractInfo (alias of XtCommodityInfo)
 
+// 交叉校验只需要复用 parser 的语义检查；窄 extern 避免把完整 parser 头扩散到本 TU。
 extern std::unordered_map<std::string, xt_runtime::XtStraContractInfo>
 parse_stra_contract_info(const YAML::Node& node);
 extern XtLiveRuntimeStateCfg parse_live_runtime_state_config(const YAML::Node& runtime_node,
@@ -96,7 +101,7 @@ bool validate_optional_positive_size_field(const YAML::Node& entry,
 }
 
 bool validate_strategies_entries(const YAML::Node& strategies, std::string& err) {
-
+    // `strategy_id` 是 engine routing 的 demux key，必须在整个 live profile 内唯一。
     std::unordered_map<std::string, size_t> seen_ids;
     for (size_t i = 0; i < strategies.size(); ++i) {
         const auto& e = strategies[i];
@@ -110,7 +115,10 @@ bool validate_strategies_entries(const YAML::Node& strategies, std::string& err)
             return false;
         }
         if (!id.empty() && id[0] == '_') {
-
+            // `_` 前缀为保留域，用户策略 id 不得占用。现有保留名：_global（控制面
+            // UpdateParam 全局参数 sentinel）/ _default（PnL aggregator/baseline 空-sid
+            // 归一桶）/ _manual（操作面手工单归因保留 sid）。真策略用 `_` 前缀名会与这些
+            // 内建语义冲突。
             err = "runtime.strategies[" + std::to_string(i) +
                   "].id='" + id +
                   "' 使用了保留的 '_' 前缀 (保留名 {_global, _default, _manual}),"
@@ -138,7 +146,16 @@ bool validate_strategies_entries(const YAML::Node& strategies, std::string& err)
 bool validate_strategies_b1_symbol_guard(const YAML::Node& runtime_node,
                                          const YAML::Node& strategies,
                                          std::string& err) {
-
+    // 交易所账户只有 symbol 维净仓，没有 per-strategy 仓位维；同 symbol 多策略会共享
+    // account position pool，导致一个策略的平仓可能消耗另一个策略的实仓。
+    // live profile 默认只允许多策略跑不同 symbol。
+    //
+    // 每个 entry 可显式声明 `symbol`；缺失时使用全局 `runtime.instrument.symbol`。
+    // 缺省 symbol 同样参与冲突检测，避免多策略 entry 省略 symbol 时绕过 guard。
+    //
+    // runtime.risk.allow_strategy_symbol_overlap=true 显式放行同 symbol 多策略
+    // (conformance multi 类压测档专用; deploy 侧 check_release_scope.py 把守
+    //  release_scope 政策门 + per-sid 配额)。
     const YAML::Node risk_node = runtime_node["risk"];
     if (risk_node && risk_node.IsMap()) {
         const YAML::Node allow = risk_node["allow_strategy_symbol_overlap"];
@@ -153,13 +170,14 @@ bool validate_strategies_b1_symbol_guard(const YAML::Node& runtime_node,
         (instrument_node && !instrument_node.IsNull())
             ? YamlNodeUtil::as_or<std::string>(instrument_node, "symbol", std::string(""))
             : std::string("");
-
+    // release verifier 读取该静态锚点并与 release_scope.yaml 对齐，确保 same-symbol
+    // 放行前已覆盖 emission / dispatch / risk guard 三条链路。
     static constexpr std::array<const char*, 3> kSameSymbolRequiredPhases = {
-        "R3",
-        "R8",
-        "R-CALLBACK-EMISSION",
+        "R3",                   // StrategySid through submit/runtime book/reverse-sync
+        "R8",                   // StrategySid through risk guard sibling force-flat
+        "R-CALLBACK-EMISSION",  // dispatch_fill_to_strategy_ per-sid pos view
     };
-    (void)kSameSymbolRequiredPhases;
+    (void)kSameSymbolRequiredPhases;  // 静态读取锚点，避免编译期未使用告警。
     if (strategies.size() <= 1) return true;
 
     std::unordered_map<std::string, size_t> seen_symbols;
@@ -167,7 +185,7 @@ bool validate_strategies_b1_symbol_guard(const YAML::Node& runtime_node,
         const auto& e = strategies[i];
         std::string sym = e["symbol"] ? e["symbol"].as<std::string>("") : "";
         if (sym.empty()) sym = global_symbol;
-        if (sym.empty()) continue;
+        if (sym.empty()) continue;  // instrument 校验链负责报告缺失 symbol。
         auto [it, inserted] = seen_symbols.emplace(sym, i);
         if (!inserted) {
             err = "runtime.strategies[" + std::to_string(i) + "].symbol='" + sym +
@@ -179,6 +197,7 @@ bool validate_strategies_b1_symbol_guard(const YAML::Node& runtime_node,
     }
     return true;
 }
+
 
 void validate_log_cfg(const XtLoggerCfg* log_cfg, ValidationCtx& v) {
     if (!log_cfg) {
@@ -203,12 +222,12 @@ void validate_md_cfg(const YAML::Node& md_node, const IMdGateway::Config* md_cfg
 
     v.add_if(md_cfg->user.empty() && provider == "ctp", "runtime.md.user 不能为空");
     if (provider == "xtp") {
-
+        // XTP 登录鉴权必须提供 software_key；通用 IMdGateway::Config 不承载该字段。
         const auto& x = md_node["xtp"];
         v.add_if(!x || !x["software_key"] || x["software_key"].as<std::string>("").empty(),
                  "runtime.md.xtp.software_key 不能为空");
     } else if (provider == "ctp") {
-
+        // CTP broker / flow_dir 不在通用 IMdGateway::Config 上，必须直接校验 yaml。
         v.add_if(!md_node["broker"] || md_node["broker"].as<std::string>("").empty(),
                  "runtime.md.broker 不能为空");
         const std::string flow = YamlNodeUtil::as_or<std::string>(md_node, "flow_dir", std::string("CTP_MD_FLOW"));
@@ -242,7 +261,7 @@ void validate_td_cfg(const YAML::Node& td_node, const ITradeGateway::Config* td_
 
     v.add_if(td_cfg->user.empty() && provider == "ctp", "runtime.td.user 不能为空");
     if (provider == "xtp") {
-
+        // XTP 交易登录鉴权链依赖 software_key / version / account_key 三元组。
         const auto& x = td_node["xtp"];
         v.add_if(!x || !x["software_key"] || x["software_key"].as<std::string>("").empty(),
                  "runtime.td.xtp.software_key 不能为空");
@@ -250,12 +269,14 @@ void validate_td_cfg(const YAML::Node& td_node, const ITradeGateway::Config* td_
                  "runtime.td.xtp.software_version 不能为空");
         v.add_if(!x || !x["account_key"] || x["account_key"].as<std::string>("").empty(),
                  "runtime.td.xtp.account_key 不能为空");
-
+        // 周期持仓/资产 requery 兜底（XTP 只在 login/reconnect 查询，session 内
+        // 成交会让快照陈旧）；<=0 = 禁用周期对账，实盘不可接受 → 拒启（对齐
+        // CTP position_refresh_ms 语义）。
         const int xtp_pos_ms = YamlNodeUtil::as_or<int>(x, "position_refresh_ms", 60000);
         v.add_if(xtp_pos_ms <= 0,
                  "runtime.td.xtp.position_refresh_ms 必须 > 0（周期持仓/资产 requery 兜底）");
     } else if (provider == "ctp") {
-
+        // CTP broker / flow_dir / recovery 参数不在通用 ITradeGateway::Config 上。
         v.add_if(!td_node["broker"] || td_node["broker"].as<std::string>("").empty(),
                  "runtime.td.broker 不能为空");
         const std::string flow = YamlNodeUtil::as_or<std::string>(td_node, "flow_dir", std::string("CTP_TD_FLOW"));
@@ -264,10 +285,10 @@ void validate_td_cfg(const YAML::Node& td_node, const ITradeGateway::Config* td_
         v.add_if(rq_to < 0, "runtime.td.recovery_query_timeout_ms 不能为负");
         const int rq_mx = YamlNodeUtil::as_or<int>(td_node, "recovery_query_max_timeouts", 6);
         v.add_if(rq_mx <= 0, "runtime.td.recovery_query_max_timeouts 必须 > 0");
-
+        // recovery_rearm_backoff_ms <=0 是合法的「关闭 re-arm」语义；仅拒负。
         const int rr_bo = YamlNodeUtil::as_or<int>(td_node, "recovery_rearm_backoff_ms", 5000);
         v.add_if(rr_bo < 0, "runtime.td.recovery_rearm_backoff_ms 不能为负（<=0 表示关闭 re-arm）");
-
+        // recovery_rearm_alert_rounds <=0 合法（恒告警）；仅拒负。
         const int rr_ar = YamlNodeUtil::as_or<int>(td_node, "recovery_rearm_alert_rounds", 10);
         v.add_if(rr_ar < 0, "runtime.td.recovery_rearm_alert_rounds 不能为负");
     } else if (provider == "binance_u") {
@@ -282,10 +303,12 @@ void validate_td_cfg(const YAML::Node& td_node, const ITradeGateway::Config* td_
     v.add_if(td_cfg->position_refresh_ms < 0, "runtime.td.position_refresh_ms 不能为负");
     v.add_if(!std::isfinite(td_cfg->account_snapshot_max_abs) || td_cfg->account_snapshot_max_abs <= 0.0,
              "runtime.td.account_snapshot_max_abs 必须为正且有限");
-
+    // `0` 表示禁用 stale reconnect；非 0 值保守限制到 >= 5s，避免 CTP SDK
+    // 在 Release / Init 高频切换下放大线程竞争和 broker 压力。
     v.add_if(td_cfg->stale_reconnect_ms != 0 && td_cfg->stale_reconnect_ms < 5000,
              "runtime.td.stale_reconnect_ms 必须 = 0 (禁用) 或 >= 5000 (5s)");
-
+    // reconcile loop（venue-neutral）：uint8 阈值在 raw node 上以宽整型独立读 + range
+    // check（parser 端窄化前拒掉越界/负值，防 256→0 静默反转 kill 禁用语义）。
     {
         const YAML::Node rec = td_node["reconcile"];
         if (rec && !rec.IsNull()) {
@@ -400,7 +423,8 @@ void validate_risk_node(const YAML::Node& runtime_node, ValidationCtx& v) {
                       "runtime.risk.enable_position_snapshot_stale_guard",
                       b);
     (void)v.read_bool(risk_node["require_l2_orderflow"], "runtime.risk.require_l2_orderflow", b);
-
+    // 读取 per-symbol blacklist 字段可同时触发未知键白名单校验；数值仍按 int
+    // 读取以便对负数给出明确错误。
     if (v.read_int(risk_node["max_order_count_per_symbol"],
                    "runtime.risk.max_order_count_per_symbol", i)) {
         v.add_if(i < 0, "runtime.risk.max_order_count_per_symbol 不能为负");
@@ -416,10 +440,13 @@ void validate_risk_node(const YAML::Node& runtime_node, ValidationCtx& v) {
     (void)v.read_bool(risk_node["blacklist_persist_across_session"],
                       "runtime.risk.blacklist_persist_across_session", b);
 
+    // ── per-strategy auto-liquidation 配置不变量 ──────────────────────────
+    // 1:1 sid:symbol 命脉：开启时禁止 same-symbol overlap（account_store 账户级
+    // 净仓无 per-sid 归属，same-symbol 下自动强平会平错或退化为账户级）。
     bool auto_liq = false;
     (void)v.read_bool(risk_node["per_strategy_auto_liquidate"],
                       "runtime.risk.per_strategy_auto_liquidate", auto_liq);
-
+    // dry_run 仅类型校验（值由 parser 读取）；复用 scratch b 不留 dead 局部。
     (void)v.read_bool(risk_node["per_strategy_auto_liquidate_dry_run"],
                       "runtime.risk.per_strategy_auto_liquidate_dry_run", b);
     const YAML::Node liq_map = risk_node["per_strategy_liquidate_pct"];
@@ -437,7 +464,7 @@ void validate_risk_node(const YAML::Node& runtime_node, ValidationCtx& v) {
                  "allow_strategy_symbol_overlap=true 同用：自动强平要求 1:1 sid:symbol，"
                  "same-symbol 多策略下账户净仓无 per-sid 归属。");
     }
-
+    // per_strategy_liquidate_pct 值域 (0,1)：超界会静默 dormant（never trigger）或误平。
     if (liq_map && liq_map.IsMap()) {
         for (auto it = liq_map.begin(); it != liq_map.end(); ++it) {
             std::string key;
@@ -523,7 +550,7 @@ void validate_trading_node(const YAML::Node& runtime_node, ValidationCtx& v) {
     if (!v.read_bool(trading_node["allow_short"], "runtime.trading.allow_short", allow_short)) {
         v.add("runtime.trading.allow_short 缺失");
     }
-
+    // 可选 key：值合法性走聚合通道（解析层 throw 是硬底，覆盖 BT 路径）。
     if (trading_node["offset_policy_default"]) {
         std::string s;
         XtOffsetPolicy p{};
@@ -546,7 +573,8 @@ void validate_closeout_window_fields(const YAML::Node& node,
     if (v.read_int(node["force_flat_hhmm"], path_prefix + ".force_flat_hhmm", force_flat)) {
         v.add_if(!valid_hhmm(force_flat), path_prefix + ".force_flat_hhmm 必须是 HHMM（0000~2359）");
     }
-
+    // 闭区间 [no_open, force] 语义下窗口必须正向；跨午夜 wrap 形态（force <= no_open）
+    // 会让窗口覆盖大半天，按配置错误 fail 启动。
     if (valid_hhmm(no_open) && valid_hhmm(force_flat)) {
         v.add_if(force_flat <= no_open,
                  path_prefix + " closeout 窗口要求 force_flat_hhmm > no_open_hhmm（不支持跨午夜窗口）");
@@ -632,7 +660,7 @@ void validate_recording_node(const YAML::Node& runtime_node, ValidationCtx& v) {
     if (v.read_int(node["queue_capacity"], "runtime.recording.queue_capacity", queue_capacity)) {
         v.add_if(queue_capacity < 0, "runtime.recording.queue_capacity 不能为负");
     }
-
+    // recorder 启用后必须有落盘路径；未启用时允许保留空路径占位。
     if (enabled_set && b) {
         const std::string path = YamlNodeUtil::as_or<std::string>(node, "file_path", std::string());
         v.add_if(path.empty(), "runtime.recording.enabled=true 时 file_path 不能为空");
@@ -661,6 +689,7 @@ void validate_recording_node(const YAML::Node& runtime_node, ValidationCtx& v) {
         }
     }
 
+    // event_store 是 recorder 的可选 FBS sink；启用后必须提供 root_path。
     const YAML::Node es = node["event_store"];
     if (es && !es.IsNull()) {
         if (!es.IsMap()) {
@@ -919,6 +948,9 @@ void validate_control_grpc_node(const YAML::Node& runtime_node, ValidationCtx& v
         return;
     }
 
+    // 「requested」判定与 runner 装配同源（fill_control_grpc_cfg，含 grpc-OFF 非显式
+    // 降级）：节存在但无 `enabled` 键时 parser 按 struct 默认 true 启动 server，本地
+    // 默认 false 会跳过 TLS 校验（T1.130 双真值源缝隙）。read_bool 仅保留键类型校验。
     bool enabled_key_value = false;
     (void)v.read_bool(cg_node["enabled"], "runtime.control_grpc.enabled", enabled_key_value);
     XtLiveControlGrpcConfig cg_cfg;
@@ -955,13 +987,16 @@ void validate_control_grpc_node(const YAML::Node& runtime_node, ValidationCtx& v
         }
     }
 
+    // tls.mode: 默认 mtls；dev_insecure 是 opt-in 本地开发模式，仅 loopback 放行。
     std::string tls_mode = "mtls";
     (void)v.read_string(tls_node["mode"], "runtime.control_grpc.tls.mode", tls_mode);
     if (tls_mode != "mtls" && tls_mode != "dev_insecure") {
         v.add("runtime.control_grpc.tls.mode 必须是 mtls 或 dev_insecure");
     }
     if (tls_mode == "dev_insecure") {
-
+        // FAIL-CLOSED at parse time：dev_insecure 仅允许 loopback **字面量** listen_addr。
+        // 判定 SSOT 在 xt_util/net/XtLoopbackHost.h，与 server start() gate 共用同一实现
+        // (防漂移)。基于数字字面量判定，拒绝 `127.evil.example` 这类 hostname 旁路。
         v.add_if(!xt_net::listen_addr_is_loopback_literal(listen_addr),
                  "runtime.control_grpc.tls.mode=dev_insecure 仅允许 loopback "
                  "listen_addr，当前=" + listen_addr);
@@ -1086,7 +1121,9 @@ void validate_portfolio_router_policy(const YAML::Node& runtime_node, Validation
     auto has_key = [&](const char* k) {
         return risk_node[k] && !risk_node[k].IsNull();
     };
-
+    // auto-liquidation 也是 per-strategy risk：依赖 sid 路由机器（wire_sid_registry 在
+    // portfolio_router=false 时早返回不注册/翻译 sid → liquidate_pct 永远为空、保护静默失效）。
+    // 与 max_pos_qty / daily_loss_pct 同口径 fail-closed，杜绝"配了却不生效"的假防护。
     if (risk_node && risk_node.IsMap() &&
         (has_key("per_strategy_max_pos_qty") ||
          has_key("per_strategy_daily_loss_pct") ||
@@ -1097,6 +1134,8 @@ void validate_portfolio_router_policy(const YAML::Node& runtime_node, Validation
     }
 }
 
+// per_strategy_max_pos_qty 依赖 1:1 sid:symbol：risk 只读账户级 symbol 净仓。
+// 同账户多策略同 symbol 不在当前支持范围内；显式打开 overlap 时 fail-closed。
 void validate_per_strategy_pos_qty_same_symbol_guard(const YAML::Node& runtime_node,
                                                      ValidationCtx& v) {
     const YAML::Node risk_node = runtime_node["risk"];
@@ -1115,7 +1154,93 @@ void validate_per_strategy_pos_qty_same_symbol_guard(const YAML::Node& runtime_n
     }
 }
 
+// A 股 T+1 需要两个旗标同开才成立：runtime.account.t1_enabled 决定账本是否拆
+// 今/昨仓，runtime.risk.enforce_long_t_plus_1 是卖出侧闸门。账本不拆今仓时可卖
+// 量恒等于总持仓，闸门对今仓卖出恒放行 —— 闸开而账本不拆 = 静默 no-op。
+// xtp 是 A 股现货 venue，T+1 是 venue 规则不是策略选项，两个旗标必须显式为
+// true，不接受「缺省即 false」兜底。另含两条 xtp venue 规则：broker-frozen
+// 时效链（position_refresh_ms < 风控时效窗）与配置符号 canonical 语法。
+void validate_xtp_t1_and_symbol_rules(const YAML::Node& runtime_node,
+                                      const YAML::Node& td_node,
+                                      ValidationCtx& v) {
+    const YAML::Node account_node = runtime_node["account"];
+    const YAML::Node risk_node = runtime_node["risk"];
+
+    // 每个键只读一次：read_bool 对非布尔值会各追加一条类型错误，重复读会重复报。
+    // 缺失 / false / 非布尔三种情况在这里统一收敛成「不是显式 true」。
+    bool t1_enabled = false;
+    const bool t1_true =
+        account_node && account_node.IsMap() &&
+        v.read_bool(account_node["t1_enabled"], "runtime.account.t1_enabled", t1_enabled) &&
+        t1_enabled;
+    bool enforce_t1 = false;
+    const bool enforce_true =
+        risk_node && risk_node.IsMap() &&
+        v.read_bool(risk_node["enforce_long_t_plus_1"],
+                    "runtime.risk.enforce_long_t_plus_1",
+                    enforce_t1) &&
+        enforce_t1;
+
+    // provider 缺失 / 不受支持由 validate_td_cfg 单独报；这里只在确认是 xtp 时加严。
+    const std::string provider =
+        YamlNodeUtil::as_or<std::string>(td_node, "provider", std::string());
+    if (provider == "xtp") {
+        v.add_if(!t1_true,
+                 "runtime.td.provider=xtp 必须显式设置 runtime.account.t1_enabled: true"
+                 "（A 股 T+1 账本拆分）");
+        v.add_if(!enforce_true,
+                 "runtime.td.provider=xtp 必须显式设置 runtime.risk.enforce_long_t_plus_1: true"
+                 "（A 股 T+1 卖出闸）");
+
+        // broker-frozen 时效链：XTP 的 frozen 由周期 position requery 派生，刷新
+        // 周期必须严格小于风控时效窗，否则 frozen 恒 stale → 降级 local-only =
+        // 结构性旁路（默认 60000 正好踩中）。阈值 SSOT = kBrokerFrozenStaleMs。
+        const YAML::Node xtp_node = td_node["xtp"];
+        const int refresh_ms =
+            YamlNodeUtil::as_or<int>(xtp_node, "position_refresh_ms", 60000);
+        v.add_if(refresh_ms <= 0 ||
+                     static_cast<uint64_t>(refresh_ms) >=
+                         XtLiveRiskGuardContext::kBrokerFrozenStaleMs,
+                 "runtime.td.provider=xtp 要求 runtime.td.xtp.position_refresh_ms 严格小于 "
+                 "broker-frozen 时效窗 30000ms（否则 frozen 恒 stale 被降级，建议 15000）");
+
+        // canonical 符号语法：XTP 内部 key 统一 6 位代码 + .SH/.SZ 后缀。裸码/
+        // alias（.SSE）在 TD/MD ingress 会被 canonicalize，与配置键形成 identity
+        // 分裂（account universe 裸 key vs 回报带后缀 → quarantine），故配置入口
+        // fail-closed。
+        const auto is_canonical_a_share = [](const std::string& s) {
+            if (s.size() != 9) return false;
+            for (int i = 0; i < 6; ++i) {
+                if (s[static_cast<size_t>(i)] < '0' || s[static_cast<size_t>(i)] > '9') return false;
+            }
+            return s.compare(6, 3, ".SH") == 0 || s.compare(6, 3, ".SZ") == 0;
+        };
+        const YAML::Node instrument = runtime_node["instrument"];
+        const std::string symbol =
+            YamlNodeUtil::as_or<std::string>(instrument, "symbol", std::string());
+        v.add_if(!symbol.empty() && !is_canonical_a_share(symbol),
+                 "runtime.td.provider=xtp 要求 runtime.instrument.symbol 为 canonical 形态"
+                 "（6 位代码 + .SH/.SZ，如 600000.SH）：裸码/alias 会与回报 canonicalize"
+                 "形成 symbol identity 分裂");
+        const YAML::Node strategies = runtime_node["strategies"];
+        if (strategies && strategies.IsSequence()) {
+            for (const auto& entry : strategies) {
+                const std::string ssym =
+                    YamlNodeUtil::as_or<std::string>(entry, "symbol", std::string());
+                v.add_if(!ssym.empty() && !is_canonical_a_share(ssym),
+                         "runtime.td.provider=xtp 要求 strategies[].symbol 为 canonical 形态"
+                         "（6 位代码 + .SH/.SZ）：'" + ssym + "'");
+            }
+        }
+    }
+
+    // venue 无关的组合闸：闸门单开时账本不拆今仓，可卖量恒等于总持仓。
+    v.add_if(enforce_true && !t1_true,
+             "runtime.risk.enforce_long_t_plus_1: true 必须与 runtime.account.t1_enabled: true "
+             "同用：账本不拆今/昨仓时可卖量恒等于总持仓，T+1 闸对今仓卖出恒放行。");
 }
+
+}  // namespace
 
 bool validate_strategy_or_strategies_cfg(const YAML::Node& runtime_node,
                                          std::string& err) {
@@ -1171,8 +1296,20 @@ void validate_live_config(const YAML::Node& runtime_node,
     validate_risk_node(runtime_node, v);
     validate_portfolio_router_policy(runtime_node, v);
     validate_per_strategy_pos_qty_same_symbol_guard(runtime_node, v);
+    validate_xtp_t1_and_symbol_rules(runtime_node, td_node, v);
     validate_closeout_node(runtime_node, v);
     validate_recording_node(runtime_node, v);
     validate_risk_monitor_node(runtime_node, v);
     validate_runtime_cross(runtime_node, md_node, queue_node, commodities_node, fees_node, v);
+}
+
+void validate_declared_universe_size(const std::vector<std::string>& declared,
+                                     std::vector<std::string>& errors) {
+    ValidationCtx v(errors);
+    v.add_if(declared.size() > xt_live::kMaxDeclaredSymbols,
+             "declared universe 共 " + std::to_string(declared.size()) +
+             " 个 symbol，超过上限 " + std::to_string(xt_live::kMaxDeclaredSymbols) +
+             "（= runtime.instrument.symbol ∪ runtime.strategies[].symbol ∪ "
+             "runtime.roll 合约表，去重后）—— mark registry 的 8192 个 id 中 1024 个"
+             "预留给未声明的持仓 symbol，拒绝启动");
 }

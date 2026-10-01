@@ -13,7 +13,13 @@ namespace xt_util {
 ///
 class XtShutdownSignal {
 public:
-
+    /// @brief 短间隔 polling sleep；flag 变为 true 时提前返回。
+    ///
+    /// @param flag       shutdown atomic flag (caller-owned, 通常是 g_shutdown)。
+    /// @param total      最大睡眠时长。
+    /// @param poll       检查间隔 (默认 50ms)。设小则 shutdown latency 短 + CPU 多;
+    ///                   设大则相反。50ms 是 1000ms frame 的 1/20,够细。
+    /// @return true 表示 shutdown 触发提前退出;false 表示 timeout 完整睡到。
     template <typename Rep1, typename Period1, typename Rep2, typename Period2>
     static bool wait_for(const std::atomic<bool>& flag,
                          std::chrono::duration<Rep1, Period1> total,
@@ -30,6 +36,7 @@ public:
         }
     }
 
+    /// @brief 默认 poll=50ms 的便捷重载。
     template <typename Rep, typename Period>
     static bool wait_for(const std::atomic<bool>& flag,
                          std::chrono::duration<Rep, Period> total) {
@@ -37,4 +44,4 @@ public:
     }
 };
 
-}
+}  // namespace xt_util

@@ -3,7 +3,7 @@
 #include "xt_core/market/XtTickConvert.h"
 #include "XtLogger.h"
 #include "xt_backtest/data/source/XtMarketDataSource.h"
-#include "xt_util/time/XtTime.h"
+#include "xt_util/time/XtTime.h"             // xt_time::to_ns / from_ns / packed_ts
 
 #include <yaml-cpp/yaml.h>
 
@@ -46,12 +46,14 @@ inline int64_t align_up(int64_t v, int64_t grid) noexcept {
     return ((v + grid - 1) / grid) * grid;
 }
 
+// event-axis 真实时刻：sort key 只管序（夜盘旋转编码不可反解），时间一律
+// 取自事件 payload 头；action_date 缺失时 fallback trading_date（preopen/合成源）。
 inline int64_t header_event_ns(const XtReplayEventHeader& h) noexcept {
     const uint32_t d = (h.action_date != 0) ? h.action_date : h.trading_date;
     if (d == 0 && h.action_time == 0) return 0;
     return xt_time::to_ns(d, h.action_time);
 }
-}
+}  // namespace
 
 size_t XtReplayer::run(XtMarketDataSource& source,
                        IReplayRuntime& runtime,
@@ -65,11 +67,17 @@ size_t XtReplayer::run(XtMarketDataSource& source,
     int64_t last_clock_ns = std::numeric_limits<int64_t>::min();
 
     while (true) {
-
+        // ── 阶段 1: peek 下一个事件的时间头（non-consuming） ────────────
         XtReplayEventHeader next_hdr;
         if (!source.peek_next_event_header(next_hdr)) break;
         const int64_t next_ns = header_event_ns(next_hdr);
 
+        // ── 阶段 2: 在 next_ns 之前按绝对网格注入 on_clock（event-axis） ───
+        //   - clock_resolution_ns_ == 0 时整段跳过（向后兼容）
+        //   - 严格 next_clock_ns < next_ns（不允许 ==）
+        //   - align_up(last_clock_ns + 1, res) 保证绝对网格对齐
+        //   - last_clock_ns == INT64_MIN 时跳过（第一个事件前不注入）
+        //   - trading_date 取即将到来事件的交易日（仅供 report/session 戳）
         if (clock_resolution_ns_ > 0
             && last_clock_ns != std::numeric_limits<int64_t>::min()) {
             int64_t next_clock_ns = align_up(last_clock_ns + 1, clock_resolution_ns_);
@@ -82,10 +90,11 @@ size_t XtReplayer::run(XtMarketDataSource& source,
             }
         }
 
+        // ── 阶段 3: advance 并分发事件 ────────────────────────────
         XtReplayEvent ev;
-        if (!source.next_event(ev)) break;
+        if (!source.next_event(ev)) break;  // 理论上 peek 成功后不应发生
         if (ev.type == XtReplayEventType::Tick) {
-
+            // 这里要用 reporter/event stream 约定的 packed timestamp，因此需要进行转换。
             const int64_t ts = xt_time::packed_ts(ev.tick.action_date, ev.tick.action_time);
             reporter.on_tick_pre(ts, ev.tick);
             runtime.on_tick(xt_tick_convert::to_core(ev.tick));
@@ -99,6 +108,7 @@ size_t XtReplayer::run(XtMarketDataSource& source,
             runtime.on_transaction(ev.transaction);
         }
 
+        // 更新 last_clock_ns 到当前事件的 event ns（仅 clock 模式启用时需要）
         if (clock_resolution_ns_ > 0) {
             last_clock_ns = next_ns;
         }

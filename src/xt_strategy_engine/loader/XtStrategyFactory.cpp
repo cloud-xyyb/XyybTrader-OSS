@@ -63,6 +63,7 @@ XtStrategyFactory::UniqueStra XtStrategyFactory::create_managed(const std::strin
         return UniqueStra(nullptr, [](XtStrategyBase*) {});
     }
 
+    // managed pointer 仍要求 factory/loader 生命周期覆盖策略实例；deleter 只负责选对 id。
     return UniqueStra(s, [this, id](XtStrategyBase* p) {
         this->destroy(id, p);
     });

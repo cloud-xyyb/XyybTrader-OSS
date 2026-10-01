@@ -17,12 +17,14 @@ namespace ct::metrics {
 
 namespace {
 
+// realized 持久化用 ×1e6 fixed-point,与 XtStrategyPnlAggregator 内部口径一致。
 constexpr double kFpScale = 1'000'000.0;
 
 int64_t amount_to_fp(double amount) {
     return static_cast<int64_t>(std::llround(amount * kFpScale));
 }
 
+// 只覆盖本文件写出的 sid/code 字段；baseline state 不接受通用 JSON 输入。
 std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
@@ -48,7 +50,7 @@ std::string normalize_sid(std::string_view sid) {
 bool ensure_dir(const std::string& dir) {
     if (dir.empty()) return false;
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
+    std::filesystem::create_directories(dir, ec);  // 目录存在时返回 false 且 ec 为空。
     if (ec) return false;
     return std::filesystem::is_directory(dir, ec);
 }
@@ -71,6 +73,7 @@ bool extract_int_field(const std::string& body, const std::string& key, int* out
     return true;
 }
 
+// Parser 只面向 save() 写出的版本 1 schema；缺关键字段时 fail-closed。
 ParseResult parse_baseline_json(const std::string& body, int expected_trading_day_id) {
     ParseResult result;
     int version = 0;
@@ -118,7 +121,7 @@ ParseResult parse_baseline_json(const std::string& body, int expected_trading_da
         pos = obj_close + 1;
 
         XtStrategyPnlBaseline::BaselineRow r;
-
+        // 不解 \" 转义:sid/code 实际字符集 (策略名/合约代码) 无引号反斜杠;含转义时该值在转义处截断。
         auto extract_str = [&](const std::string& key) -> std::string {
             auto k = obj.find("\"" + key + "\"");
             if (k == std::string::npos) return {};
@@ -148,13 +151,14 @@ ParseResult parse_baseline_json(const std::string& body, int expected_trading_da
         };
         r.sid      = extract_str("sid");
         r.code     = extract_str("code");
-
+        // 优先读取 realized_fp (int64 ×1e6, 精确)；兼容只含 realized 的早期文件
+        // (double, defaultfloat 10 位有效数字，>=1e7 金额小数被截)。
         bool has_realized_fp = false;
         const int64_t realized_fp = extract_int64("realized_fp", has_realized_fp);
         r.realized = has_realized_fp ? static_cast<double>(realized_fp) / kFpScale
                                      : extract_double("realized");
         r.fees     = extract_double("fees");
-        r.fills    = static_cast<uint64_t>(extract_double("fills"));
+        r.fills    = static_cast<uint64_t>(extract_double("fills"));  // 缺字段时按 0 处理，兼容早期文件。
         if (r.code.empty()) {
             result.status = XtStrategyPnlBaseline::LoadStatus::Corrupt;
             return result;
@@ -165,7 +169,7 @@ ParseResult parse_baseline_json(const std::string& body, int expected_trading_da
     return result;
 }
 
-}
+}  // namespace
 
 XtStrategyPnlBaseline::XtStrategyPnlBaseline(std::string instance_id)
     : instance_id_(instance_id.empty() ? std::string("_default") : std::move(instance_id)) {}
@@ -198,7 +202,7 @@ bool XtStrategyPnlBaseline::load(std::string_view base_dir, int trading_day_id) 
         next[k] = std::move(r);
     }
     baseline_ = std::move(next);
-    new_reported_keys_.clear();
+    new_reported_keys_.clear();  // 新 epoch：baseline-new 去重集重置
     last_load_status_ = LoadStatus::Loaded;
     ready_ = true;
     return true;
@@ -207,7 +211,7 @@ bool XtStrategyPnlBaseline::load(std::string_view base_dir, int trading_day_id) 
 void XtStrategyPnlBaseline::rotate_day(const std::vector<BaselineRow>& rows) {
     std::lock_guard<std::mutex> lock(mu_);
     baseline_.clear();
-    new_reported_keys_.clear();
+    new_reported_keys_.clear();  // 新 epoch：baseline-new 去重集重置
     for (const auto& r : rows) {
         if (r.code.empty()) continue;
         BaselineRow row = r;
@@ -225,6 +229,8 @@ bool XtStrategyPnlBaseline::save(std::string_view base_dir, int trading_day_id) 
     if (!ensure_dir(dir)) return false;
     const std::string path = path_for(base_dir, trading_day_id);
 
+    // 走 PathUtil::AtomicOfstream (tmp + fsync(fd) + rename + fsync(parent)),
+    // 防 crash 后留 0 字节文件。
     PathUtil::AtomicOfstream out(path);
     if (!out.is_open()) return false;
 
@@ -234,7 +240,9 @@ bool XtStrategyPnlBaseline::save(std::string_view base_dir, int trading_day_id) 
     ofs << "  \"trading_day_id\": " << trading_day_id << ",\n";
     ofs << "  \"instance_id\": \"" << json_escape(instance_id_) << "\",\n";
     ofs << "  \"baseline\": [\n";
-
+    // realized 双键写出：realized_fp (int64 ×1e6) 是精确值；realized (double 金额)
+    // 供不识别 realized_fp 的二进制读取。load 优先 realized_fp；fixed 防 defaultfloat
+    // 在 >=1e7 金额下截断小数 (10 位有效数字 -> today = cumulative - baseline 出毛刺)。
     ofs << std::fixed << std::setprecision(8);
     bool first = true;
     for (const auto& [k, r] : baseline_) {
@@ -275,7 +283,9 @@ bool XtStrategyPnlBaseline::mark_new_reported(std::string_view sid, std::string_
 }
 
 int64_t XtStrategyPnlBaseline::realized_fp_for_sid(std::string_view sid) const {
-
+    // amount_to_fp 用 llround：baseline 文件经 realized_fp 精确往返，llround 还原出
+    // 与 aggregator 当前累计同口径的开盘 fp，相减得 today realized（emit 显示路径
+    // 用 truncate，gate 走 round 取精确值，差异 < 1 fp/code 对百分比门槛可忽略）。
     const std::string key_sid = normalize_sid(sid);
     std::lock_guard<std::mutex> lock(mu_);
     int64_t sum_fp = 0;
@@ -288,7 +298,7 @@ int64_t XtStrategyPnlBaseline::realized_fp_for_sid(std::string_view sid) const {
 int XtStrategyPnlBaseline::compute_trading_day_id(int tz_offset_h) {
     auto now = std::chrono::system_clock::now();
     auto sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-
+    // 先套用 venue timezone，再取 UTC 日期，避免本地时区影响交易日边界。
     sec += static_cast<int64_t>(tz_offset_h) * 3600;
     std::time_t t = static_cast<std::time_t>(sec);
     std::tm tm_utc;
@@ -340,4 +350,4 @@ std::string XtStrategyPnlBaseline::path_for(std::string_view base_dir,
     return oss.str();
 }
 
-}
+}  // namespace ct::metrics

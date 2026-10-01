@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "oss-dev-jammy",
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/builds/xyybtrader-oss-dev-jammy",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CLOUDTRADER_BUILD_TESTS": "ON",
+        "XT_BUILD_CONTROL_GRPC": "OFF",
+        "XT_SKIP_DEBUG_SPLIT": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "oss-dev",
+      "configurePreset": "oss-dev-jammy",
+      "targets": [
+        "XtRunner",
+        "XtBackTestRunner",
+        "XtSelBacktestRunner",
+        "xt_public_tests",
+        "hft_tick_revert_strategy",
+        "sel_weights_csv_strategy"
+      ]
+    }
+  ]
+}

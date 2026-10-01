@@ -2,13 +2,14 @@
 
 #include <cstdint>
 
-#include "xt_live/hft/control/HftRunnerControl.h"
+#include "xt_live/hft/control/HftRunnerControl.h"  // XtHftRunnerControlContext
 
 namespace xt_live {
 namespace control {
 
 void PanelForceExitLatch::step(XtHftRunnerControlContext& ctx, int64_t now_ms) {
-
+    // force_exit 复用所需的 panel 依赖视图（control ctx 字段直映；单帧构造，
+    // mirror PerSidLiquidator）。
     XtPanelContext panel{};
     panel.td_gateway           = ctx.td_gateway;
     panel.order_book           = ctx.order_book;
@@ -22,18 +23,19 @@ void PanelForceExitLatch::step(XtHftRunnerControlContext& ctx, int64_t now_ms) {
 }
 
 void PanelForceExitLatch::step_panel(XtPanelContext& panel, int64_t now_ms) {
-
+    // fail-safe：关键依赖缺失 → no-op 保 latch（mirror PerSidLiquidator step 入口自查）。
     if (!panel.td_gateway || !panel.order_book || !panel.account_store
         || !panel.runtime_shared_state) {
         return;
     }
 
+    // 全程持锁：1Hz 冷路径 + 条目量级小；RPC 线程 arm 至多阻塞一轮 step。
     std::lock_guard<std::mutex> lk(mu_);
     for (auto it = entries_.begin(); it != entries_.end();) {
         Entry& e = *it;
         bool hedge_warn = false;
         uint64_t oid = 0;
-
+        // strategy_id 空 == runner-wide（5 参重载对空 sid 与 runner-wide 重载等价）。
         const ForceExitOutcome out =
             force_exit_panel_request(panel, e.symbol, e.strategy_id, hedge_warn, &oid);
         ++e.frames;
@@ -62,5 +64,5 @@ void PanelForceExitLatch::step_panel(XtPanelContext& panel, int64_t now_ms) {
     }
 }
 
-}
-}
+}  // namespace control
+}  // namespace xt_live

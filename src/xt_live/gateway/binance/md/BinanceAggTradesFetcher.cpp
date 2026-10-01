@@ -20,18 +20,18 @@ std::string to_upper(std::string_view s) {
     return out;
 }
 
-}
+}  // namespace
 
 bool parse_agg_trades_response(const std::string& body,
                                std::vector<AggTrade>& out,
                                std::string* err) {
-    auto j = nlohmann::json::parse(body, nullptr,  false);
+    auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded()) {
         if (err) *err = "binance aggTrades response: invalid json";
         return false;
     }
     if (!j.is_array()) {
-
+        // binance 错误体是 object {"code":..,"msg":..}；非数组即失败。
         if (err) *err = "binance aggTrades response: not a json array: " + body;
         return false;
     }
@@ -47,7 +47,7 @@ bool parse_agg_trades_response(const std::string& body,
             t.a = e["a"].get<int64_t>();
             t.q = std::stod(e.at("q").get<std::string>());
             t.p = std::stod(e.at("p").get<std::string>());
-
+            // P15：非有限价/量 = 坏页，整页按解析失败（caller 已按失败退避）。
             if (!std::isfinite(t.p) || !std::isfinite(t.q)) {
                 if (err) *err = "binance aggTrades response: non-finite p/q";
                 return false;
@@ -71,7 +71,7 @@ bool BinanceAggTradesFetcher::fetch_sync(std::string_view symbol, int64_t from_i
     std::string body;
     if (!binance_public_http_get(cfg_.host, cfg_.port, path.str(),
                                  static_cast<long>(cfg_.timeout_sec),
-                                 cancel, &body,  nullptr, err)) {
+                                 cancel, &body, /*out_http=*/nullptr, err)) {
         return false;
     }
     std::vector<AggTrade> parsed;
@@ -80,4 +80,4 @@ bool BinanceAggTradesFetcher::fetch_sync(std::string_view symbol, int64_t from_i
     return true;
 }
 
-}
+}  // namespace binance_u

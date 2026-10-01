@@ -45,35 +45,44 @@
 namespace xt_live {
 namespace control {
 
+/// 覆盖 marshal 可见性窗口（closure 入队 → worker 应用 → snapshot publish）
+/// + ForceClosed 后 terminal-vs-trade 落账收敛窗；1Hz control frame 下 ≈3 帧。
 inline constexpr int64_t kForceFlatFenceHoldMs = 3000;
 
 /// @brief per-symbol force-flat submit fence（见文件头）。
 class ForceFlatSubmitFence {
 public:
-
+    /// @param hold_ms submit 后的 held 窗口；测试可注入短窗。
     explicit ForceFlatSubmitFence(int64_t hold_ms = kForceFlatFenceHoldMs)
         : hold_ms_(hold_ms) {}
 
+    /// @brief symbol 是否处于 held 窗口内（惰性清理过期条目）。
     bool held(const std::string& symbol, int64_t now_ms) {
         std::lock_guard<std::mutex> lk(mu_);
         return held_locked_(symbol, now_ms);
     }
 
+    /// @brief submit 前原子 claim：未 held 时置 `until = now + hold` 并返回本次
+    ///        claim 的 generation（>0）；已 held 返 0 不延长（单锁段 check+set，
+    ///        并发恰一胜出）。
     uint64_t try_acquire(const std::string& symbol, int64_t now_ms) {
         std::lock_guard<std::mutex> lk(mu_);
         if (held_locked_(symbol, now_ms)) return 0;
-
+        // 机会式扫除：成功 close 的条目只能由同 symbol 后续访问惰性清理，
+        // 不同 symbol 的过期残条在此阈值扫除，防进程生命周期缓慢累积。
         if (entries_.size() >= kSweepSize) {
             for (auto it = entries_.begin(); it != entries_.end();) {
                 it = (now_ms >= it->second.until_ms) ? entries_.erase(it) : std::next(it);
             }
         }
         uint64_t gen = ++next_gen_;
-        if (gen == 0) gen = ++next_gen_;
+        if (gen == 0) gen = ++next_gen_;  // wrap 保留值 0 跳过（理论完备性）
         entries_[symbol] = Entry{now_ms + hold_ms_, gen};
         return gen;
     }
 
+    /// @brief claim 后 submit 失败（td 返 0）时让出窗口；仅当条目仍属本
+    ///        generation 时删除（他方已重新 claim → no-op，不碰新窗口）。
     void release(const std::string& symbol, uint64_t gen) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = entries_.find(symbol);
@@ -81,7 +90,7 @@ public:
     }
 
 private:
-    static constexpr std::size_t kSweepSize = 32;
+    static constexpr std::size_t kSweepSize = 32;  ///< 达阈即扫除过期残条（机会式）
     struct Entry {
         int64_t until_ms = 0;
         uint64_t gen = 0;
@@ -90,18 +99,18 @@ private:
     bool held_locked_(const std::string& symbol, int64_t now_ms) {
         auto it = entries_.find(symbol);
         if (it == entries_.end()) return false;
-        if (now_ms >= it->second.until_ms) {
+        if (now_ms >= it->second.until_ms) {  // 过期惰性清理
             entries_.erase(it);
             return false;
         }
         return true;
     }
 
-    std::mutex mu_;
-    std::unordered_map<std::string, Entry> entries_;
-    uint64_t next_gen_ = 0;
+    std::mutex mu_;                                  ///< frame 线程 × RPC 线程序列化
+    std::unordered_map<std::string, Entry> entries_; ///< symbol → {held 截止 steady ms, generation}
+    uint64_t next_gen_ = 0;                          ///< 受 mu_ 保护；claim 归属标识
     int64_t hold_ms_ = kForceFlatFenceHoldMs;
 };
 
-}
-}
+}  // namespace control
+}  // namespace xt_live

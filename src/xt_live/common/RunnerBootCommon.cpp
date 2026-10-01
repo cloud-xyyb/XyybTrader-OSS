@@ -8,7 +8,7 @@
 #include "xt_strategy_engine/XtStrategyContext.h"
 #include "XtLogger.h"
 #include "XtPluginHolder.h"
-#include "xt_strategy_engine/loader/StrategyExecCaps.h"
+#include "xt_strategy_engine/loader/StrategyExecCaps.h"  // exec sink capability gate 单源
 #include "xt_risk/engine/XtRiskMonitorState.h"
 #include "xt_identity/StrategySidRegistry.h"
 #include "xt_util/path/PathUtil.h"
@@ -23,7 +23,7 @@ bool load_live_config_or_report(int argc, char** argv,
                                 const char* runner_name, XtLiveConfig& out) {
     std::string load_err;
     std::vector<std::string> validation_errors;
-
+    // XtLogger 依赖配置才能 init，此时只能写 stderr。
     if (!load_live_config(argc, argv, out, load_err, validation_errors)) {
         std::fprintf(stderr, "%s: %s\n", runner_name, load_err.c_str());
         return false;
@@ -56,6 +56,10 @@ void runner_process_init(const XtLiveConfig& cfg, const char* module_tag,
         }
     }
 
+    // 进程内 Prometheus /metrics endpoint。端口走 yaml
+    // `runtime.metrics.exposer_port`；prometheus-agent 按 topology 生成 scrape
+    // 与 remote_write 配置并附加 active labels。多 runner per-host 必须使用
+    // 不同端口；端口为 0 时跳过启动。
 #ifdef XT_HAVE_METRICS
     {
         const int mport = cfg.runtime.control_cfg.metrics_exposer_port;
@@ -77,7 +81,9 @@ void runner_process_init(const XtLiveConfig& cfg, const char* module_tag,
 
 int runner_fail_exit(std::atomic<bool>& shutdown_flag) {
     shutdown_flag.store(true, std::memory_order_release);
-
+    // exposer 已在 runner_process_init 启动，early-fail 路径也需显式 stop：
+    // 避免 civetweb 工作线程在 main() 返回后仍运行；若等 singleton dtor
+    // 在 __cxa_finalize 阶段回收，prometheus::Registry 可能已部分析构。
 #ifdef XT_HAVE_METRICS
     ct::metrics::XtMetricRegistry::instance().stop_exposer();
 #endif
@@ -118,7 +124,7 @@ bool load_strategy_plugins(std::vector<std::unique_ptr<XtPluginHolder>>& out,
                               i, entry.factory_cfg.id, so_path, holder->err);
             return false;
         }
-
+        // 插件 ABI 只负责 create；runner 必须显式传入 yaml init params。
         if (auto* plugin = holder->get()) {
             plugin->init(entry.init_cfg);
         }
@@ -159,12 +165,14 @@ bool wire_sid_registry(std::unique_ptr<xt_identity::StrategySidRegistry>& out,
     out = std::make_unique<xt_identity::StrategySidRegistry>();
     if (!cfg.parsed.portfolio_router) return true;
 
+    // 按 strategies[] 顺序 register → 1-based uint32 ID
     for (const auto& entry : cfg.parsed.strategies) {
         const uint32_t sid_id = out->register_or_lookup(entry.factory_cfg.id);
         XtLogger::info_m("router", "sid_registry: '{}' -> sid_id={}",
                          entry.factory_cfg.id, sid_id);
     }
 
+    // 翻译 yaml string-keyed → uint32-keyed (writeback to risk cfg)
     auto& risk_cfg = cfg.bootstrap.order_gateway_cfg.risk;
     auto max_pos_by_sid = risk_cfg.per_strategy_max_pos_qty;
     for (const auto& [sid_str, qty] : risk_cfg.per_strategy_max_pos_qty_by_sid_string) {
@@ -180,6 +188,7 @@ bool wire_sid_registry(std::unique_ptr<xt_identity::StrategySidRegistry>& out,
             "per_strategy_max_pos_qty: '{}' (sid_id={}) -> {}", sid_str, sid_id, qty);
     }
 
+    // per_strategy_daily_loss_pct string -> uint32 翻译。
     auto daily_loss_by_sid = risk_cfg.per_strategy_daily_loss_pct;
     for (const auto& [sid_str, pct] : risk_cfg.per_strategy_daily_loss_pct_by_sid_string) {
         const uint32_t sid_id = out->lookup(sid_str);
@@ -194,6 +203,7 @@ bool wire_sid_registry(std::unique_ptr<xt_identity::StrategySidRegistry>& out,
             "per_strategy_daily_loss_pct: '{}' (sid_id={}) -> {}", sid_str, sid_id, pct);
     }
 
+    // per_strategy_liquidate_pct string -> uint32 翻译（auto-liquidation 硬阈值）。
     auto liquidate_by_sid = risk_cfg.per_strategy_liquidate_pct;
     for (const auto& [sid_str, pct] : risk_cfg.per_strategy_liquidate_pct_by_sid_string) {
         const uint32_t sid_id = out->lookup(sid_str);
@@ -214,9 +224,10 @@ bool wire_sid_registry(std::unique_ptr<xt_identity::StrategySidRegistry>& out,
 }
 
 void finalize_sid_registry(xt_identity::StrategySidRegistry* registry) {
-
+    // EventLoop tap 通过 process-global sid_registry 反查 sid_id → strategy string。
     xt_identity::StrategySidRegistry::set_global(registry);
-
+    // boot 完成后 freeze registry — run-time 新 sid 注入 fail-soft
+    // (返 kNoSidId + stderr warn)。
     registry->freeze();
 }
 
@@ -240,14 +251,18 @@ bool parse_control_enabled(const std::string& value, bool fallback) {
     return fallback;
 }
 
-}
+}  // namespace
 
 void apply_initial_control_enabled(XtStrategyContext& ctx, XtLiveParamDomain& pd,
                                    const std::string& sid, const char* module_tag) {
     std::string value;
     if (!sid.empty() && pd.get("strategy." + sid + ".enabled", value)) {
-
-        const bool enabled = parse_control_enabled(value,  false);
+        // 值存在但无法识别 → fail-closed (false)，与热更新路径
+        // (XtStrategyContext::on_params_updated 的 parse_bool_value def=false) 一致：
+        // 同一 key+值在启动与热更新必须给出相同 enable 决策，杜绝 malformed 值
+        // 「boot 时运行、首个 param bump 时翻 halt」的不一致。key 缺失（未进本
+        // 分支）仍保持默认启用。
+        const bool enabled = parse_control_enabled(value, /*fallback=*/false);
         ctx.set_control_enabled(enabled);
         XtLogger::info_m(module_tag,
                          "initial strategy enabled gate strategy={} value={} enabled={}",
@@ -255,4 +270,4 @@ void apply_initial_control_enabled(XtStrategyContext& ctx, XtLiveParamDomain& pd
     }
 }
 
-}
+}  // namespace xt_live::common

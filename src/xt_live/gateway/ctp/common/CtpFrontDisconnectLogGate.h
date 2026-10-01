@@ -14,12 +14,15 @@ class CtpFrontDisconnectLogGate {
 public:
     enum class Action { LogError, LogWarn, Suppress };
 
+    /// @brief 收到一次 OnFrontDisconnected;返回本次该如何打日志。
+    /// @param now_ms steady-clock 毫秒
     Action on_disconnect(uint32_t now_ms) {
         if (++streak_ == 1) { last_log_ms_ = now_ms; return Action::LogError; }
         if (now_ms - last_log_ms_ >= kIntervalMs) { last_log_ms_ = now_ms; return Action::LogWarn; }
         return Action::Suppress;
     }
 
+    /// @brief 收到 OnFrontConnected;返回本段断开期间累计的断线回调次数,并复位。
     uint32_t on_reconnect() {
         uint32_t n = streak_;
         streak_ = 0;
@@ -27,7 +30,7 @@ public:
     }
 
 private:
-    static constexpr uint32_t kIntervalMs = 60000;
-    uint32_t streak_ = 0;
-    uint32_t last_log_ms_ = 0;
+    static constexpr uint32_t kIntervalMs = 60000;  ///< 断开期内日志最小间隔(≥1 条/分钟)
+    uint32_t streak_ = 0;        ///< 当前连续断开期内的回调次数(reconnect 复位)
+    uint32_t last_log_ms_ = 0;   ///< 上次打日志的 steady ms 锚点
 };

@@ -10,6 +10,10 @@
 
 namespace ct::data {
 
+/// @brief EventStore MdTick 盘口档数上限（contract v2 变长，1..本值）。
+///
+/// 与 recorder JSONL 的 20 槽（XtLiveRecorder::kMdDepth）及引擎
+/// XtRawTick::DEPTH 对齐；写读两端共用本常量作为 depth 上限。
 inline constexpr int kEventStoreMdDepth = 20;
 
-}
+}  // namespace ct::data

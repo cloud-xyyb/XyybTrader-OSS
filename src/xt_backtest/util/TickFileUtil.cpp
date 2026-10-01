@@ -5,8 +5,8 @@
 #include "XtParseUtil.h"
 #include "xt_util/path/PathUtil.h"
 #include "TickCsvUtil.h"
-#include "xt_core/sync/XtTransparentStringHash.h"
-#include "xt_util/time/XtTime.h"
+#include "xt_core/sync/XtTransparentStringHash.h"  // FNV-1a 常量和流式 update。
+#include "xt_util/time/XtTime.h"                   // yyyymmdd_add_days / diff_days（guard band）
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +18,9 @@
 #include <sstream>
 #include <utility>
 
+// 文件名日期只作为范围过滤条件；解析失败时调用方仍可保留该文件参与扫描。
 bool extract_date_from_filename(const std::string& name, uint32_t& out_date) {
-
+    // 优先匹配 8 位连续数字（20220527.csv）。
     for (size_t i = 0; i + 7 < name.size(); ++i) {
         bool ok = true;
         for (size_t j = 0; j < 8; ++j) {
@@ -28,7 +29,7 @@ bool extract_date_from_filename(const std::string& name, uint32_t& out_date) {
         if (!ok) continue;
         return XtParseUtil::parse_u32(std::string_view(name.data() + i, 8), out_date);
     }
-
+    // 其次匹配 YYYY-MM-DD（2022-05-27.csv）。
     for (size_t i = 0; i + 9 < name.size(); ++i) {
         if (!std::isdigit(static_cast<unsigned char>(name[i]))) continue;
         bool match = true;
@@ -82,7 +83,7 @@ std::string build_tick_cache_path(const std::string& cache_dir,
         }
         if (!sec.empty()) sym = sec;
     }
-
+    // 参数指纹：排序后的 source 路径集 + qty_base bit-pattern + vol_mode。
     uint64_t phash = xt_core::sync::kFnv1a64OffsetBasis;
     auto mix = [&](const void* d, size_t n) {
         phash = xt_core::sync::fnv1a_update(phash, d, n);
@@ -90,7 +91,7 @@ std::string build_tick_cache_path(const std::string& cache_dir,
     std::vector<std::string> sorted = sources;
     std::sort(sorted.begin(), sorted.end());
     for (const auto& p : sorted) {
-
+        // 长度前缀消 concat 歧义（{"a","bc"} 与 {"ab","c"} 否则同指纹）。
         const uint32_t len = static_cast<uint32_t>(p.size());
         mix(&len, sizeof(len));
         mix(p.data(), p.size());
@@ -108,6 +109,7 @@ std::string build_tick_cache_path(const std::string& cache_dir,
 
 namespace {
 
+/// @brief 名字是否为 `n` 位纯数字（年目录 4 位、月目录 2 位）。
 bool is_all_digits(const std::string& s, size_t n) {
     if (s.size() != n) return false;
     for (char c : s) {
@@ -116,10 +118,12 @@ bool is_all_digits(const std::string& s, size_t n) {
     return true;
 }
 
+/// @brief `year*12 + month` 的月序号；用于月目录区间迭代。
 int month_index_of(uint32_t yyyymmdd) {
     return static_cast<int>(yyyymmdd / 10000) * 12 + static_cast<int>((yyyymmdd / 100) % 100);
 }
 
+/// @brief 月序号 → `root/YYYY/MM` 目录路径。
 std::string month_dir_path(const std::string& root, int month_index) {
     int yy = month_index / 12;
     int mm = month_index % 12;
@@ -129,7 +133,7 @@ std::string month_dir_path(const std::string& root, int month_index) {
     return PathUtil::join(PathUtil::join(root, std::to_string(yy)), buf);
 }
 
-}
+}  // namespace
 
 uint32_t derive_night_carry_guard_days(std::vector<uint32_t> filename_days) {
     const size_t input_files = filename_days.size();
@@ -141,7 +145,8 @@ uint32_t derive_night_carry_guard_days(std::vector<uint32_t> filename_days) {
                         filename_days.end());
     if (filename_days.size() < 2) {
         if (input_files != 0 && filename_days.empty()) {
-
+            // 一个文件名都解析不出日期：间隔无从测量，只能按保底值放宽。语料换成不带
+            // 日期的命名后本条会持续成立，故进程内只吼一次。
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true, std::memory_order_relaxed)) {
                 XtLogger::warn_m("MD",
@@ -157,12 +162,13 @@ uint32_t derive_night_carry_guard_days(std::vector<uint32_t> filename_days) {
         max_gap = (std::max)(max_gap,
                              xt_time::yyyymmdd_diff_days(filename_days[i - 1], filename_days[i]));
     }
-
+    // +1：间隔 g 意味着上一个 session 的文件正落在 g 天之前，放宽必须够到它本身。
     return (std::max)(kTickNightCarryGuardDays, static_cast<uint32_t>(max_gap + 1));
 }
 
 uint32_t derive_night_carry_guard_days_for_paths(const std::vector<std::string>& paths) {
-
+    // 每个文件都占一个位置（解析不出的记 0）：入参条数即语料文件数，`derive_*` 据此
+    // 区分「语料为空」与「语料全是无日期命名」。
     std::vector<uint32_t> days;
     days.reserve(paths.size());
     for (const auto& p : paths) {
@@ -178,6 +184,8 @@ void append_all_tick_files_from_root(const std::string& root, std::vector<std::s
     std::error_code ec;
     if (!std::filesystem::exists(root, ec)) return;
 
+    // 只认 `YYYY/MM/*.csv`：有窗扫描也只看这两层，多认一层就会把窗口扫描永远看不到的
+    // 文件算进 family 身份，两条路径的输入集从此对不上。
     for (const auto& year : std::filesystem::directory_iterator(root, ec)) {
         if (ec) break;
         if (!year.is_directory()) continue;
@@ -218,14 +226,22 @@ void append_tick_files_from_root(const std::string& root,
         return;
     }
 
+    // 起点向前放宽一段 guard（widen-only）：窗口首日的夜盘段落在上一个 session 的文件里，
+    // 而上一个 session 与窗口首日之间可能隔着周末或长假——只放宽一天时，周一开窗会把周五
+    // 文件承载的周一夜盘段整段漏掉。多读的窗外行由读端行级过滤（in_day_range）精确裁掉。
+    //
+    // guard 长度由语料自己说：先按保底值圈出月目录区间扫一遍，用**扫到的**文件名日集合
+    // 推导 guard（零额外 I/O——这批目录本来就要枚举）；推出的起点若落进更早的月份，补扫
+    // 那几个月再推一次。语料按月落盘时月数有限，循环必然收敛。
     const int end_month = month_index_of(end_date);
-
+    // start_date == 0 = 只设上界，起点不设界（月序号 0，同 band_start 为 0 的老口径）。
     int first_month =
         (start_date != 0)
             ? month_index_of(xt_time::yyyymmdd_add_days(
                   start_date, -static_cast<int>(kTickNightCarryGuardDays)))
             : 0;
 
+    // 先按月收好（路径 + 文件名日），过滤推迟到 guard 定下来之后。
     std::vector<std::pair<std::string, uint32_t>> scanned;
     std::vector<uint32_t> seen_days;
     auto scan_months = [&](int from_month, int to_month) {
@@ -248,7 +264,7 @@ void append_tick_files_from_root(const std::string& root,
     scan_months(first_month, end_month);
     uint32_t band_start = 0;
     while (true) {
-        if (start_date == 0) break;
+        if (start_date == 0) break;  // 只设上界的窗不需要 band
         band_start = xt_time::yyyymmdd_add_days(
             start_date, -static_cast<int64_t>(derive_night_carry_guard_days(seen_days)));
         const int band_month = month_index_of(band_start);
@@ -314,10 +330,12 @@ std::vector<std::string> filter_files_for_auto_main(const std::vector<std::strin
         if (extract_date_from_filename(name, fdate) && fdate < start_date) continue;
         kept.push_back(f);
     }
-
+    // 全部被剔除（如窗口配置与语料错位）时回退原列表，保守不致空推断。
     if (kept.empty()) return files;
     return kept;
 }
+
+// tick 二进制 cache manifest。
 
 uint64_t compute_source_signature(const std::vector<std::string>& sources,
                                   double qty_base,
@@ -325,7 +343,8 @@ uint64_t compute_source_signature(const std::vector<std::string>& sources,
                                   uint32_t start_day,
                                   uint32_t end_day) {
     if (sources.empty()) return 0;
-
+    // 对排序后的 (path, mtime, size) tuple 做流式 FNV-1a，保证输入顺序无关；
+    // 再混入影响 bin 内容的解析参数（qty_base bit-pattern + vol_mode 枚举值）。
     uint64_t hash = xt_core::sync::kFnv1a64OffsetBasis;
     auto mix = [&](const void* data, size_t n) {
         hash = xt_core::sync::fnv1a_update(hash, data, n);
@@ -338,7 +357,7 @@ uint64_t compute_source_signature(const std::vector<std::string>& sources,
         if (ec) return 0;
         const auto mt = std::filesystem::last_write_time(path, ec);
         if (ec) return 0;
-
+        // file_time_type 的 epoch 由实现决定；manifest 只要求同一环境内可复算。
         const auto mt_count = mt.time_since_epoch().count();
         mix(path.data(), path.size());
         mix(&sz, sizeof(sz));
@@ -347,10 +366,12 @@ uint64_t compute_source_signature(const std::vector<std::string>& sources,
     mix(&qty_base, sizeof(qty_base));
     const int32_t vm = static_cast<int32_t>(vol_mode);
     mix(&vm, sizeof(vm));
-
+    // codec 修订号折进签名：解析器语义变更（bump）时旧 cache 签名必 mismatch →
+    // 自动重建，消灸「源不变旧 bin 静默命中」窗口（旧格式 manifest 一次性失效）。
     const uint16_t codec_ver = xt_tick_bin::kTickBinCodecVersion;
     mix(&codec_ver, sizeof(codec_ver));
-
+    // builder 修订号：建库语义变更（非 codec 字节格式变更）时 bump。
+    // rev 2 = 建库按交易日窗过滤（cache 内容与文件名 range 一致），旧全量 cache 失效。
     const uint16_t builder_rev = 2;
     mix(&builder_rev, sizeof(builder_rev));
     mix(&start_day, sizeof(start_day));
@@ -361,7 +382,8 @@ uint64_t compute_source_signature(const std::vector<std::string>& sources,
 bool write_cache_manifest(const std::string& bin_path, uint64_t signature) {
     if (bin_path.empty() || signature == 0) return false;
     const std::string manifest_path = bin_path + ".manifest";
-
+    // key=value 文本格式避免给 backtest cache 路径引入额外依赖。
+    // version 仅作 forensic 标记；verify 只比 signature（算法升级靠 signature mismatch 自然失效）。
     std::ostringstream oss;
     oss << "version=2\n"
         << "signature=" << signature << "\n";

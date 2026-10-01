@@ -7,6 +7,7 @@
 
 | 组件 | 用途 | 许可证 |
 |---|---|---|
+| [googletest](https://github.com/google/googletest) | SEL 单元与集成测试 | BSD-3-Clause（完整 LICENSE 随源码分发） |
 | [flatbuffers](https://github.com/google/flatbuffers) | 事件录制二进制序列化 | Apache-2.0 |
 | [nlohmann_json](https://github.com/nlohmann/json) | JSON 解析/生成 | MIT |
 | [spdlog](https://github.com/gabime/spdlog) | 日志（内嵌 bundled [fmt](https://github.com/fmtlib/fmt)，MIT） | MIT |
@@ -36,5 +37,7 @@
 
 ## 数据
 
-- `data/regression/` 内附带的期货分笔样例数据仅供回归测试与示例回测使用，不构成任何
+- `data/regression/sample_ticks/` 内附带的期货分笔样例数据仅供回归测试与示例回测使用，不构成任何
   投资建议；数据为历史行情片段，版权归原交易所所有。
+
+- SEL 的 sel_demo、sel_demo_large、sel_ca 为项目维护的合成回归 fixture，随项目 MIT 许可发布；来源、构造方法和逐文件 hash 见 [DATA_PROVENANCE.md](docs/DATA_PROVENANCE.md)。

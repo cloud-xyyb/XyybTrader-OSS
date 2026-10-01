@@ -39,6 +39,7 @@ private:
     std::atomic_flag& flag_;
 };
 
+// 只移除当前线程 TLS 中指向 domain 的 entry；其他线程的 record 由 force_reclaim_all_ 统一处理。
 void remove_current_thread_tls_record(const HazardDomain* domain) noexcept {
     tls_hazard_records.erase(
         std::remove_if(tls_hazard_records.begin(), tls_hazard_records.end(),
@@ -48,14 +49,14 @@ void remove_current_thread_tls_record(const HazardDomain* domain) noexcept {
         tls_hazard_records.end());
 }
 
-}
+}  // namespace
 
 HazardDomain::HazardDomain() = default;
 
 HazardDomain::~HazardDomain() {
     shutting_down_.store(true, std::memory_order_release);
     remove_current_thread_tls_record(this);
-
+    // 析构要求外部已经让读线程 quiescent；这里不等待其他线程释放 hazard slot。
     force_reclaim_all_();
 }
 
@@ -71,7 +72,7 @@ HazardDomain::ThreadRecord* HazardDomain::local_record_() const noexcept {
         std::abort();
     }
     record->owner_thread = std::this_thread::get_id();
-
+    // reserve 只发生在线程首次进入 domain 时，避免常规 retire push 频繁扩容。
     record->retired.reserve(kMaxHazardsPerThread * 4);
 
     {
@@ -120,11 +121,15 @@ void HazardDomain::try_scan() noexcept {
         return;
     }
 
+    // scan 是 writer/GC 路径：用临时 set 收集所有已发布 hazard，允许发生短期堆分配。
     std::unordered_set<const void*> hazards;
 
     {
         SpinLockGuard guard(records_lock_);
-
+        // records_.size() 的 reserve 提示也必须在锁内读：local_record_() 注册新线程时
+        // 在锁内 push_back(records_)，锁外读 size() 会与之 data race（TSAN 报，且属 UB——
+        // 即便仅作 reserve 容量提示）。持 records_lock_ 保护 records_ 的 size 读与迭代；
+        // hazard slot 本身通过 acquire load 读取。
         hazards.reserve(records_.size() * kMaxHazardsPerThread);
         for (const auto* thread_record : records_) {
             if (!thread_record) {
@@ -142,7 +147,7 @@ void HazardDomain::try_scan() noexcept {
     auto write = record->retired.begin();
     for (auto read = record->retired.begin(); read != record->retired.end(); ++read) {
         if (hazards.find(read->ptr) != hazards.end()) {
-
+            // 仍被读者保护的对象留在当前线程 retire list，等待后续 scan。
             if (write != read) {
                 *write = *read;
             }
@@ -167,7 +172,7 @@ std::size_t HazardDomain::thread_record_count() const noexcept {
 
 std::size_t HazardDomain::scan_threshold_() const noexcept {
     const std::size_t records = std::max<std::size_t>(thread_record_count(), 1);
-
+    // 阈值随线程数增长，避免 reader 多时 writer 过于频繁地全域扫描。
     return std::max<std::size_t>(2 * records * kMaxHazardsPerThread, kMaxHazardsPerThread);
 }
 
@@ -182,7 +187,7 @@ void HazardDomain::force_reclaim_all_() noexcept {
         if (!record) {
             continue;
         }
-
+        // Domain 析构期外部应已停止 reader；清 slot 只是避免诊断残留，不提供同步等待。
         for (auto& hazard : record->hazards) {
             hazard.store(nullptr, std::memory_order_release);
         }
@@ -195,5 +200,5 @@ void HazardDomain::force_reclaim_all_() noexcept {
     }
 }
 
-}
-}
+}  // namespace sync
+}  // namespace xt_util

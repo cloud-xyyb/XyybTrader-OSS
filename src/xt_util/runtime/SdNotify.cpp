@@ -4,13 +4,13 @@
 #include <cstring>
 
 #ifdef _WIN32
-
+// Windows 无 systemd/unix socket，保留相同 API 的 no-op stub。
 namespace xt_util {
 bool sd_notify(const char*) noexcept { return false; }
 bool sd_notify_ready() noexcept { return false; }
 bool sd_notify_watchdog() noexcept { return false; }
 bool sd_notify_stopping() noexcept { return false; }
-}
+}  // namespace xt_util
 #else
 
 #include <sys/socket.h>
@@ -29,6 +29,7 @@ bool sd_notify(const char* state) noexcept {
     const std::size_t path_len = std::strlen(socket_path);
     if (path_len >= sizeof(addr.sun_path)) return false;
 
+    // systemd abstract namespace socket 用 '@' 表示首字节 NUL。
     if (socket_path[0] == '@') {
         addr.sun_path[0] = '\0';
         std::memcpy(addr.sun_path + 1, socket_path + 1, path_len - 1);
@@ -58,6 +59,6 @@ bool sd_notify_stopping() noexcept {
     return sd_notify("STOPPING=1\n");
 }
 
-}
+}  // namespace xt_util
 
-#endif
+#endif  // _WIN32

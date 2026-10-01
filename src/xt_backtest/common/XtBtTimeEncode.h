@@ -9,6 +9,14 @@
 
 #include <cstdint>
 
+// ── 回测风控时钟编码（bt risk clock encode）─────────────────────────────────
+//
+// 把交易日 + 打包时刻编码为单一可比较 int64，供 XtRiskEvalContext::now_ms。
+// HHMMSSmmm 先转线性 ms-since-midnight，避免分钟/小时边界处非线性导致
+// rate limit 窗口精度失真；date×1e8 保证跨日单调。HFT/CTA 两侧回测 gateway
+// 共用此编码，保证 reject/normal 路径时间戳同源可比。
+
+/// @brief (date YYYYMMDD, time_ms HHMMSSmmm) → date×1e8 + 线性 ms-since-midnight。
 inline int64_t bt_risk_now_ms(uint32_t date, uint32_t time_ms) noexcept {
     const uint32_t hh = time_ms / 10000000;
     const uint32_t mm = (time_ms / 100000) % 100;

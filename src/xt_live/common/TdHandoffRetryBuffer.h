@@ -9,6 +9,7 @@
 
 namespace xt_live {
 
+/// 重投缓冲默认容量；覆盖 TD 队列瞬时满的突发窗口（must_not_drop 为低频事件）。
 inline constexpr size_t kTdHandoffDefaultCapacity = 256;
 
 /// @brief must_not_drop 事件的 TD-queue handoff 重投缓冲（bounded store-and-forward）。
@@ -48,29 +49,38 @@ class TdHandoffRetryBuffer {
 public:
     static constexpr size_t kDefaultCapacity = kTdHandoffDefaultCapacity;
 
+    /// @brief offer 结局；kOverflow 之外 payload 均未丢失。
     enum class Offer : uint8_t {
-        kEnqueued,
-        kBuffered,
-        kOverflow,
+        kEnqueued,  ///< 已直接投递下游队列（缓冲为空且 push 成功）。
+        kBuffered,  ///< 已持入重投缓冲（进程内必达承诺生效）。
+        kOverflow,  ///< 缓冲已满，新事件被拒绝——调用方按既有 drop 语义计数。
     };
 
     /// @brief 观测快照；counter 单调递增，depth/store_and_forward 为瞬时值。
     struct Stats {
-        uint64_t buffered_total = 0;
-        uint64_t redelivered_total = 0;
-        uint64_t overflow_total = 0;
-        size_t depth = 0;
-        bool store_and_forward = false;
+        uint64_t buffered_total = 0;     ///< 累计持入缓冲的事件数
+        uint64_t redelivered_total = 0;  ///< 累计自缓冲重投成功的事件数
+        uint64_t overflow_total = 0;     ///< 累计因缓冲满被拒绝的事件数
+        size_t depth = 0;                ///< 当前缓冲深度
+        bool store_and_forward = false;  ///< 当前是否处于 S&F 模式
     };
 
     explicit TdHandoffRetryBuffer(size_t capacity = kDefaultCapacity)
         : cap_(capacity) {}
 
+    /// @brief 投递一个 must_not_drop 事件：先试排空缓冲（enqueue 调用点即 drain
+    ///        时机），缓冲空则直发，直发失败或模式内则按序持入缓冲。
+    /// @param ev   事件 payload；kOverflow 时随本次调用丢弃（调用方已在调用前
+    ///             提取计数/分类所需信息）。
+    /// @param push 下游投递函数，见类注释 PushFn 契约；在本组件锁内执行，必须
+    ///             非阻塞（对齐 MPSC try-push 语义）。
+    /// @return 见 Offer；kOverflow 才算 drop。
     template <typename PushFn>
     Offer offer(Event ev, PushFn&& push) {
         std::lock_guard<std::mutex> lk(mu_);
         if (cap_ == 0) {
-
+            // 功能关闭：直发，失败即视为溢出（回退旧的失败即丢语义）；
+            // kOverflow 返回值与 overflow_total 保持 1:1，与 enabled 路径同口径。
             if (push(ev)) {
                 return Offer::kEnqueued;
             }
@@ -84,7 +94,7 @@ public:
             if (push(ev)) {
                 return Offer::kEnqueued;
             }
-
+            // 下游拒绝（队列满/已停）→ 进入 store-and-forward。
             buf_.push_back(std::move(ev));
             saf_hint_.store(true, std::memory_order_relaxed);
             buffered_total_.fetch_add(1, std::memory_order_relaxed);
@@ -99,16 +109,24 @@ public:
         return Offer::kBuffered;
     }
 
+    /// @brief 自队首按序重投缓冲事件；排空即退出 S&F 模式（同一临界区）。
+    /// @return 本次成功重投的事件数。
+    /// @note 供周期 hook（1Hz frame-tail / worker 每轮）与 enqueue 调用点共用；
+    ///       缓冲为空时 O(1) 返回。任意线程可调。
     template <typename PushFn>
     size_t try_drain(PushFn&& push) {
         std::lock_guard<std::mutex> lk(mu_);
         return drain_locked_(push);
     }
 
+    /// @brief S&F 模式 hint（lock-free relaxed 读）。
+    /// @note 仅作廉价预检（周期 hook / 非关键事件路径避免每次取锁）；权威判定
+    ///       在 offer/try_drain 锁内完成，hint 短暂滞后无碍正确性。
     [[nodiscard]] bool in_store_and_forward() const noexcept {
         return saf_hint_.load(std::memory_order_relaxed);
     }
 
+    /// @brief 观测快照（冷路径，取锁读 depth 保证与 counter 一致视图）。
     [[nodiscard]] Stats stats() const {
         std::lock_guard<std::mutex> lk(mu_);
         Stats s;
@@ -120,18 +138,19 @@ public:
         return s;
     }
 
+    /// @brief 运行时调整容量；0 = 关闭（已缓冲事件保留，仍可被 try_drain 排空）。
     void set_capacity(size_t capacity) {
         std::lock_guard<std::mutex> lk(mu_);
         cap_ = capacity;
     }
 
 private:
-
+    /// @pre 调用方持有 mu_。
     template <typename PushFn>
     size_t drain_locked_(PushFn&& push) {
         size_t n = 0;
         while (!buf_.empty()) {
-
+            // PushFn 失败不消费实参（契约）→ 队首原地保留，保序等待下轮。
             if (!push(buf_.front())) break;
             buf_.pop_front();
             ++n;
@@ -145,14 +164,14 @@ private:
         return n;
     }
 
-    mutable std::mutex mu_;
-    std::deque<Event> buf_;
-    size_t cap_;
+    mutable std::mutex mu_;   ///< 序列化 offer 决策与 drain+模式清除（见类注释）
+    std::deque<Event> buf_;   ///< S&F 缓冲；非空 ⇔ S&F 模式（锁内权威判定）
+    size_t cap_;              ///< 容量上限；0 = 功能关闭；mu_ 保护
 
-    std::atomic<bool> saf_hint_{false};
-    std::atomic<uint64_t> buffered_total_{0};
-    std::atomic<uint64_t> redelivered_total_{0};
-    std::atomic<uint64_t> overflow_total_{0};
+    std::atomic<bool> saf_hint_{false};            ///< S&F 模式 lock-free hint
+    std::atomic<uint64_t> buffered_total_{0};      ///< 累计持入缓冲数
+    std::atomic<uint64_t> redelivered_total_{0};   ///< 累计重投成功数
+    std::atomic<uint64_t> overflow_total_{0};      ///< 累计溢出拒绝数
 };
 
-}
+}  // namespace xt_live

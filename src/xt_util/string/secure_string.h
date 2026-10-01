@@ -32,9 +32,10 @@ namespace XtUtil {
 /// string 的内部缓冲；调用方不应继续保留或复用该 source。
 class secure_string {
 public:
-
+    /// @brief 空 secure_string；不分配、不 mlock。
     secure_string() noexcept = default;
 
+    /// @brief 从 rvalue string 接管 secret，并清零 source string 的内部缓冲。
     explicit secure_string(std::string&& source) {
         const size_t n = source.size();
         if (n == 0) {
@@ -44,10 +45,11 @@ public:
         allocate_(n);
         std::memcpy(buf_, source.data(), n);
         size_ = n;
-
+        // 清掉 source string 内部缓冲，包括 SSO 与堆分配实现。
         secure_zero_string(source);
     }
 
+    /// @brief 从 raw bytes 拷贝 secret；空指针或零长度得到 empty()。
     secure_string(const char* data, size_t n) {
         if (data == nullptr || n == 0) return;
         allocate_(n);
@@ -80,19 +82,27 @@ public:
 
     ~secure_string() { release_(); }
 
+    /// @brief 只读访问指针。返回的指针在 secure_string 生命周期内有效。
+    /// @note 调用方 **不得** 拷贝出来再保存 std::string —— 失去 mlock 保护。
+    /// @return  指向内部缓冲的常量指针；空 secure_string 返回 ""（C-string 安全）。
     const char* data() const noexcept { return buf_ ? buf_ : ""; }
 
     size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
 
+    /// @brief 提供 string_view 接口供需要 length-bounded API 使用。
     std::string_view view() const noexcept {
         return buf_ ? std::string_view{buf_, size_} : std::string_view{};
     }
 
+    /// @brief 为必须接收 owning string 的外部 API 提供转换；调用方必须立刻消费，不得长存。
+    /// @note 名字带 unsafe_ 前缀强调反模式：每次调用产生一份未保护的
+    ///       std::string 拷贝，**该拷贝不在 mlock 保护范围内**。
     std::string unsafe_to_string() const {
         return buf_ ? std::string{buf_, size_} : std::string{};
     }
 
+    /// @brief 显式 zero + 释放（dtor 内部调用，public 仅供 reset 测试用）。
     void clear() noexcept { release_(); }
 
 private:
@@ -108,7 +118,7 @@ private:
         buf_ = static_cast<char*>(p);
         cap_ = cap;
         if (::mlock(buf_, cap_) != 0) {
-
+            // mlock 是 best-effort：失败不影响进程运行，但保留 stderr 诊断。
             std::fprintf(stderr,
                          "[secure_string] mlock(%zuB) failed; secret may swap. "
                          "Check ulimit -l (RLIMIT_MEMLOCK).\n", cap_);
@@ -123,7 +133,7 @@ private:
 
     void release_() noexcept {
         if (buf_ == nullptr) return;
-
+        // volatile-pointer zero 防止 free 前清零被优化为 dead store。
         secure_zero_buf(buf_, cap_);
 #if XT_SECURE_STRING_HAS_MLOCK
         ::munlock(buf_, cap_);
@@ -134,12 +144,16 @@ private:
         cap_ = 0;
     }
 
+    /// @brief Volatile-pointer zero —— 防 dead store 优化。
     static void secure_zero_buf(void* p, size_t n) noexcept {
         if (p == nullptr || n == 0) return;
         volatile unsigned char* vp = static_cast<volatile unsigned char*>(p);
         while (n--) *vp++ = 0;
     }
 
+    /// @brief 清掉 std::string 内部缓冲。同时覆盖 SSO 与 heap 两种实现。
+    /// @note 用 const_cast 让代码同时支持 C++14（C++17 才允许 string::data()
+    ///       non-const 重载）。本项目要求 C++17 但保留兼容性。
     static void secure_zero_string(std::string& s) noexcept {
         if (!s.empty()) {
             secure_zero_buf(const_cast<char*>(s.data()), s.size());
@@ -153,4 +167,4 @@ private:
     size_t cap_ = 0;
 };
 
-}
+}  // namespace XtUtil

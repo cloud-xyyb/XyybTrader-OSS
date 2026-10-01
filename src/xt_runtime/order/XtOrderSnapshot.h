@@ -17,9 +17,11 @@
 namespace xt_runtime {
 namespace order {
 
+// Runtime book snapshot 直接暴露 instrument id，避免 reader 再做 code->id 查找。
 using xt_core::XtInstrumentId;
 using xt_core::kInvalidInstrumentId;
 
+/// Snapshot 数组固定容量；写入方超过容量时截断，reader 不持有容器引用。
 inline constexpr std::size_t kOrderSnapshotMaxOrders = 512;
 inline constexpr std::size_t kOrderSnapshotMaxCodes = 512;
 inline constexpr std::size_t kOrderSnapshotMaxCloseOutstanding = 512;
@@ -30,9 +32,9 @@ inline constexpr std::size_t kOrderSnapshotCodeLen = 64;
 /// 由 XtOrderRuntimeBook 单写者发布，跨线程 reader 只能在 HazardGuard 生命周期内读取。
 /// `id=0` 表示空槽；所有 qty/price 字段使用 order fixed-point scale。
 struct OrderSnapshot {
-    uint64_t id = 0;
-    XtInstrumentId instrument_id = kInvalidInstrumentId;
-    char code[kOrderSnapshotCodeLen] = {};
+    uint64_t id = 0;                                     ///< 逻辑订单 id；0 表示空槽。
+    XtInstrumentId instrument_id = kInvalidInstrumentId; ///< 无效 id 表示 code 未解析。
+    char code[kOrderSnapshotCodeLen] = {};               ///< NUL-terminated，超长 code 截断。
     bool is_buy = true;
     bool is_close = false;
     XtOffset close_offset = XtOffset::Close;
@@ -43,7 +45,7 @@ struct OrderSnapshot {
     int64_t filled_today_fp = 0;
     int64_t filled_yesterday_fp = 0;
     uint64_t seq = 0;
-    uint32_t sid_id = 0;
+    uint32_t sid_id = 0;         ///< 0 表示 no-sid/single-strategy 路径。
 };
 
 /// @brief 已跟踪合约或 force-flat pending 合约的 snapshot 条目。
@@ -53,9 +55,13 @@ struct OrderSnapshot {
 struct OrderTrackedCodeSnapshot {
     XtInstrumentId instrument_id = kInvalidInstrumentId;
     char code[kOrderSnapshotCodeLen] = {};
-
+    /// force-flat 发起方 sid_id (0 = global/no-sid scope)。
+    /// 仅在 fresh->force_flat_pending_codes 数组中有意义 (tracked_codes 数组保留 default 0)。
     uint32_t force_flat_sid_id = 0;
-
+    /// true = 该条目对应「真·force-flat」单（record_force_flat_order）；
+    /// false = 策略普通平仓挂单（on_order_submitted, is_close）。panel 重复强平守卫的窄口径
+    /// (is_genuine_force_flat_pending*) 据此过滤，避免策略 passive 平仓单误阻断 operator 接管。
+    /// 宽口径 is_force_flat_pending（closeout 收集用）不看此位。
     bool is_genuine_force_flat = false;
 };
 
@@ -85,6 +91,7 @@ struct OrderBookSnapshot {
     std::array<CloseOutstandingSnapshot, kOrderSnapshotMaxCloseOutstanding> close_outstanding{};
 };
 
+/// @brief 拷贝 code 到 snapshot 固定数组，并保证 NUL 结尾。
 inline void copy_snapshot_code(char (&dst)[kOrderSnapshotCodeLen], const char* src) noexcept {
     dst[0] = '\0';
     if (!src || src[0] == '\0') {
@@ -94,6 +101,7 @@ inline void copy_snapshot_code(char (&dst)[kOrderSnapshotCodeLen], const char* s
     dst[kOrderSnapshotCodeLen - 1] = '\0';
 }
 
+/// @brief 比较 snapshot code；任一侧为空时返回 false。
 inline bool snapshot_code_equals(const char* lhs, const char* rhs) noexcept {
     if (!lhs || lhs[0] == '\0' || !rhs || rhs[0] == '\0') {
         return false;
@@ -110,5 +118,5 @@ static_assert(std::is_trivially_copyable<CloseOutstandingSnapshot>::value,
 static_assert(std::is_trivially_copyable<OrderBookSnapshot>::value,
               "OrderBookSnapshot must stay trivially copyable");
 
-}
-}
+}  // namespace order
+}  // namespace xt_runtime

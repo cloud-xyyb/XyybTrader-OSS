@@ -1,0 +1,58 @@
+# Phase 13i large-scale wt parity (2026-05-10): 60 days × 5 stocks × 3 rebalance
+# fee 等价 wt 2 档 (commission + stamp_duty merged into close)
+
+datalake:
+  root: ""
+  allow_schema_skew: true
+
+selector:
+  trading_dates_csv: data/regression/sel_demo_large/trading_dates.csv
+  close_prices_csv:  data/regression/sel_demo_large/close_prices.csv
+  date_from: 0  # 不过滤
+  date_to:   0
+
+  task:
+    strategy_id: sel_demo_large
+    period: daily
+    day: 0
+    time: 1500
+    strict_time: true
+    trdtpl: CHINA
+    session: default
+
+  strategy:
+    so:    var/plugins/strategies/libsel_weights_csv_strategy.so
+    id:    sel_demo_large
+    params:
+      weights_path: data/regression/sel_demo_large/weights.csv
+      normalize: true
+
+account:
+  initial_cash: 1000000.0    # 100 万 与 wt strategy hardcoded INITIAL_CASH 对齐
+
+commodities:
+  '600000.SH': {vol_scale: 1.0, price_tick: 0.01, margin_rate: 0.0, has_open_interest: false, has_settle_price: false, is_t_plus_1: true, min_lot: 100, allow_short: false}
+  '000001.SZ': {vol_scale: 1.0, price_tick: 0.01, margin_rate: 0.0, has_open_interest: false, has_settle_price: false, is_t_plus_1: true, min_lot: 100, allow_short: false}
+  '600519.SH': {vol_scale: 1.0, price_tick: 0.01, margin_rate: 0.0, has_open_interest: false, has_settle_price: false, is_t_plus_1: true, min_lot: 100, allow_short: false}
+  '601318.SH': {vol_scale: 1.0, price_tick: 0.01, margin_rate: 0.0, has_open_interest: false, has_settle_price: false, is_t_plus_1: true, min_lot: 100, allow_short: false}
+  '000333.SZ': {vol_scale: 1.0, price_tick: 0.01, margin_rate: 0.0, has_open_interest: false, has_settle_price: false, is_t_plus_1: true, min_lot: 100, allow_short: false}
+
+# fees 与 wt fees_stk.json 等价 (2 档 schema, stamp_duty / transfer_fee 合并)
+fees:
+  '600000.SH': {open: 0.00026, close: 0.00076, stamp_duty_rate: 0.0, transfer_fee_rate: 0.0, min_commission: 0.0}
+  '000001.SZ': {open: 0.00025, close: 0.00075, stamp_duty_rate: 0.0, transfer_fee_rate: 0.0, min_commission: 0.0}
+  '600519.SH': {open: 0.00026, close: 0.00076, stamp_duty_rate: 0.0, transfer_fee_rate: 0.0, min_commission: 0.0}
+  '601318.SH': {open: 0.00026, close: 0.00076, stamp_duty_rate: 0.0, transfer_fee_rate: 0.0, min_commission: 0.0}
+  '000333.SZ': {open: 0.00025, close: 0.00075, stamp_duty_rate: 0.0, transfer_fee_rate: 0.0, min_commission: 0.0}
+
+risk:
+  max_order_qty: 100000000.0
+  max_pos_qty: 1000000000.0
+  enforce_long_t_plus_1: true
+  allow_short: false
+
+trade_cost:
+  slippage: 0.0
+
+report:
+  output_dir: ../reports/sel_large

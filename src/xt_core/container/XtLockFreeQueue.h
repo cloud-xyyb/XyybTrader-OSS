@@ -8,7 +8,7 @@
 #include <vector>
 
 #if defined(__linux__)
-#  include <sys/mman.h>
+#  include <sys/mman.h>   // madvise, MADV_HUGEPAGE
 #endif
 
 /// @file
@@ -18,6 +18,7 @@
 /// advice 只在 Linux 上通过 `madvise(MADV_HUGEPAGE)` 请求 THP，失败不改变队列语义。
 namespace xt_queue_detail {
 
+/** @brief 对已分配内存建议内核使用 huge page（Linux-only，其他平台 no-op）。 */
 inline void advise_huge_pages(void* ptr, size_t bytes) noexcept {
 #if defined(__linux__)
     if (ptr && bytes > 0) {
@@ -30,6 +31,9 @@ inline void advise_huge_pages(void* ptr, size_t bytes) noexcept {
 
 using HugePageAdviceFn = void (*)(void*, size_t);
 
+/// @brief huge-page advice 注入点。
+///
+/// 生产代码保持默认 `madvise`/no-op 行为；单元测试可替换函数指针验证是否触发 advice。
 inline HugePageAdviceFn& huge_page_advice_fn() noexcept {
     static HugePageAdviceFn fn = &advise_huge_pages;
     return fn;
@@ -41,7 +45,7 @@ inline void maybe_advise_huge_pages(bool use_huge_pages, void* ptr, size_t bytes
     }
 }
 
-}
+} // namespace xt_queue_detail
 
 namespace xt_queue_detail {
 
@@ -60,6 +64,7 @@ public:
         xt_queue_detail::maybe_advise_huge_pages(use_huge_pages, buf_.data(), cap_ * sizeof(T));
     }
 
+    /// @return true 表示元素已发布；false 表示队列已满，调用方必须按 drop/backpressure 处理。
     bool push(const T& v) {
         const size_t head = head_.load(std::memory_order_relaxed);
         const size_t next = (head + 1) & mask_;
@@ -69,6 +74,7 @@ public:
         return true;
     }
 
+    /// @return true 表示元素已发布；false 表示队列已满，调用方必须按 drop/backpressure 处理。
     bool push(T&& v) {
         const size_t head = head_.load(std::memory_order_relaxed);
         const size_t next = (head + 1) & mask_;
@@ -78,6 +84,7 @@ public:
         return true;
     }
 
+    /// @return true 表示成功取出一个元素；false 表示当前队列为空。
     bool pop(T& out) {
         const size_t tail = tail_.load(std::memory_order_relaxed);
         if (__builtin_expect(tail == head_.load(std::memory_order_acquire), 0)) return false;
@@ -86,6 +93,10 @@ public:
         return true;
     }
 
+    /// @brief 读取队头元素但不出队（consumer 端 look-ahead，如 k-way merge 比对队头）。
+    /// @return true 已拷贝队头到 out；false 当前队列为空。
+    /// @warning 仅 consumer 线程可调用（与 pop 同一单 consumer 契约）；不前进 tail，
+    ///          下次 peek/pop 仍见同一元素（single consumer 保证 peek 与后续 pop 同值）。
     bool peek(T& out) const {
         const size_t tail = tail_.load(std::memory_order_relaxed);
         if (__builtin_expect(tail == head_.load(std::memory_order_acquire), 0)) return false;
@@ -100,13 +111,16 @@ private:
         return n < 2 ? 2 : n;
     }
 
+    // 两侧线程只读。
     const size_t cap_;
     const size_t mask_;
     std::vector<T> buf_;
 
+    // Producer 独占写区。
     alignas(64) std::atomic<size_t> head_{0};
     char _pad_head_[64 - sizeof(std::atomic<size_t>)];
 
+    // Consumer 独占写区。
     alignas(64) std::atomic<size_t> tail_{0};
     char _pad_tail_[64 - sizeof(std::atomic<size_t>)];
 };
@@ -140,6 +154,7 @@ public:
     bool push(const T& v) { return emplace(v); }
     bool push(T&& v) { return emplace(std::move(v)); }
 
+    /// @return true 表示成功取出一个元素；false 表示当前队列为空。
     bool pop(T& out) {
         Cell& cell = buffer_[deq_pos_ & mask_];
         const size_t seq = cell.seq.load(std::memory_order_acquire);
@@ -209,19 +224,26 @@ private:
         return true;
     }
 
+    // 多生产者/单消费者只读配置。
     const size_t cap_;
     const size_t mask_;
     std::vector<Cell> buffer_;
 
+    // Producer 共享写区（多线程 CAS 竞争，与 deq_pos_ 隔离）。
     alignas(64) std::atomic<size_t> enq_pos_{0};
     char _pad_enq_[64 - sizeof(std::atomic<size_t>)];
 
+    // Consumer 独占写区。
     alignas(64) size_t deq_pos_ = 0;
     char _pad_deq_[64 - sizeof(size_t)];
 };
 
-}
+}  // namespace xt_queue_detail
 
+/**
+ * @brief 队列并发模式（queue concurrency mode）。
+ * @note `SPSC` 单生产者单消费者，`MPSC` 多生产者单消费者。
+ */
 enum class QueueMode {
     SPSC,
     MPSC
@@ -239,7 +261,14 @@ enum class QueueMode {
 template <typename T>
 class XtLockFreeQueue {
 public:
-
+    /**
+     * @brief 构造并初始化指定模式的队列实例。
+     * @param mode 并发模式；不确定 producer 数量时使用默认 MPSC。
+     * @param capacity 目标容量；0 使用默认容量，底层会提升到最小有效容量并取 2 的幂。
+     * @param use_huge_pages 若为 true，向 OS 建议将 ring buffer 映射到 huge page
+     *                       以降低 TLB miss（Linux only，其他平台 no-op）。
+     *                       建议大容量队列（>= 16K 元素）开启。
+     */
     explicit XtLockFreeQueue(QueueMode mode = QueueMode::MPSC, size_t capacity = 1024,
                              bool use_huge_pages = false) {
         mode_ = mode;
@@ -251,6 +280,7 @@ public:
         }
     }
 
+    /** @brief 非阻塞入队（copy enqueue）。 */
     bool push(const T& v) {
         if (mode_ == QueueMode::SPSC) {
             return spsc_->push(v);
@@ -258,6 +288,7 @@ public:
         return mpsc_->push(v);
     }
 
+    /** @brief 非阻塞入队（move enqueue）。 */
     bool push(T&& v) {
         if (mode_ == QueueMode::SPSC) {
             return spsc_->push(std::move(v));
@@ -265,6 +296,10 @@ public:
         return mpsc_->push(std::move(v));
     }
 
+    /**
+     * @brief 非阻塞出队（dequeue）。
+     * @return 成功出队返回 `true`，空队列返回 `false`。
+     */
     bool pop(T& out) {
         if (mode_ == QueueMode::SPSC) {
             return spsc_->pop(out);
@@ -272,6 +307,10 @@ public:
         return mpsc_->pop(out);
     }
 
+    /**
+     * @brief 批量出队（bulk dequeue）。
+     * @return 实际出队数量，范围 `[0, max]`。
+     */
     size_t pop_bulk(T* out, size_t max) {
         if (!out || max == 0) return 0;
         if (mode_ == QueueMode::SPSC) {
@@ -286,7 +325,7 @@ public:
 
 private:
     QueueMode mode_ = QueueMode::MPSC;
-
+    // 仅 active backend 非空；由 mode_ 决定转发目标。
     std::unique_ptr<xt_queue_detail::SpscQueue<T>> spsc_;
     std::unique_ptr<xt_queue_detail::MpscRingQueue<T>> mpsc_;
 };

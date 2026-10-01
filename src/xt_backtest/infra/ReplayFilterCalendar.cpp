@@ -12,7 +12,7 @@ namespace {
 bool parse_date_strict(const std::string& s, uint32_t& out) {
     out = XtTimeParse::parse_date_only(s);
     if (out != 0) return true;
-
+    // 回退到纯整数格式（YYYYMMDD）
     try {
         out = static_cast<uint32_t>(std::stoul(s));
         return out != 0;
@@ -33,7 +33,7 @@ void add_dates_from_yaml_node(const YAML::Node& node, std::unordered_set<uint32_
     uint32_t d = XtConfigYamlUtil::parse_date_node(node);
     if (d) out.insert(d);
 }
-}
+} // namespace
 
 bool XtBacktestTradingCalendar::parse_date_token(const std::string& token, uint32_t& out) {
     std::string v = XtStringUtil::trim(token);
@@ -48,17 +48,20 @@ XtBacktestTradingCalendar::Config parse_trading_calendar_config(const YAML::Node
     cfg.enabled = node["enabled"] ? node["enabled"].as<bool>() : true;
     if (!cfg.enabled) return cfg;
 
+    // 支持多个同义 key（days/dates/trading_days/include），全部合并
     add_dates_from_yaml_node(node["days"], cfg.days);
     add_dates_from_yaml_node(node["dates"], cfg.days);
     add_dates_from_yaml_node(node["trading_days"], cfg.days);
     add_dates_from_yaml_node(node["include"], cfg.days);
 
+    // exclude 从合并结果中移除
     if (node["exclude"]) {
         std::unordered_set<uint32_t> ex;
         add_dates_from_yaml_node(node["exclude"], ex);
         for (uint32_t d : ex) cfg.days.erase(d);
     }
 
+    // 外部文件加载：每行一个日期，# 开头为注释，支持逗号/空格分隔的首列
     if (node["path"]) {
         try {
             std::string path = node["path"].as<std::string>();
@@ -88,13 +91,13 @@ void XtBacktestTradingCalendar::set_config(const Config& cfg) {
 }
 
 bool XtBacktestTradingCalendar::is_trading_day(uint32_t date) const {
-
+    // 未启用或空日历时放行所有日期
     if (!enabled_ || days_.empty() || date == 0) return true;
     return days_.find(date) != days_.end();
 }
 
 uint32_t XtBacktestTradingCalendar::next_trading_day(uint32_t date) const {
-
+    // YYYYMMDD → 下一自然日
     auto advance = [](uint32_t d) -> uint32_t {
         int y = d / 10000, m = (d / 100) % 100, dd = d % 100;
         static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
@@ -103,7 +106,7 @@ uint32_t XtBacktestTradingCalendar::next_trading_day(uint32_t date) const {
         if (m < 12) return y * 10000 + (m + 1) * 100 + 1;
         return (y + 1) * 10000 + 100 + 1;
     };
-
+    // Tomohiko Sakamoto: 返回 0=Sun,1=Mon,...,6=Sat
     auto day_of_week = [](uint32_t d) -> int {
         static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
         int y = d / 10000, m = (d / 100) % 100, dd = d % 100;
@@ -116,9 +119,9 @@ uint32_t XtBacktestTradingCalendar::next_trading_day(uint32_t date) const {
         if (enabled_ && !days_.empty()) {
             if (days_.find(nd) != days_.end()) return nd;
         } else {
-
+            // 无交易日历：跳过周末
             const int dow = day_of_week(nd);
-            if (dow != 0 && dow != 6) return nd;
+            if (dow != 0 && dow != 6) return nd;  // 0=Sun, 6=Sat
         }
         nd = advance(nd);
     }

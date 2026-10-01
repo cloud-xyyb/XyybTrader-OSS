@@ -3,12 +3,13 @@ project(XtLiveConfigLib LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
 # ── xt_live_config: live yaml 配置加载 / schema / 校验 / 解析 ──────────────
-# 四个 TU 的唯一编译点（TU 单一所有权）。
+# 五个 TU 的唯一编译点（TU 单一所有权）。
 add_library(xt_live_config STATIC
     XtLiveConfig.cpp
     LiveConfigSchemaRules.cpp
     LiveConfigValidators.cpp
     LiveConfigParsers.cpp
+    DeclaredUniverse.cpp
 )
 
 target_include_directories(xt_live_config PUBLIC

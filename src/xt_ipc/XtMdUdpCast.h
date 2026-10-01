@@ -26,10 +26,10 @@ namespace xt_ipc {
 
 /// @brief UDP 组播 MD 包（定长 POD，一包一 tick + 单调 seq 供 gap 检测）。
 struct UdpMdPacket {
-    uint64_t magic;
-    uint32_t wire_version;
+    uint64_t magic;        ///< == kMdRingMagic（认包 + 防误收）
+    uint32_t wire_version; ///< == XT_MD_WIRE_VERSION
     uint32_t _pad;
-    uint64_t seq;
+    uint64_t seq;          ///< 单调发布序号（receiver 据此测 gap）
     XtRawTick tick;
 };
 static_assert(std::is_trivially_copyable_v<UdpMdPacket> && std::is_standard_layout_v<UdpMdPacket>);
@@ -41,6 +41,7 @@ class UdpMdSender {
 public:
     ~UdpMdSender() { if (fd_ >= 0) ::close(fd_); }
 
+    /// @brief 建组播 socket。loop=true 同机也能收到自己发的（loopback 自测必需）。
     bool open(const std::string& group_ip, uint16_t port, int ttl = 1, bool loop = true) {
         fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd_ < 0) return false;
@@ -92,6 +93,7 @@ public:
         return true;
     }
 
+    /// @brief 收一包。timeout_ms<0 阻塞。返回 false=超时/错误/坏包。out_seq 填包序号。
     bool recv(XtRawTick& out, uint64_t& out_seq, int timeout_ms = -1) {
         if (fd_ < 0) return false;
         if (timeout_ms >= 0) {
@@ -102,13 +104,13 @@ public:
         ssize_t n = ::recv(fd_, &p, sizeof(p), 0);
         if (n != static_cast<ssize_t>(sizeof(p))) return false;
         if (p.magic != kMdRingMagic || p.wire_version != XT_MD_WIRE_VERSION) {
-            ++bad_packet_count_;
+            ++bad_packet_count_;  // 收到了 datagram 但 codec/wire 不符 → 区分"环境无包"与"契约漂移"
             return false;
         }
-
+        // seq gap 检测（UDP 丢包/乱序）
         if (have_last_) {
-            if (p.seq > last_seq_ + 1) gap_count_ += (p.seq - last_seq_ - 1);
-            else if (p.seq <= last_seq_) ++reorder_count_;
+            if (p.seq > last_seq_ + 1) gap_count_ += (p.seq - last_seq_ - 1);  // 丢包
+            else if (p.seq <= last_seq_) ++reorder_count_;                     // 乱序/重复
         }
         last_seq_ = p.seq;
         have_last_ = true;
@@ -119,7 +121,7 @@ public:
 
     uint64_t gap_count() const { return gap_count_; }
     uint64_t reorder_count() const { return reorder_count_; }
-    uint64_t bad_packet_count() const { return bad_packet_count_; }
+    uint64_t bad_packet_count() const { return bad_packet_count_; }  ///< magic/version 不符的 datagram 数
 
 private:
     int fd_ = -1;
@@ -130,4 +132,4 @@ private:
     uint64_t bad_packet_count_ = 0;
 };
 
-}
+}  // namespace xt_ipc

@@ -15,6 +15,9 @@ std::string yymm_from_date(uint32_t yyyymmdd);
 std::vector<std::string> months_between(uint32_t start_date, uint32_t end_date);
 bool month_in_list(const std::vector<std::string>& list, const std::string& yymm);
 
+/// @brief action_time（HHMMSSmmm）转当天毫秒数。
+///
+/// 用于 CTA bar 聚合和 TWAP 时间比较；不校验 HH/MM/SS 字段合法性。
 inline uint32_t action_time_to_ms(uint32_t action_time) noexcept {
     const uint32_t h  = action_time / 10000000;
     const uint32_t m  = (action_time / 100000) % 100;
@@ -23,6 +26,9 @@ inline uint32_t action_time_to_ms(uint32_t action_time) noexcept {
     return h * 3600000 + m * 60000 + s * 1000 + ms;
 }
 
+/// @brief 解析固定宽度时间字段（HH:MM:SS + ms）为 HHMMSSmmm。
+/// @note 只读取前 8 字节，适合 SDK 固定 char 时间字段；非法输入返回 0。
+/// @note 毫秒字段会 clamp 到 [0, 999]；需要严格拒绝越界时不要使用本接口。
 inline uint32_t parse_fixed_time_hms_ms(const char* s, int ms) noexcept {
     if (!s || !s[0]) return 0;
     for (int i = 0; i < 8; ++i) {
@@ -45,6 +51,8 @@ inline uint32_t parse_fixed_time_hms_ms(const char* s, int ms) noexcept {
     return static_cast<uint32_t>((hh * 10000 + mm * 100 + ss) * 1000 + ms);
 }
 
+/// @brief 解析固定宽度日期字段（YYYYMMDD）为 uint32_t。
+/// @note 只读取前 8 字节，适合 SDK 固定 char 日期字段；非法输入返回 0。
 inline uint32_t parse_fixed_date_yyyymmdd(const char* s) noexcept {
     if (!s || !s[0]) return 0;
     auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
@@ -73,4 +81,4 @@ bool parse_time_hms(const std::string& s, uint32_t& time_ms);
 uint32_t parse_date_only(const std::string& s);
 uint32_t add_ms(uint32_t time_ms, int delta_ms);
 
-}
+}  // namespace XtTimeParse

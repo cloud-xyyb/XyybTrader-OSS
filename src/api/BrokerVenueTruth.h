@@ -9,7 +9,7 @@
 /// 数量、价格、盈亏、保证金字段均为 fixed-point(1e6)。venue REST/TD 回报填充，
 /// 供 report 与 Prometheus per-symbol gauge；不要求所有 venue 都提供。
 struct PerSymbolTruth {
-    std::string symbol;
+    std::string symbol;             ///< 合约代码；空 symbol 行应由 producer 跳过。
     int64_t qty_fp = 0;
     int64_t avg_price_fp = 0;
     int64_t mark_price_fp = 0;
@@ -28,9 +28,9 @@ struct PerSymbolTruth {
 /// 金额字段 fixed-point(1e6)；venue 不提供的字段保持 0。CTP 仅填 available；
 /// binance 填全字段并置 per_symbol_is_broker_truth=true。
 struct BrokerVenueTruth {
-    int64_t available_balance_fp = 0;
-    int64_t maint_margin_fp = 0;
-    int64_t total_margin_balance_fp = 0;
-    std::vector<PerSymbolTruth> per_symbol;
-    bool per_symbol_is_broker_truth = false;
+    int64_t available_balance_fp = 0;        ///< venue 可用余额；0 也可能表示未提供。
+    int64_t maint_margin_fp = 0;             ///< venue 维持保证金；0 也可能表示未提供。
+    int64_t total_margin_balance_fp = 0;     ///< venue 总保证金余额；0 表示不可用于 raw equity cross-check。
+    std::vector<PerSymbolTruth> per_symbol;  ///< venue per-symbol 明细；空=venue 不提供。
+    bool per_symbol_is_broker_truth = false; ///< true=per_symbol 来自 venue 真值(可做 store-vs-broker 比对)。
 };

@@ -55,12 +55,13 @@ int numa_node_of_cpu(int cpu_id, const char* cpu_sysfs_root) {
     char dir_path[192];
     const int n =
         std::snprintf(dir_path, sizeof(dir_path), "%s/cpu%d", cpu_sysfs_root, cpu_id);
-    if (n < 0 || n >= static_cast<int>(sizeof(dir_path))) return -1;
+    if (n < 0 || n >= static_cast<int>(sizeof(dir_path))) return -1;  // 截断则拒探
     DIR* d = ::opendir(dir_path);
     if (!d) return -1;
     int node = -1;
     while (const dirent* e = ::readdir(d)) {
-
+        // kernel 在 cpuN 目录下放 `node<M>` 条目标记所属 NUMA node；
+        // topology/physical_package_id 是 socket id，NPS>1 拓扑下与 node 不同。
         if (std::strncmp(e->d_name, "node", 4) != 0) continue;
         char* endp = nullptr;
         const long v = std::strtol(e->d_name + 4, &endp, 10);
@@ -81,9 +82,10 @@ bool bind_current_thread_numa(int cpu_id) {
 #if defined(__linux__)
     if (cpu_id < 0) return true;
     const int node = numa_node_of_cpu(cpu_id);
-
+    // 单字 nodemask 承载上限 64 node；超界宁可不 bind 也不写错误掩码。
     if (node < 0 || node >= static_cast<int>(sizeof(unsigned long) * 8)) return false;
 
+    // 直接 syscall，避免 xt_util 引入 libnuma 链接依赖。
     constexpr int MPOL_BIND = 2;
     constexpr int MPOL_F_STATIC_NODES = (1 << 15);
     unsigned long nodemask = 1UL << node;
@@ -101,4 +103,4 @@ void join_or_detach(std::thread& th) {
     else th.detach();
 }
 
-}
+}  // namespace ThreadUtil

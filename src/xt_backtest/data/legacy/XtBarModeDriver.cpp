@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// 配置注入与 bar 输入源解析
+// ---------------------------------------------------------------------------
+
 void XtBarModeDriver::apply_config(const XtMarketDataSourceConfig& d) {
     read_cfg.spread      = d.simtick_spread;
     read_cfg.qty_base    = d.qty_base;
@@ -26,6 +30,7 @@ void XtBarModeDriver::apply_config(const XtMarketDataSourceConfig& d) {
     bar.path.clear();
     bar.paths.clear();
 
+    // simtick.from_bar 与 save 共用一个配置开关：启用生成时同步允许落盘缓存。
     simtick.from_bar = d.simtick_enable;
     simtick.save     = d.simtick_enable;
     simtick.dir      = d.simtick_dir;
@@ -44,17 +49,19 @@ void XtBarModeDriver::apply_config(const XtMarketDataSourceConfig& d) {
 }
 
 bool XtBarModeDriver::prepare(const XtMarketDataSourceConfig& d) {
-
+    // bar 数据源参数。
     bar.root   = d.bar_root;
     bar.symbol = d.bar_symbol;
     bar.suffix = d.bar_suffix;
     if (!d.has_bar_code && !bar.symbol.empty())
         bar.code = bar.symbol;
 
+    // 主力合约滚动路径（hot）。
     if (hot.use_hot && !hot.path.empty()) {
         hot.months        = XtTimeParse::months_between(read_cfg.range_start, read_cfg.range_end);
         hot.range_enabled = !hot.months.empty();
 
+        // 月份级 simtick bin 缓存必须全量命中；部分命中时退回 hot CSV 生成路径。
         if (simtick.from_bar && simtick.format == "bin") {
             XtLogger::info_m("MD", "HOT simtick bin cache check: start={} end={} months={}",
                 read_cfg.range_start, read_cfg.range_end, hot.months.size());
@@ -76,7 +83,7 @@ bool XtBarModeDriver::prepare(const XtMarketDataSourceConfig& d) {
                     XtLogger::info_m("MD", "HOT simtick bin cache: HIT count={}", total);
                     return true;
                 }
-
+                // 部分命中：is_bin 保持 false，本轮退回 hot CSV。
                 XtLogger::info_m("MD", "HOT simtick bin cache: HIT={} MISS={}", hit, total - hit);
             }
         }
@@ -94,6 +101,7 @@ bool XtBarModeDriver::prepare(const XtMarketDataSourceConfig& d) {
         return true;
     }
 
+    // 从 symbol 推导月份路径；validate 已约束 start_date/end_date 非零且有序。
     if (!bar.symbol.empty() && build_bar_paths_from_symbol())
         return true;
 
@@ -103,12 +111,16 @@ bool XtBarModeDriver::prepare(const XtMarketDataSourceConfig& d) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 路径推导
+// ---------------------------------------------------------------------------
+
 bool XtBarModeDriver::build_bar_paths_from_symbol() {
     bar.paths.clear();
     if (!(read_cfg.range_start && read_cfg.range_end)) {
         return false;
     }
-
+    // 日期范围按月份展开；路径约定为 root/symbol/symbol.YYMM.suffix。
     int sy = static_cast<int>(read_cfg.range_start / 10000);
     int sm = static_cast<int>((read_cfg.range_start / 100) % 100);
     int ey = static_cast<int>(read_cfg.range_end / 10000);
@@ -164,6 +176,10 @@ std::string XtBarModeDriver::build_simtick_path_for_month(const std::string& yym
     return outp;
 }
 
+// ---------------------------------------------------------------------------
+// 重置
+// ---------------------------------------------------------------------------
+
 void XtBarModeDriver::reset() {
     bar.in.reset();
     bar.ticks.clear();
@@ -184,8 +200,12 @@ void XtBarModeDriver::reset() {
     hot.month_filter.clear();
 }
 
-bool XtBarModeDriver::open_next_bar_file() {
+// ---------------------------------------------------------------------------
+// 流式 bar 文件管理
+// ---------------------------------------------------------------------------
 
+bool XtBarModeDriver::open_next_bar_file() {
+    // hot + simtick 按月份遍历；bin 缓存命中时跳过 CSV，未命中时读 hot CSV。
     if (hot.use_hot && !simtick.paths.empty()) {
         while (hot.month_idx < simtick.paths.size()) {
             const std::string& m    = hot.months[hot.month_idx];
@@ -216,7 +236,7 @@ bool XtBarModeDriver::open_next_bar_file() {
         }
         return false;
     }
-
+    // 非 hot 模式逐文件遍历 bar.paths；每个 bar 文件优先尝试对应 simtick bin 缓存。
     while (bar.path_idx < bar.paths.size()) {
         const size_t idx = bar.path_idx;
         const std::string& p = bar.paths[bar.path_idx++];
@@ -247,7 +267,7 @@ bool XtBarModeDriver::open_next_bar_file() {
         }
         XtLogger::warn_m("MD", "INIT failed to open {}", p);
     }
-
+    // paths 为空但存在单文件 bar.path 时保留兼容读取路径。
     if (bar.paths.empty() && !bar.path.empty()) {
         if (simtick.from_bar && simtick.format == "bin" && hot.use_hot && hot.bin_available) {
             bar.in = std::make_unique<std::ifstream>(hot.bin_path, std::ios::binary);
@@ -272,11 +292,15 @@ bool XtBarModeDriver::open_next_bar_file() {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 流式 tick 读取
+// ---------------------------------------------------------------------------
+
 bool XtBarModeDriver::next_tick(XtRawTick& out) {
     if (!bar.in) {
         if (!open_next_bar_file()) return false;
     }
-
+    // bin stream 每个文件独立探测 format，避免跨文件沿用旧 header 状态。
     if (bar.stream_is_bin) {
         if (!bar.stream_bin_fmt_inited) {
             if (!xt_tick_bin::detect_stream_format(*bar.in, bar.stream_bin_fmt)) {
@@ -297,12 +321,13 @@ bool XtBarModeDriver::next_tick(XtRawTick& out) {
         }
         if (bar.stream_is_bin) return true;
     }
-
+    // 已生成的 simtick 缓冲未消费完时先返回缓冲内容。
     if (bar.tick_idx < bar.ticks.size()) {
         out = bar.ticks[bar.tick_idx++];
         return true;
     }
 
+    // CSV bar 逐行读取并生成 simtick。
     std::string line;
     while (true) {
         if (!bar.pending_line.empty()) {
@@ -321,7 +346,7 @@ bool XtBarModeDriver::next_tick(XtRawTick& out) {
         if (!parse_bar_row_line(line, row)) continue;
         if (read_cfg.range_start && row.trading_date < read_cfg.range_start) continue;
         if (read_cfg.range_end   && row.trading_date > read_cfg.range_end)   continue;
-
+        // hot 月份过滤：越过当前月份时保留 pending_line，再切换到下个月份文件。
         if (hot.use_hot && !hot.month_filter.empty()) {
             std::string cur_m = XtTimeParse::yymm_from_date(row.trading_date);
             if (!cur_m.empty() && cur_m < hot.month_filter) continue;
@@ -339,6 +364,7 @@ bool XtBarModeDriver::next_tick(XtRawTick& out) {
             bar.total_volume, bar.ticks);
         bar.tick_idx = 0;
 
+        // simtick CSV 落盘路径使用单个追加文件。
         if (simtick.save && simtick.format == "csv") {
             if (!simtick.csv_out) {
                 std::string outp = simtick.dir;
@@ -355,7 +381,7 @@ bool XtBarModeDriver::next_tick(XtRawTick& out) {
             if (simtick.csv_out && simtick.csv_out->is_open())
                 write_ticks_csv(*simtick.csv_out, bar.ticks);
         }
-
+        // simtick bin 落盘按 hot month 或 bar 文件月份拆分。
         if (simtick.save && simtick.format == "bin") {
             auto open_bin_out = [&](const std::string& outp) {
                 if (outp.empty()) return;
@@ -412,8 +438,12 @@ bool XtBarModeDriver::next_tick(XtRawTick& out) {
     }
 }
 
-bool XtBarModeDriver::load_to_memory(std::vector<XtRawTick>& out) {
+// ---------------------------------------------------------------------------
+// 内存加载
+// ---------------------------------------------------------------------------
 
+bool XtBarModeDriver::load_to_memory(std::vector<XtRawTick>& out) {
+    // simtick.is_bin 表示 prepare 阶段确认缓存可直接读取，memory 路径跳过 bar 解析。
     if (simtick.is_bin) {
         if (!simtick.paths.empty()) {
             for (const auto& sp : simtick.paths) { if (!sp.empty()) load_simtick_bin(sp, out); }
@@ -422,7 +452,7 @@ bool XtBarModeDriver::load_to_memory(std::vector<XtRawTick>& out) {
         }
         return !out.empty();
     }
-
+    // 多 bar 文件逐个尝试 simtick bin 缓存；未命中时退回 bar CSV 生成。
     if (bar.is_csv && !bar.paths.empty()) {
         size_t total = 0;
         for (size_t i = 0; i < bar.paths.size(); ++i) {
@@ -445,7 +475,7 @@ bool XtBarModeDriver::load_to_memory(std::vector<XtRawTick>& out) {
         XtLogger::info_m("MD", "total simticks {}", total);
         return true;
     }
-
+    // 单文件 bar_path 兼容路径。
     if (bar.is_csv && !bar.path.empty()) {
         return load_bar_file(bar.path, out);
     }
@@ -527,7 +557,7 @@ bool XtBarModeDriver::load_bar_file(const std::string& path, std::vector<XtRawTi
 
         for (const auto& t : generated_ticks) {
             out.push_back(t);
-
+            // hot 模式下按月份切换 bin 输出文件。
             if (simtick.save && simtick.format == "bin" && hot.use_hot) {
                 if (!hot.range_enabled) { ++loaded; continue; }
                 std::string yymm = XtTimeParse::yymm_from_date(t.action_date);

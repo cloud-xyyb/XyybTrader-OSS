@@ -30,6 +30,8 @@ public:
         }
     }
 
+    /// @brief 获取一个空闲 slot。
+    /// @return 可写 slot 指针；池耗尽时返回 nullptr。
     T* acquire() noexcept {
         for (std::size_t word = 0; word < kWordCount; ++word) {
             uint64_t mask = free_mask_[word].load(std::memory_order_acquire);
@@ -43,7 +45,7 @@ public:
                     if (index < N) {
                         return &ring_[index];
                     }
-
+                    // 防御性处理：若 padding bit 被置位，恢复该 bit 并跳到下一组。
                     release_bit_(word, bit);
                     break;
                 }
@@ -52,6 +54,10 @@ public:
         return nullptr;
     }
 
+    /// @brief 归还一个 slot。
+    ///
+    /// @pre ptr 必须来自本池且当前处于 acquired 状态；debug build 会断言非法释放和 double release。
+    /// @pre 如果 slot 曾发布给读者，必须在 HazardDomain 确认无 hazard guard 后再调用。
     void release(T* ptr) noexcept {
         if (!ptr) {
             return;
@@ -84,9 +90,9 @@ private:
         free_mask_[word].fetch_or(bit, std::memory_order_release);
     }
 
-    std::array<T, N> ring_{};
-    std::array<std::atomic<uint64_t>, kWordCount> free_mask_{};
+    std::array<T, N> ring_{};  ///< 预分配 slot；对象生命周期与 pool 相同。
+    std::array<std::atomic<uint64_t>, kWordCount> free_mask_{};  ///< 1 表示 slot 可 acquire。
 };
 
-}
-}
+}  // namespace sync
+}  // namespace xt_util

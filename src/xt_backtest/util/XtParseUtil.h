@@ -13,10 +13,14 @@
 #include <string_view>
 #include <vector>
 
+// parse_time_with_ms 复用 XtTimeParse 的 HH:MM:SS 基础解析。
 #include "xt_util/time/XtTimeParse.h"
 
 namespace XtParseUtil {
 
+// ── 内部辅助（internal helpers） ──────────────────────────────────────────────
+
+/// 去除 string_view 首尾 ASCII 控制字符和空格。
 inline std::string_view trim_sv(std::string_view s) {
     while (!s.empty() && static_cast<unsigned char>(s.front()) <= ' ') s.remove_prefix(1);
     while (!s.empty() && static_cast<unsigned char>(s.back())  <= ' ') s.remove_suffix(1);
@@ -34,6 +38,9 @@ inline bool valid_date_parts(uint32_t y, uint32_t m, uint32_t d) {
     return d <= days;
 }
 
+// ── 列名规范化（column name normalization） ──────────────────────────────────────────────
+
+/// 去掉非字母数字字符并转小写，用于 CSV 表头列名识别。
 inline std::string normalize_col(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -43,6 +50,9 @@ inline std::string normalize_col(std::string_view s) {
     return out;
 }
 
+// ── CSV 行分割（CSV line split） ──────────────────────────────────────────────
+
+/// 按逗号分割 line，每列 trim 首尾空白后写入 cols（复用已有 buffer）。
 inline void split_csv_trim(const std::string& line, std::vector<std::string>& cols) {
     cols.clear();
     const char* p   = line.data();
@@ -59,6 +69,10 @@ inline void split_csv_trim(const std::string& line, std::vector<std::string>& co
     }
 }
 
+/// 按逗号分割 line，每列 trim 后存为 string_view（zero-copy）。
+///
+/// `cols` 中的 string_view 直接引用 `line` 的内存；调用方必须保证 line 在
+/// cols 使用完毕前保持有效。
 inline void split_csv_trim_sv(const std::string& line, std::vector<std::string_view>& cols) {
     cols.clear();
     const char* p   = line.data();
@@ -75,6 +89,13 @@ inline void split_csv_trim_sv(const std::string& line, std::vector<std::string_v
     }
 }
 
+// ── 日期解析（date parsing） ──────────────────────────────────────────────
+
+/// 解析日期字符串为 YYYYMMDD 编码的 uint32。
+/// 支持格式：
+///   - "YYYYMMDD"    （8 位纯数字）
+///   - "YYYY-MM-DD"  （带连字符）
+/// 使用 from_chars：无异常、无 locale 依赖。失败返回 false，out 不修改。
 inline bool parse_date(std::string_view s, uint32_t& out) {
     s = trim_sv(s);
     if (s.size() == 8) {
@@ -100,6 +121,9 @@ inline bool parse_date(std::string_view s, uint32_t& out) {
     return false;
 }
 
+// ── 无异常数字解析（exception-free numeric parsers） ──────────────────────────────────────────────
+
+/// 解析 uint32，自动去首尾空白。失败返回 false，out 不修改。
 inline bool parse_u32(std::string_view s, uint32_t& out) {
     s = trim_sv(s);
     if (s.empty()) return false;
@@ -107,6 +131,7 @@ inline bool parse_u32(std::string_view s, uint32_t& out) {
     return ec == std::errc{} && p == s.data() + s.size();
 }
 
+/// 解析 uint64，自动去首尾空白。
 inline bool parse_u64(std::string_view s, uint64_t& out) {
     s = trim_sv(s);
     if (s.empty()) return false;
@@ -114,6 +139,7 @@ inline bool parse_u64(std::string_view s, uint64_t& out) {
     return ec == std::errc{} && p == s.data() + s.size();
 }
 
+/// 解析 int（带符号），自动去首尾空白。
 inline bool parse_i32(std::string_view s, int& out) {
     s = trim_sv(s);
     if (s.empty()) return false;
@@ -121,6 +147,7 @@ inline bool parse_i32(std::string_view s, int& out) {
     return ec == std::errc{} && p == s.data() + s.size();
 }
 
+/// 解析 uint8，自动去首尾空白。
 inline bool parse_u8(std::string_view s, uint8_t& out) {
     uint32_t v = 0;
     if (!parse_u32(s, v)) return false;
@@ -129,15 +156,27 @@ inline bool parse_u8(std::string_view s, uint8_t& out) {
     return true;
 }
 
+// ── 时间解析（time parsing） ──────────────────────────────────────────────
+
+/// 把 D/DD/DDD 位小数秒填充到毫秒（6→600, 60→600, 600→600）。
 inline uint32_t pad_frac_to_ms(uint32_t v, std::size_t digit_count) {
     for (std::size_t n = digit_count; n < 3; ++n) v *= 10;
     return v;
 }
 
+/// 将时间字符串解析为 HHMMSS*1000+ms 编码的 uint32。
+///
+/// 支持格式：
+///   - "HH:MM:SS"         / "HH:MM:SS.mmm"  → HHMMSS*1000 [+ mmm]
+///   - "HHMMSS"     (6)                     → HHMMSS*1000
+///   - "HHMMSSD"    (7)                     → HHMMSS*1000 + D*100
+///   - "HHMMSSCC"   (8)                     → HHMMSS*1000 + CC*10
+///   - "HHMMSSMMM"  (9)                     → HHMMSS*1000 + MMM
 inline bool parse_time_with_ms(std::string_view s, uint32_t& time_ms) {
     s = trim_sv(s);
     if (s.empty()) return false;
 
+    // HH:MM:SS[.mmm] 格式
     if (s.find(':') != std::string_view::npos) {
         int extra_ms = 0;
         std::string_view base = s;
@@ -156,6 +195,11 @@ inline bool parse_time_with_ms(std::string_view s, uint32_t& time_ms) {
         return true;
     }
 
+    // ── 纯数字格式：按长度 positional slicing（6=HHMMSS, 7=+D, 8=+CC, 9=+MMM） ──
+    //
+    // Why not modular decomposition（packed /= 1000/100/100）：那会假设
+    // 输入永远带 3 位 ms 后缀；6 位 HHMMSS 会被错位分解（"190000"
+    // → sec=90, reject）。positional slicing 不受输入长度影响。
     if (s.size() < 6 || s.size() > 9) return false;
 
     auto parse_2 = [](const char* p, uint32_t& out) -> bool {
@@ -181,6 +225,9 @@ inline bool parse_time_with_ms(std::string_view s, uint32_t& time_ms) {
     return true;
 }
 
+// ── 浮点解析（floating-point parsing） ──────────────────────────────────────────────
+
+/// 解析 double，自动去首尾空白；无异常、无 locale 依赖、无额外堆分配。
 inline bool parse_double(std::string_view s, double& out) {
     s = trim_sv(s);
     if (s.empty()) return false;
@@ -188,4 +235,4 @@ inline bool parse_double(std::string_view s, double& out) {
     return ec == std::errc{} && p == s.data() + s.size();
 }
 
-}
+} // namespace XtParseUtil

@@ -15,4 +15,4 @@ public:
     }
 };
 
-}
+}  // namespace xt_runtime

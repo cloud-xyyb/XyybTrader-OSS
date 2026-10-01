@@ -16,6 +16,9 @@ class HazardDomain {
 public:
     static constexpr std::size_t kMaxHazardsPerThread = 16;
 
+    /// @brief type-erased 回收函数。
+    /// @param ctx 调用方传入的回收上下文，常见为 SnapshotPool 指针。
+    /// @param ptr retire 时提交的对象地址；调用时已确认不在任何 hazard slot 中。
     using ReclaimFn = void (*)(void* ctx, const void* ptr) noexcept;
 
 private:
@@ -90,6 +93,7 @@ public:
             return protected_ != nullptr;
         }
 
+        /// @brief 清空 hazard slot，并释放本线程内的 slot 占用。
         void reset() noexcept {
             if (record_) {
                 record_->hazards[slot_index_].store(nullptr, std::memory_order_release);
@@ -120,6 +124,10 @@ public:
         const Element* protected_ = nullptr;
     };
 
+    /// @brief 保护一次 atomic snapshot 指针读取。
+    ///
+    /// @return 非空 Guard 表示读取到稳定指针；src 为 nullptr 时返回空 Guard 且不占用 hazard slot。
+    /// @note 同一线程在同一 domain 中同时持有的 Guard 数不能超过 kMaxHazardsPerThread。
     template <typename T>
     Guard<const T> protect(const std::atomic<const T*>& src) const noexcept {
         auto* record = local_record_();
@@ -143,6 +151,7 @@ public:
         return Guard<const T>(record, slot_index, protected_ptr);
     }
 
+    /// @brief 延迟 delete 一个普通堆对象；ptr 为 nullptr 时 no-op。
     template <typename T>
     void retire(const T* ptr) noexcept {
         if (!ptr) {
@@ -151,14 +160,21 @@ public:
         retire_raw(ptr, nullptr, &delete_reclaim_<T>);
     }
 
+    /// @brief 延迟执行自定义回收函数。
+    ///
+    /// 常用于把 snapshot slot 归还给 XtSnapshotPool。reclaim 必须 noexcept，且不能依赖被回收对象仍可被读者访问。
     void retire_raw(const void* ptr, void* ctx, ReclaimFn reclaim) noexcept;
 
+    /// @brief 扫描所有线程 hazard slot，并回收当前线程 retire list 中未受保护的对象。
     void try_scan() noexcept;
 
+    /// @brief 当前线程 retire list 达到阈值时才触发 try_scan()。
     void try_scan_if_due() noexcept;
 
+    /// @brief 测试/诊断入口：当前线程 retire list 的待回收数量。
     std::size_t retired_count_for_current_thread() const noexcept;
 
+    /// @brief 测试/诊断入口：已懒注册的线程记录数量。
     std::size_t thread_record_count() const noexcept;
 
 private:
@@ -171,6 +187,7 @@ private:
     static std::size_t acquire_slot_(ThreadRecord& record) noexcept;
     std::size_t scan_threshold_() const noexcept;
 
+    /// @pre 调用方已经停止所有使用该 domain 的读线程，并释放所有 Guard。
     void force_reclaim_all_() noexcept;
 
     mutable std::atomic<bool> shutting_down_{false};
@@ -181,5 +198,5 @@ private:
 template <typename T>
 using HazardGuard = HazardDomain::Guard<T>;
 
-}
-}
+}  // namespace sync
+}  // namespace xt_util

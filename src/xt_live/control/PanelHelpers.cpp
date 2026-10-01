@@ -21,19 +21,19 @@
 #include "xt_account/state/AccountStateStore.h"
 #include "xt_identity/StrategySidRegistry.h"
 #include "xt_runtime/order/XtOrderRuntimeBook.h"
-#include "XtLiveOrderGateway.h"
-#include "api/XtRunnerSignals.h"
-#include "XtLiveConfig.h"
-#include "xt_core/order/XtOrderTypes.h"
-#include "api/ExecFlags.h"
+#include "XtLiveOrderGateway.h"     // xt_live/execution PUBLIC include path
+#include "api/XtRunnerSignals.h"        // xt_live/common PUBLIC include path
+#include "XtLiveConfig.h"          // run_overlap_check_for_config
+#include "xt_core/order/XtOrderTypes.h"  // XtTimeInForce / XtOffset (via XtOffset.h) / xt_fp::to_fp (via XtFixedPoint.h)
+#include "api/ExecFlags.h"        // exec_none()
 #include "xt_live/gateway/binance/refdata/BinanceExchangeInfo.h"
-#include "xt_live/control/CloseoutPricing.h"
-#include "xt_live/control/ForceFlatSubmitFence.h"
-#include "xt_util/time/XtSteadyClock.h"
-#include "xt_config/catalog/XtCommodityCatalog.h"
-#include "xt_risk/engine/XtRiskMonitor.h"
-#include "xt_risk/engine/XtRiskMonitorState.h"
-#include "XtDeclaredSymbolRegistry.h"
+#include "xt_live/control/CloseoutPricing.h"  // aggressive_close_price_fp / legal_close_price_fp (shared)
+#include "xt_live/control/ForceFlatSubmitFence.h"  // force-flat submit 同步 fence（over-close 缝挡板）
+#include "xt_util/time/XtSteadyClock.h"            // fence now（函数内自取，签名不变）
+#include "xt_config/catalog/XtCommodityCatalog.h"        // ctx.catalog->find(symbol)->price_tick
+#include "xt_risk/engine/XtRiskMonitor.h"        // wire_per_strategy_risk_state
+#include "xt_risk/engine/XtRiskMonitorState.h"   // per_strategy.set_strategy_killed (init-failure latch)
+#include "XtDeclaredSymbolRegistry.h"        // routing registry for overlap validation
 #include "xt_strategy_engine/XtStrategyInitConfig.h"
 #include "XtLogger.h"
 #include <algorithm>
@@ -46,6 +46,9 @@ namespace xt_live::control {
 
 namespace {
 
+// TD 可用性检查:恢复中时不触发强平,避免与恢复流程冲突。
+// 与 HftCloseoutGate.cpp anon-ns 的 load_td_for_runner_force_close 同实现,
+// anon-ns 隔离不冲突。
 ITradeGateway* load_td_for_panel_request(ITradeGateway* td,
                                          const std::atomic<bool>& trading_ready) {
     if (!td) return nullptr;
@@ -54,8 +57,11 @@ ITradeGateway* load_td_for_panel_request(ITradeGateway* td,
     return td;
 }
 
-}
+}  // namespace
 
+// ---------------------------------------------------------------------------
+// cancel_all_panel_request
+// ---------------------------------------------------------------------------
 std::size_t cancel_all_panel_request(XtPanelContext& ctx) {
     if (!ctx.td_gateway || !ctx.order_book || !ctx.account_store
         || !ctx.runtime_shared_state) {
@@ -71,6 +77,9 @@ std::size_t cancel_all_panel_request(XtPanelContext& ctx) {
     return cancel_ids.size();
 }
 
+// ---------------------------------------------------------------------------
+// flatten_all_panel_request
+// ---------------------------------------------------------------------------
 FlattenAllPanelResult flatten_all_panel_request(XtPanelContext& ctx) {
     FlattenAllPanelResult out;
     if (!ctx.td_gateway || !ctx.order_book || !ctx.account_store
@@ -128,6 +137,9 @@ FlattenAllPanelResult flatten_all_panel_request(XtPanelContext& ctx) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// cancel_one_panel_request
+// ---------------------------------------------------------------------------
 std::pair<bool, bool> cancel_one_panel_request(XtPanelContext& ctx,
                                                 const std::string& symbol,
                                                 const std::string& oid_str,
@@ -172,6 +184,9 @@ std::pair<bool, bool> cancel_one_panel_request(XtPanelContext& ctx,
     return {true, was_open};
 }
 
+// ---------------------------------------------------------------------------
+// force_exit_panel_request
+// ---------------------------------------------------------------------------
 ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
                                           const std::string& symbol,
                                           bool& hedge_warn_out,
@@ -208,6 +223,14 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
         scope_sid = StrategySid::from_raw(sid_id);
     }
 
+    // (1a) 已删（盲审 fold-3）：旧 held 只读早出会在 held 窗口内压制 (2) 段撤单轮
+    // ——窗口内新出现的 working order 拖到窗口过期才能撤。原子性由 (4a) 独立承担，
+    // held 窗口内的请求照常走撤单轮，仅 submit 被闸。
+
+    // (1b) 真·force-flat 已在途 → 跳过避免双 submit。用窄口径（is_genuine_*）：策略普通平仓
+    // 挂单不算 force-flat，故不阻断 operator 接管——落到 (2) cancel-first 撤掉策略 passive
+    // 平仓单后下帧强平，与 runner closeout cancel-first 接管语义对称。
+    // Strategy-scoped 只与同 sid 或 global 真·force-flat 冲突；sibling sid 仍可平自己的量。
     if (!strategy_scoped) {
         if (ctx.order_book->is_genuine_force_flat_pending(symbol.c_str())) {
             return ForceExitOutcome::AlreadyForceFlat;
@@ -219,6 +242,7 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
         }
     }
 
+    // (2) 该 symbol 有 working order → 先撤后平, 本帧只撤
     std::vector<uint64_t> cancel_ids;
     if (strategy_scoped) {
         ctx.order_book->collect_working_ids_for_code_and_sid(symbol.c_str(), scope_sid, cancel_ids);
@@ -230,13 +254,21 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
         return ForceExitOutcome::CancelledOnly;
     }
 
+    // (3) 查 net position — account_store (the single per-symbol truth). Under the
+    // hard-enforced 1:1, the account_store per-code position IS the scoped strategy's
+    // position, so strategy-scoped and runner-wide force-exit flatten the same quantity
+    // (the scoped path still cancels + closeable-clamps per-sid via scope_sid above/below).
     const auto position = ctx.account_store->snapshot_position(symbol);
     int64_t long_fp  = position.long_qty;
     int64_t short_fp = position.short_qty;
-    const int64_t mark_fp  = position.mark_price;
+    // 定价读 venue 真值，不用帧内 position.mark_price：后者是估值口径（venue 优先、
+    // 缺失回退持仓成本价），按成本价挂强平单等于凭空定一个与盘口无关的价格。
+    // venue 缺失 → NoMarkPrice 显式拒，把处置交回 operator。
+    const int64_t mark_fp = ctx.account_store->venue_mark_price(symbol);
     if (long_fp <= 0 && short_fp <= 0) return ForceExitOutcome::NoPosition;
     if (mark_fp <= 0) return ForceExitOutcome::NoMarkPrice;
 
+    // hedge 模式 (long+short 都 > 0) 警告 — 只关较大边
     if (long_fp > 0 && short_fp > 0) hedge_warn_out = true;
 
     const bool sell_to_close = (long_fp >= short_fp);
@@ -248,6 +280,7 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     }
     if (qty_fp <= 0) return ForceExitOutcome::NoPosition;
 
+    // (4) IOC@mark + Close offset (跟 try_runner_force_close 同 pattern)
     const bool buy_to_close = !sell_to_close;
     int64_t price_tick_fp = 0;
     if (ctx.catalog) {
@@ -256,7 +289,9 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     }
     const int64_t close_price_fp = legal_close_price_fp(
         symbol, aggressive_close_price_fp(mark_fp, buy_to_close), buy_to_close, price_tick_fp);
-
+    // (4a) 权威闸：submit 前原子 claim（单锁段 check+set，并发 caller 恰一胜出）。
+    // generation 归属：claim 过期后被他方重新 claim 时，先前持有者的 release
+    // 不得误删新窗口（盲审 fold-3）。
     uint64_t fence_gen = 0;
     if (ctx.force_flat_fence) {
         fence_gen = ctx.force_flat_fence->try_acquire(symbol, XtSteadyClock::steady_now_ms());
@@ -265,6 +300,9 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     if (strategy_scoped) {
         xt_identity::OrderAttributionStore::set_thread_submit_strategy_sid(scope_sid);
     }
+    // 直发 TD 不经 gateway（F02 D5 豁免面）：force-exit 从真实持仓构造硬 Close 单，
+    // 不产生 slice、只平已有仓不开新敞口，不破坏「未声明合约不得开仓」不变量；
+    // 定价须走 venue-only（D4）。
     const uint64_t oid = td->submit_order(symbol.c_str(),
                                           buy_to_close,
                                           close_price_fp,
@@ -277,7 +315,8 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
         xt_identity::OrderAttributionStore::set_thread_submit_strategy_sid(StrategySid::legacy());
     }
     if (oid == 0) {
-
+        // claim 让出：本次未产生在途 force-flat，窗口不应挡后续重试；
+        // 按 generation 归属释放，不碰他方新窗口。
         if (ctx.force_flat_fence) ctx.force_flat_fence->release(symbol, fence_gen);
         return ForceExitOutcome::SubmitFailed;
     }
@@ -285,7 +324,7 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
         ctx.order_book->record_force_flat_order(oid, symbol.c_str(), buy_to_close,
                                                 qty_fp, XtOffset::Close, scope_sid);
     } else {
-
+        // runner-wide emergency scope：显式写出 legacy sid（0 = 对所有 sid 生效）。
         ctx.order_book->record_force_flat_order(oid, symbol.c_str(), buy_to_close,
                                                 qty_fp, XtOffset::Close,
                                                 StrategySid::legacy());
@@ -294,11 +333,16 @@ ForceExitOutcome force_exit_panel_request(XtPanelContext& ctx,
     return ForceExitOutcome::ForceClosed;
 }
 
+// ---------------------------------------------------------------------------
+// manual_order_panel_request
+// ---------------------------------------------------------------------------
 ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
                                               const ManualOrderRequest& req,
                                               std::string& reject_reason_out) {
     reject_reason_out.clear();
-
+    // D8-③：manual 提交前置拒绝的结构化可见性 —— 每个 gateway 之前的早退拒绝分支落
+    // keyed WARN（reason text，非纯 code）。侧道日志专用，**不**写 reject_reason_out
+    // （守 caller 的 reject.empty() 契约，见 XtRunnerPanelControl.cpp）。
     auto reject_log = [&](ManualOrderOutcome outcome, const char* reason) -> ManualOrderOutcome {
         XtLogger::warn_m("control",
             "panel.manual_order reject: request_id={} venue={} symbol={} reason={}",
@@ -313,6 +357,7 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
         ctx.runtime_shared_state->trading_ready);
     if (!td) return reject_log(ManualOrderOutcome::NoTd, "td_not_ready");
 
+    // (1) side 解析
     std::string side_upper;
     side_upper.reserve(req.side.size());
     for (char c : req.side) side_upper.push_back(static_cast<char>(::toupper(c)));
@@ -321,6 +366,7 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     else if (side_upper == "SELL") is_buy = false;
     else return reject_log(ManualOrderOutcome::InvalidSide, "invalid_side");
 
+    // (2) type 解析
     std::string type_upper;
     type_upper.reserve(req.type.size());
     for (char c : req.type) type_upper.push_back(static_cast<char>(::toupper(c)));
@@ -328,6 +374,7 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     if (!is_market && type_upper != "LIMIT")
         return reject_log(ManualOrderOutcome::InvalidType, "invalid_type");
 
+    // (3) qty 解析(double → fp)
     char* end = nullptr;
     const double qty_d = std::strtod(req.qty.c_str(), &end);
     if (end == req.qty.c_str() || qty_d <= 0.0 || !std::isfinite(qty_d)) {
@@ -336,10 +383,13 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     const int64_t qty_fp = xt_fp::to_fp(qty_d);
     if (qty_fp <= 0) return reject_log(ManualOrderOutcome::InvalidQty, "invalid_qty_fp");
 
+    // (4) price 解析:MARKET 用 venue 真实行情价;LIMIT 用用户给的
+    // 与 force-exit 同一契约：出单价只认 venue 真值，帧内 PositionSnapshot::mark_price
+    // 是估值口径（可能是持仓成本价 fallback），拿来开仓会按成本价成交。
     int64_t price_fp = 0;
     XtTimeInForce tif;
     if (is_market) {
-        price_fp = ctx.account_store->snapshot_position(req.symbol).mark_price;
+        price_fp = ctx.account_store->venue_mark_price(req.symbol);
         if (price_fp <= 0) return reject_log(ManualOrderOutcome::InvalidPrice, "invalid_price_no_mark");
         tif = XtTimeInForce::IOC;
     } else {
@@ -353,13 +403,16 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
         tif = XtTimeInForce::GTC;
     }
 
+    // D2 条件 stamp：router 模式（attribution_router_mode）且请求 strategy_id 为空时，
+    // 改写归属为保留名 "_manual"（动作归因账簿）；显式非空 strategy_id 保持既有定向归属
+    // 语义。非 router 模式不 stamp → 零 delta。
     std::string effective_strategy_id = req.strategy_id;
     if (ctx.attribution_router_mode && effective_strategy_id.empty()) {
         effective_strategy_id = xt_identity::StrategySidRegistry::kManualStrategyId;
     }
 
     if (!effective_strategy_id.empty()) {
-
+        // 保留名 "_manual" 因 D1 内建 lookup 恒返 kManualSidId（非 kNoSidId），此校验天然通过。
         const auto* sid_registry = xt_identity::StrategySidRegistry::global();
         if (!sid_registry ||
             sid_registry->lookup(effective_strategy_id)
@@ -368,6 +421,7 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
         }
     }
 
+    // (5) 提交走 full risk gate(critical:绝不 bypass)
     const std::string user_tag = "panel_manual_" + req.request_id;
     xt_core::XtOrderRequest order_req;
     order_req.order.set_code(req.symbol.c_str());
@@ -376,20 +430,21 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     order_req.order.qty_fp = qty_fp;
     order_req.order.tif = tif;
     order_req.order.set_tag(user_tag.c_str());
-    order_req.order.close_offset = XtOffset::Open;
+    order_req.order.close_offset = XtOffset::Open;  // 新开仓
     order_req.strategy_id = effective_strategy_id;
     order_req.source = xt_core::XtOrderSource::Manual;
     const xt_runtime::SubmitResult r = ctx.live_order_gateway->submit(order_req, exec_none());
     const char* sid_disp = effective_strategy_id.empty() ? "-" : effective_strategy_id.c_str();
     if (!r.accepted()) {
         reject_reason_out = std::to_string(static_cast<int>(r.reject_reason));
-
+        // D8-③：manual 路径提交失败可见性 —— 结构化 journal（request_id + reason text +
+        // reject 原因码）。与前置早退分支同 grep key `panel.manual_order reject`。
         XtLogger::warn_m("control",
             "panel.manual_order reject: request_id={} venue={} symbol={} sid={} reason=risk_rejected reason_code={}",
             req.request_id, req.venue, req.symbol, sid_disp, reject_reason_out);
         return ManualOrderOutcome::RiskRejected;
     }
-
+    // 提交回执（server-side lifecycle 起点；终态回执见 engine finish_terminal / D8-④）。
     XtLogger::info_m("control",
         "panel.manual_order submitted: request_id={} venue={} symbol={} sid={} order_id={}",
         req.request_id, req.venue, req.symbol, sid_disp,
@@ -397,24 +452,31 @@ ManualOrderOutcome manual_order_panel_request(XtPanelContext& ctx,
     return ManualOrderOutcome::Submitted;
 }
 
+// cross-Runner per-strategy risk state wire helper。
+// 任一 ptr nullptr → 跳过相关 setter (跟 BT 路径同 fail-safe pattern)。
 void wire_per_strategy_risk_state(
     xt_risk::XtRiskMonitor* risk_monitor,
     xt_account::AccountStateStore* account_store,
     XtLiveOrderGateway* order_gateway,
     const xt_risk::XtRiskMonitorState* risk_monitor_state) noexcept {
-
+    // risk_monitor.on_session_begin dedup 块内调
+    //   account_store.on_session_begin_hook(equity_fp) freeze starting_balance。
     if (risk_monitor && account_store) {
         risk_monitor->set_account_store(account_store);
     }
-
+    // GuardContext.make_snapshot 走 monitor.per_strategy 反查填
+    //   snapshot.strategy_killed/blocked → engine reject StrategyKillSwitchActive/BlockedByWatchdog。
     if (order_gateway && risk_monitor_state) {
         order_gateway->set_per_strategy_risk_monitor_state(risk_monitor_state);
     }
 }
 
+// 进程内累计：被 fail-closed disable + kill-latch 的策略 on_init 失败次数（TU-scope）。
 namespace {
 std::atomic<uint64_t> g_strategy_init_failure_latched_total_{0};
-}
+/// 置位后回读没读到 true 的次数（该 sid 的开仓闸实际没上）。
+std::atomic<uint64_t> g_strategy_init_failure_latch_unverified_total_{0};
+}  // namespace
 
 std::function<void(uint32_t, const std::string&)>
 make_strategy_init_failure_handler(
@@ -422,23 +484,49 @@ make_strategy_init_failure_handler(
     return [risk_monitor_state](uint32_t sid_id, const std::string& name) {
         const uint64_t total =
             g_strategy_init_failure_latched_total_.fetch_add(1, std::memory_order_relaxed) + 1;
-
-        bool latched = false;
+        // per-sid kill latch：拒新开仓，平仓单天然通行（close bypass）。sid_id==0
+        // （reserved/no-sid）或 state 缺失 → 仅日志 + counter。
+        //
+        // set_strategy_killed 对越界 sid 是静默 no-op，而槽位数组在装配期通常还没
+        // init（容量 0）——「调过 setter」不等于「闸上了」。故置位后必须回读：只有
+        // 读回 true 才敢记「已置位」，否则记 error 并计数，让 runner 侧的 post-init
+        // 补置缺失能在日志/counter 上直接暴露，而不是被一条报喜的 critical 掩盖。
+        bool attempted = false;
+        bool verified  = false;
         if (risk_monitor_state && sid_id != 0) {
+            attempted = true;
             risk_monitor_state->per_strategy.set_strategy_killed(sid_id, true);
-            latched = true;
+            verified = risk_monitor_state->per_strategy.is_strategy_killed(sid_id);
         }
-
+        const char* latch_state = !attempted ? "跳过(sid=0 或无 risk state)"
+                                             : (verified ? "已置位" : "置位失败(回读为假)");
+        // recovery 持仓在本回调触发点（worker 启动 / 装配期）尚未回灌，无法按 sid 读净仓；
+        // 折入基础 critical，由 operator 据日志核查该 sid 是否残留恢复持仓（无人管理）。
         XtLogger::critical(
             "[INIT-FAILURE] strategy '{}' (sid_id={}) on_init 失败 → fail-closed disabled + "
             "per-sid kill latch {}（拒新开仓、平仓通行）；若该 sid 有恢复持仓则无人管理，"
             "需 operator 处置。latched_total={}",
-            name.c_str(), sid_id, latched ? "已置位" : "跳过(sid=0 或无 risk state)", total);
+            name.c_str(), sid_id, latch_state, total);
+        if (attempted && !verified) {
+            const uint64_t unverified =
+                g_strategy_init_failure_latch_unverified_total_.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            XtLogger::error(
+                "[INIT-FAILURE] sid_id={} 的 per-sid kill latch 写后回读为 false —— "
+                "per-sid risk state 槽位尚未 init(容量 {})，该 sid 的 gateway/risk 开仓闸"
+                "当前未生效，必须由 runner 在 init() 之后补置。unverified_total={}",
+                sid_id, risk_monitor_state->per_strategy.size(), unverified);
+        }
     };
 }
 
 uint64_t strategy_init_failure_latched_total() noexcept {
     return g_strategy_init_failure_latched_total_.load(std::memory_order_relaxed);
+}
+
+uint64_t strategy_init_failure_latch_unverified_total() noexcept {
+    return g_strategy_init_failure_latch_unverified_total_.load(
+        std::memory_order_relaxed);
 }
 
 bool wire_risk_state_and_validate(
@@ -450,14 +538,18 @@ bool wire_risk_state_and_validate(
     const ct::metrics::XtStrategyPnlBaseline* strategy_pnl_baseline) noexcept {
     wire_per_strategy_risk_state(risk_monitor, account_store, order_gateway,
                                  risk_monitor_state);
-
+    // per-strategy daily-loss source = realized-PnL aggregator（HFT 持有；无源
+    // engine 的 per_strategy_daily_loss_pct 保持 bypass）。baseline 与 aggregator
+    // 配对：gate 用「aggregator 累计 − baseline」得 today realized，否则退化为
+    // lifetime 累计。两 setter 必须先于 validate（validate 检查「配 daily-loss
+    // 却无 PnL 源」）。
     if (order_gateway && strategy_pnl_aggr) {
         order_gateway->set_strategy_pnl_aggregator(strategy_pnl_aggr);
     }
     if (order_gateway && strategy_pnl_baseline) {
         order_gateway->set_strategy_pnl_baseline(strategy_pnl_baseline);
     }
-
+    // late dep wire 后校验风控配置；misconfig 由 caller fail-exit。
     if (order_gateway) {
         const std::string verr = order_gateway->validate_risk_config();
         if (!verr.empty()) {
@@ -468,6 +560,11 @@ bool wire_risk_state_and_validate(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// cross-strategy symbol overlap validation
+// ---------------------------------------------------------------------------
+//
+// Runner 启动期反查 symbol → sid_set，默认拒绝多 strategy 共仓归因重叠。
 bool validate_cross_strategy_symbol_overlap(
     const xt_strategy_engine::XtDeclaredSymbolRegistry* registry,
     const std::vector<std::string>& sid_list,
@@ -491,6 +588,7 @@ bool validate_cross_strategy_symbol_overlap(
         return false;
     }
 
+    // 反向索引: code → vector<sid> (按 yaml 顺序保稳定)
     std::unordered_map<std::string, std::vector<std::string>> code_to_sids;
     std::vector<std::string> missing_sids;
     for (const auto& sid : sid_list) {
@@ -511,6 +609,7 @@ bool validate_cross_strategy_symbol_overlap(
         return false;
     }
 
+    // 扫描重叠
     bool any_overlap = false;
     for (const auto& [code, sids] : code_to_sids) {
         if (sids.size() < 2) continue;
@@ -530,9 +629,9 @@ bool validate_cross_strategy_symbol_overlap(
     }
 
     if (any_overlap && !allow_overlap) {
-        return false;
+        return false;  // default: abort
     }
-    return true;
+    return true;  // 无重叠 / escape hatch: pass
 }
 
 std::vector<std::string> collect_strategy_config_symbols(
@@ -574,6 +673,13 @@ std::vector<std::string> collect_strategy_config_symbols(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// run_overlap_check (Runner wrapper)
+// ---------------------------------------------------------------------------
+// HFT / CTA / SEL runner 共用的 sid_list 校验入口。
+// CTA/SEL on_init 在 worker 线程, declare_position_interest 跟主线程 race —
+// poll-with-timeout (500ms) 等 tracker.registered_sids 跟 sid_list 全 covered。
+// HFT 不需要 (init_all_strategy_plugins_ 同步), wait_for_workers=false。
 bool run_overlap_check(
     const xt_strategy_engine::XtDeclaredSymbolRegistry* registry,
     const std::vector<std::string>& sid_list,
@@ -581,11 +687,13 @@ bool run_overlap_check(
     const char* engine_tag,
     bool wait_for_workers) noexcept {
     if (!registry) {
-
+        // 多策略无法证明 overlap-safe 时 fail closed; 单策略在 validate 内直接通过。
         return validate_cross_strategy_symbol_overlap(nullptr, sid_list, allow_overlap);
     }
     if (wait_for_workers && !sid_list.empty()) {
-
+        // CTA/SEL on_init worker race: poll tracker.registered_sids 到 fully covered 或 500ms 超时。
+        // 实测 on_init 第一次 fire 在 event_loop start 后 ~10-50ms (worker thread bootstrap),
+        // 500ms timeout 给 5x margin, 超时 fall-through (log warn 但不 abort, validate 仍跑用部分覆盖)。
         const auto start_ts = std::chrono::steady_clock::now();
         const auto timeout = std::chrono::milliseconds(500);
         while (true) {
@@ -624,7 +732,7 @@ bool run_overlap_check_for_config(
     const bool allow_overlap =
         cfg.bootstrap.order_gateway_cfg.risk.allow_strategy_symbol_overlap;
     if (!run_overlap_check(registry, sid_list, allow_overlap, engine_tag,
-                            true)) {
+                           /*wait_for_workers=*/true)) {
         XtLogger::error_m(engine_tag,
             "cross-strategy symbol overlap detected — abort startup "
             "(set risk.allow_strategy_symbol_overlap=true to bypass)");
@@ -633,4 +741,4 @@ bool run_overlap_check_for_config(
     return true;
 }
 
-}
+}  // namespace xt_live::control

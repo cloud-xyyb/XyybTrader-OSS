@@ -14,9 +14,13 @@
 
 namespace xt_core::sync {
 
+/// FNV-1a 64-bit 标准常量（项目内字符串/字节 hash 的 SSOT）。
 inline constexpr uint64_t kFnv1a64OffsetBasis = 14695981039346656037ULL;
 inline constexpr uint64_t kFnv1a64Prime       = 1099511628211ULL;
 
+/// @brief FNV-1a 64-bit 流式更新：把 [data, data+len) 混入既有 hash 状态。
+/// @note 初始 state 取 `kFnv1a64OffsetBasis`；可多次调用累积（顺序敏感）。
+/// @pre `data` 仅在 `len == 0` 时允许为 nullptr。
 inline uint64_t fnv1a_update(uint64_t h, const void* data, size_t len) noexcept {
     const auto* p = static_cast<const unsigned char*>(data);
     for (size_t i = 0; i < len; ++i) {
@@ -26,6 +30,7 @@ inline uint64_t fnv1a_update(uint64_t h, const void* data, size_t len) noexcept 
     return h;
 }
 
+/// @brief FNV-1a 64-bit single-shot：对 [data, data+len) 求 hash。
 inline uint64_t fnv1a_bytes(const void* data, size_t len) noexcept {
     return fnv1a_update(kFnv1a64OffsetBasis, data, len);
 }
@@ -41,6 +46,7 @@ struct TransparentStringHash {
         return static_cast<size_t>(fnv1a_bytes(s.data(), s.size()));
     }
 
+    /// @pre `s` 不能为 nullptr；空字符串请传 `""`。
     size_t operator()(const char* s) const noexcept {
         return operator()(std::string_view{s});
     }
@@ -64,7 +70,8 @@ struct TransparentStringEqual {
     }
 };
 
+/// 便利类型别名：带透明 hash 的 string-keyed unordered_map。
 template <typename V>
 using TransparentStringMap = std::unordered_map<std::string, V, TransparentStringHash, TransparentStringEqual>;
 
-}
+}  // namespace xt_core::sync

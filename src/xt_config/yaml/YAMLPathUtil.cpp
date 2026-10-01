@@ -41,7 +41,7 @@ void flatten_yaml_node_impl(const YAML::Node& node,
     }
 }
 
-}
+}  // namespace
 
 YAML::Node get_path_node(const YAML::Node& root, const std::string& path) {
     if (path.empty()) return YAML::Clone(root);
@@ -52,7 +52,7 @@ YAML::Node get_path_node(const YAML::Node& root, const std::string& path) {
         std::string key = (dot == std::string::npos) ? path.substr(start)
                                                       : path.substr(start, dot - start);
         if (!cur || !cur.IsDefined()) return YAML::Node();
-
+        // 用 const Node 下标访问，避免 yaml-cpp 对缺失 key 执行插入式访问。
         const YAML::Node ccur = cur;
         YAML::Node next = ccur[key];
         if (!next.IsDefined() || next.IsNull()) return YAML::Node();
@@ -85,4 +85,4 @@ void flatten_yaml_node_to_pairs(const YAML::Node& node,
         [&](const std::string& key, const std::string& value) { out.emplace_back(key, value); });
 }
 
-}
+}  // namespace XtConfigYamlUtil

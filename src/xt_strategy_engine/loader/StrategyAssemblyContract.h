@@ -21,12 +21,21 @@
 
 namespace xt_strategy_engine {
 
+// ── multi-strategy 4-tuple alignment ──────────────────────────────────────
+
 /// @brief multi-strategy 装配对齐结果。
 struct AssemblyAlignmentReport {
     bool        aligned = true;
-    std::string error;
+    std::string error;  ///< 详细错位描述（aligned == true 时为空）
 };
 
+/// @brief 4-tuple alignment check（multi-mode 装配后必调）。
+///
+/// 4-tuple = `{cfg_strategy_ids[i], instances[i].id, sink_ptrs[i] == context sink,
+/// context strategy_id}`，可选再校验 `sid_registry.lookup(id) == i + 1`。
+/// 任一错位都会让 sid routing 把某策略的回报分发给错误 sink。
+///
+/// sink resolver 必须返回 adjusted `IStrategyExecSink*`，不能比较 context object address。
 template <typename StrategyIdAt, typename SinkAt>
 inline AssemblyAlignmentReport check_multi_exec_sink_alignment(
     const std::vector<std::string>&      cfg_strategy_ids,
@@ -93,6 +102,11 @@ inline AssemblyAlignmentReport check_multi_exec_sink_alignment(
     return rep;
 }
 
+/// @brief instances-free 变体（3-tuple alignment）：plugin 所有权不以
+/// StrategyInstance 承载的 runner（如 CTA 的 `XtPluginHolder` vector）使用。
+/// 校验 `{cfg_strategy_ids[i], sink_ptrs[i], context strategy_id/sink}` 对齐
+/// + 可选 sid slot；插件加载缺失由 context_count 尺寸差暴露。
+/// @note 与上方 4-tuple 版本语义同源，改动需成对维护。
 template <typename StrategyIdAt, typename SinkAt>
 inline AssemblyAlignmentReport check_multi_exec_sink_alignment_no_instances(
     const std::vector<std::string>&        cfg_strategy_ids,
@@ -178,4 +192,4 @@ inline AssemblyAlignmentReport check_multi_exec_sink_alignment(
         sid_registry);
 }
 
-}
+}  // namespace xt_strategy_engine

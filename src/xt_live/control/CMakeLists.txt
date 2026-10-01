@@ -32,4 +32,5 @@ target_link_libraries(xt_live_control PUBLIC
     xt_stra            # XtDeclaredSymbolRegistry / XtStrategyInitConfig
     xt_config          # XtCommodityCatalog
     xt_logger
+    xt_metrics        # AdvanceRiskFrame 帧尾 account store 健康面 1Hz emit
 )

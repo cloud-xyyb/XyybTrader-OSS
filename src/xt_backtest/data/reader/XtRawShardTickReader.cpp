@@ -38,7 +38,8 @@ bool XtRawShardTickReader::load_next_shard() {
         std::vector<XtRawTick> recs;
         const auto status = xt_raw_shard::load_shard(path, recs, info);
         if (status != xt_raw_shard::XtRawShardStatus::Ok) {
-
+            // 分片是建库产物，缺片/损坏不是「这个文件恰好没数据」——跳过会把回放
+            // 悄悄截断成另一段行情。置 sticky I/O 错误交给上层判 run 失败。
             failed_shard_ = path;
             failure_status_ = status;
             io_error_ = true;
@@ -51,7 +52,7 @@ bool XtRawShardTickReader::load_next_shard() {
         records_.swap(recs);
         rec_idx_ = 0;
         if (!records_.empty()) return true;
-
+        // 空分片（该交易日无 tick）合法，继续下一片。
     }
     return false;
 }

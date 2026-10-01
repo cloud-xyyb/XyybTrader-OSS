@@ -9,6 +9,8 @@
 
 namespace {
 
+// JSON 字符串最小转义：reason 文本来自 risk 层（静态文案为主），只处理会破坏
+// JSON 语法的字符，不追求完整 escaper。
 std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -32,7 +34,7 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
-}
+}  // namespace
 
 void XtBacktestDailyBreakdown::on_tick(uint32_t trading_date) noexcept {
     if (trading_date != 0) ++daily_stats_[trading_date].tick_count;
@@ -51,7 +53,8 @@ void XtBacktestDailyBreakdown::on_risk_reject(uint32_t trading_date, std::string
     auto& st = daily_stats_[trading_date];
     ++st.risk_reject_count;
     if (reason.empty()) return;
-
+    // 分桶封顶：reason 文本理论上可携带动态数字（风控层多为静态文案），封顶
+    // 防止单日 map 无界增长；已存在的桶不受上限影响继续累加。
     auto it = st.rejects_by_reason.find(std::string(reason));
     if (it != st.rejects_by_reason.end()) {
         ++it->second;
@@ -78,7 +81,7 @@ bool XtBacktestDailyBreakdown::write_json(const std::string& out_path,
                                           uint32_t cfg_start_date,
                                           uint32_t cfg_end_date,
                                           bool shared_execution_counters) const {
-    if (daily_stats_.empty()) return true;
+    if (daily_stats_.empty()) return true;  // 没数据不写文件 (vs failure)
 
     std::error_code ec;
     std::filesystem::create_directories(
@@ -95,7 +98,7 @@ bool XtBacktestDailyBreakdown::write_json(const std::string& out_path,
     out << "  \"start_date\": " << cfg_start_date << ",\n";
     out << "  \"end_date\": " << cfg_end_date << ",\n";
     out << "  \"days\": " << daily_stats_.size() << ",\n";
-
+    // F8:仅共享计数路径落该标志（默认缺席 → 单策略 / HFT 逐字节不变）。
     if (shared_execution_counters) {
         out << "  \"shared_execution_counters\": true,\n";
     }

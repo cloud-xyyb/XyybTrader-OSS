@@ -11,7 +11,8 @@
 XtFeeRuleBook::Config parse_fee_rule_book_config(const YAML::Node& node) {
     XtFeeRuleBook::Config cfg;
     if (!node || node.IsNull() || !node.IsMap()) return cfg;
-
+    // 费率字段必须有限且非负：消费方 calc_fee_from_rule 用 `>0.0` gate 会把 NaN/负值当作
+    // 0-fee；解析层 fail-closed，使配置误写在启动期暴露。
     auto rate = [](const YAML::Node& item, const char* k,
                    const std::string& key, double& dst) {
         if (!item[k]) return;
@@ -24,7 +25,7 @@ XtFeeRuleBook::Config parse_fee_rule_book_config(const YAML::Node& node) {
     };
     for (auto it = node.begin(); it != node.end(); ++it) {
         if (!it->first.IsScalar()) continue;
-
+        // fee 与 commodity catalog 共用归一化键；重复归一化 key 保持 YAML 后写覆盖语义。
         std::string key = XtCommodityCatalog::normalize_key(it->first.as<std::string>());
         if (key.empty()) continue;
         const YAML::Node item = it->second;

@@ -1,5 +1,7 @@
 # XyybTrader
 
+> dev：HFT + SEL 回测，保留源码注释。[SEL 使用与数据契约](docs/SEL_BACKTEST.md)。
+
 <p align="center">
     <img src="https://img.shields.io/badge/language-C%2B%2B17-blue.svg"/>
     <img src="https://img.shields.io/badge/platform-linux-yellow.svg"/>
@@ -23,7 +25,7 @@ XyybTrader 是一套 C++17 写的高频交易系统，覆盖 tick 级回测、�
 
 #### 三类策略引擎
 
-XyybTrader 支持 **HFT**、**CTA**（beta）、**SEL**（beta）三类策略，共用策略接口、账户、风控；本仓目前开源 HFT，CTA 和 SEL 会在后续版本陆续开源。
+XyybTrader 支持 **HFT**、**CTA**（beta）、**SEL**（beta）三类策略，共用策略接口、账户、风控；dev 分支公开 HFT 与 SEL 回测，保留源码注释；CTA 引擎、SEL 实盘与 XTP 接入暂不包含。
 
 - **HFT 引擎** —— 高频策略引擎, 逐笔处理行情策略，单线程事件驱动，具有极低的系统延迟。
 - **CTA 引擎**（beta）—— 时间驱动 + 事件驱动，策略按目标仓位表达意图，引擎进行差量下单和开平拆分；适合分钟到日线级的趋势、均值回归类策略。
@@ -145,8 +147,6 @@ repo 带五个能直接参考的插件：`hft_tick_revert` 是最小可用的 ti
     - CTP —— SDK 随仓附带，SimNow 仿真可直连；行情、交易、断线恢复、报撤单与回报映射
 - **加密货币**
     - Binance USDT-M 永续 —— demo trading / testnet 可直连；行情、交易、REST + WebSocket 双通道、User Data Stream、对账
-- **股票**
-    - 中泰XTP（beta）
 
 #### 相关工具（beta）
 
@@ -187,15 +187,12 @@ sudo apt-get install -y /tmp/apache-arrow-apt-source-latest-*.deb && sudo apt-ge
 sudo apt-get install -y libarrow-dev libparquet-dev
 
 # 构建主体（回测器 + 实盘 runner）
-cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+bash scripts/build_dev.sh
+python3 scripts/validate_dev.py
 
-# 构建策略插件（独立编译为 .so）
-cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy -DXT_SRC_ROOT=$(pwd)/src
-cmake --build build-strategy -j$(nproc)
-mkdir -p var/plugins/strategies && cp build-strategy/libhft_tick_revert_strategy.so var/plugins/strategies/
-# 开发期想跳过校验，设 CLOUDTRADER_PLUGIN_STRICT_SIGNING=0
-(cd var/plugins/strategies && sha256sum libhft_tick_revert_strategy.so | awk '{print $1}' > libhft_tick_revert_strategy.so.sha256)
+# SEL 最小示例（5 笔成交）
+export CLOUDTRADER_PLUGIN_ALLOWLIST=libsel_weights_csv_strategy.so
+$HOME/builds/xyybtrader-oss-dev-jammy/XtSelBacktestRunner configs/backtest_sel_demo.yaml
 ```
 
 > 本步产物跑回测与实盘 runner 都够用；Live Panel 控制面未随本仓发布，无需额外构建选项。
@@ -222,7 +219,7 @@ export PROJECT_DIR=$(pwd)
 sed "s|\${PROJECT_DIR}|$PROJECT_DIR|g" configs/baselines/ag2206_only.yaml > /tmp/bt.yaml
 echo '{}' > /tmp/market.yaml     # 隔离 market 合并，loader 在 config 同目录找它
 CLOUDTRADER_PLUGIN_ALLOWLIST=libhft_tick_revert_strategy.so \
-  ./build/XtBackTestRunner --config /tmp/bt.yaml
+  $HOME/builds/xyybtrader-oss-dev-jammy/XtBackTestRunner --config /tmp/bt.yaml
 ```
 
 **3. 跑完整的 regression 测试**
@@ -237,7 +234,7 @@ bash scripts/regression_test.sh
 cp configs/secrets.yaml.example configs/secrets.yaml   # 填 SimNow investor 账号密码
 cp configs/live_hft_ctp.yaml.example configs/live_hft_ctp.yaml
 CLOUDTRADER_PLUGIN_ALLOWLIST=libhft_tick_revert_strategy.so \
-  ./build/xt_live/hft/XtRunner --config configs/live_hft_ctp.yaml
+  $HOME/builds/xyybtrader-oss-dev-jammy/xt_live/hft/XtRunner --config configs/live_hft_ctp.yaml
 ```
 
 **5. 实盘，Binance demo trading**
@@ -246,7 +243,7 @@ CLOUDTRADER_PLUGIN_ALLOWLIST=libhft_tick_revert_strategy.so \
 cp configs/secrets.yaml.example configs/secrets.yaml   # 填 demo API key/secret，权限只勾 Enable Futures
 cp configs/live_hft_binance.yaml.example configs/live_hft_binance.yaml
 CLOUDTRADER_PLUGIN_ALLOWLIST=libhft_tick_revert_strategy.so \
-  ./build/xt_live/hft/XtRunner --config configs/live_hft_binance.yaml
+  $HOME/builds/xyybtrader-oss-dev-jammy/xt_live/hft/XtRunner --config configs/live_hft_binance.yaml
 ```
 
 > `configs/secrets.yaml` 在 `.gitignore` 里，凭证不会进仓。凭证按主配置相同的 YAML 路径写，

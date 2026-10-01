@@ -14,12 +14,12 @@
 /// `reporter` 为 non-owning，可为空；为空时丢弃所有报告事件。
 class XtBacktestReporterObserver final : public xt_runtime::IHftEngineObserver {
 public:
-
+    /// @param r non-owning；允许为空，表示关闭本 observer 的 reporter 输出。
     explicit XtBacktestReporterObserver(XtBacktestReporter* r) : reporter_(r) {}
 
     void on_order_update(const XtOrderExecUpdate& u,
-                         XtLatencyEligibility   = XtLatencyEligibility::kEligible) override {
-
+                         XtLatencyEligibility /*elig*/ = XtLatencyEligibility::kEligible) override {
+        // BT reporter 只做报告输出，不喂 latency tracker；忽略 elig。
         if (reporter_) reporter_->on_order_update(u);
     }
 
@@ -37,9 +37,10 @@ public:
                                        tag, is_close, is_today);
         }
     }
+    // HFT backtest reporter 不消费 position/account snapshot observer 回调。
 
 private:
-    XtBacktestReporter* reporter_;
+    XtBacktestReporter* reporter_;  ///< non-owning；允许为空
 };
 
 /// @brief HFT 回测 engine-side 的成交报告 observer。
@@ -48,7 +49,7 @@ private:
 /// reporter 的 fill 行。`reporter` 为 non-owning，可为空；为空时关闭 fill 上报。
 class XtBacktestReporterFillObserver final : public xt_runtime::IHftEngineObserver {
 public:
-
+    /// @param r non-owning；允许为空，表示关闭 fill 上报。
     explicit XtBacktestReporterFillObserver(XtBacktestReporter* r) : reporter_(r) {}
 
     void on_trade(const XtTradeRecord& tr,
@@ -56,5 +57,5 @@ public:
                   uint64_t logical_order_id = 0) override;
 
 private:
-    XtBacktestReporter* reporter_;
+    XtBacktestReporter* reporter_;  ///< non-owning；允许为空
 };

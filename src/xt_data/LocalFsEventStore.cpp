@@ -9,21 +9,26 @@
 #include <optional>
 #include <system_error>
 #include <utility>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <fcntl.h>    // open (回滚重开 truncate)
+#include <sys/stat.h> // fstat
+#include <unistd.h>   // fsync, fileno, ftruncate, close
 #include <vector>
 
 #include "flatbuffers/flatbuffers.h"
 
-#include "xt_core/market/XtTickSortKey.h"
+#include "xt_core/market/XtTickSortKey.h"  // make_tick_sort_key（夜盘旋转），与 CSV/memory 归并同口径
 
 namespace ct::data {
 
+// ---------------------------------------------------------------------------
+// 文件内 helper
+// ---------------------------------------------------------------------------
+
 namespace {
 
+// 将 YYYYMMDD 转成目录名 `YYYY-MM-DD`；交易日合法性由上游保证。
 std::string format_trading_day(std::uint32_t day) {
-
+    // 16 字节足够覆盖 snprintf 的保守截断分析，避免不同 GCC 版本误报。
     char buf[16];
     const std::uint32_t y = day / 10000;
     const std::uint32_t m = (day / 100) % 100;
@@ -32,6 +37,7 @@ std::string format_trading_day(std::uint32_t day) {
     return std::string(buf);
 }
 
+// query 遍历目录时只接受严格 `YYYY-MM-DD`，非法目录名按非 shard 跳过。
 std::optional<std::uint32_t> parse_trading_day(const std::string& name) {
     if (name.size() != 10 || name[4] != '-' || name[7] != '-') {
         return std::nullopt;
@@ -50,6 +56,7 @@ std::optional<std::uint32_t> parse_trading_day(const std::string& name) {
     return y * 10000u + m * 100u + d;
 }
 
+// FD cache key 使用路由三元组；EventExt 通过保留 exch/sym `_events` 复用关闭路径。
 std::string make_shard_key(std::uint32_t day,
                            std::string_view exch,
                            std::string_view sym) {
@@ -65,6 +72,8 @@ std::string make_shard_key(std::uint32_t day,
     return key;
 }
 
+// 取 FILE* 当前 on-disk 字节大小（char device / fstat 失败返 0）；用于 clean_size 基准
+// 与短写/flush 失败时的回滚边界判定。
 std::size_t on_disk_size(std::FILE* fp) {
     const int fd = ::fileno(fp);
     if (fd < 0) {
@@ -77,8 +86,12 @@ std::size_t on_disk_size(std::FILE* fp) {
     return static_cast<std::size_t>(st.st_size);
 }
 
+// 单 record payload 上限；append 超限拒绝，query 读到超限视作 corrupt size prefix。
 constexpr std::size_t kMaxRecordSize = 64u * 1024u;
 
+// 拒绝会逃出 root 或制造歧义路径的 exchange/symbol 组件：空、路径分隔符、相对引用
+// (. / ..)、控制字符。venue 推送的 InstrumentID 直接进文件系统路径，半可信 → append
+// 边界纵深防御，与 query 侧 parse_trading_day 的严格校验对称。
 bool is_path_component_safe(std::string_view s) {
     if (s.empty() || s == "." || s == "..") {
         return false;
@@ -91,7 +104,11 @@ bool is_path_component_safe(std::string_view s) {
     return true;
 }
 
-}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Iterator 实现
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -174,7 +191,7 @@ private:
             f.file_order = i;
             f.fp = std::fopen(f.path.c_str(), "rb");
             if (!f.fp) {
-                continue;
+                continue;  // query 后文件被删或权限变化时跳过该 shard。
             }
             states_.push_back(std::move(f));
             const std::size_t idx = states_.size() - 1;
@@ -187,6 +204,10 @@ private:
         }
     }
 
+    // has_error() 契约 = 「丢失了已提交记录的腐化」，而非「文件停在不完整记录上」。
+    // append-only 单写下截断只可能在尾部、且尾记录从未提交 → 截断尾是良性 EOF
+    // (关该 shard 继续 merge 其它健康 shard)；只有中段 bit-rot (非法 size / verify
+    // fail 但字节齐全) 才是真错误 (置 has_error_ 全局早退)。
     bool read_next_record_(FileState& f) {
         if (!f.fp) {
             return false;
@@ -194,16 +215,17 @@ private:
 
         std::uint32_t size_le = 0;
         const std::size_t nr = std::fread(&size_le, 1, sizeof(std::uint32_t), f.fp);
-        bytes_read_ += nr;
+        bytes_read_ += nr;  // 物理读取字节数，所有分支统一口径。
         if (nr != sizeof(std::uint32_t)) {
-
+            // nr==0 干净 EOF；nr∈1..3 是崩溃残留的不完整尾 size 前缀 → 均良性。
             close_file_(f);
             return false;
         }
 
         const std::size_t size = static_cast<std::size_t>(size_le);
         if (size == 0 || size > kMaxRecordSize) {
-
+            // append 永不写出 size==0；oversize 只可能来自腐化或错位前缀 → 一律按中段
+            // bit-rot 处理（非良性尾），置 has_error_ 全局早退。
             has_error_ = true;
             return false;
         }
@@ -212,13 +234,13 @@ private:
         const std::size_t data_nr = std::fread(f.buf.data(), 1, size, f.fp);
         bytes_read_ += data_nr;
         if (data_nr != size) {
-            close_file_(f);
+            close_file_(f);  // 尾部不完整 payload (崩溃残留) → 良性。
             return false;
         }
 
         ::flatbuffers::Verifier v(f.buf.data(), size);
         if (!schema::VerifyMdTickBuffer(v)) {
-            has_error_ = true;
+            has_error_ = true;  // size 齐全但内容坏 → bit-rot。
             return false;
         }
 
@@ -229,10 +251,12 @@ private:
         return true;
     }
 
+    // 比较器让最早 tick 位于 heap top；pop_heap 后从 heap_.back() 取出。
     bool heap_later_(std::size_t lhs, std::size_t rhs) const {
         const FileState& a = states_[lhs];
         const FileState& b = states_[rhs];
-
+        // 用全局 tick sort key（含夜盘 18:00 旋转，SSOT=xt_core/XtTickSortKey）比较，与 CSV /
+        // memory 归并同口径：同一 trading_day 夜盘(21:00，action_time 数值大但时间早)排日盘之前。
         const uint64_t ka = make_tick_sort_key(a.trading_day, a.action_time);
         const uint64_t kb = make_tick_sort_key(b.trading_day, b.action_time);
         if (ka != kb) {
@@ -267,15 +291,19 @@ private:
     bool has_error_ = false;
 };
 
-}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// LocalFsEventStore 成员实现
+// ---------------------------------------------------------------------------
 
 LocalFsEventStore::LocalFsEventStore(std::string root_path)
     : root_path_(std::move(root_path)) {
-
+    // root 目录在首次 append 时创建，空 store 不触碰文件系统。
 }
 
 LocalFsEventStore::~LocalFsEventStore() {
-    (void)flush();
+    (void)flush();  // 析构兜底关闭；持久化失败已由显式 shutdown 路径的 flush() 返回值告警。
 }
 
 std::filesystem::path
@@ -293,11 +321,11 @@ LocalFsEventStore::shard_path(std::uint32_t day,
 LocalFsEventStore::ShardHandle*
 LocalFsEventStore::open_shard_(const std::string& key,
                               const std::filesystem::path& path) {
-
+    // 已闩死 → fail-closed，不再重开续写（否则会在残尾后制造不可见后缀）。
     if (poisoned_shards_.count(key) != 0) {
         return nullptr;
     }
-
+    // 插入空 handle 占位后再创建目录/打开文件；失败时必须 erase，避免缓存坏 slot。
     auto [it, inserted] = files_.try_emplace(key);
     if (!inserted && it->second.fp) {
         return &it->second;
@@ -315,7 +343,11 @@ LocalFsEventStore::open_shard_(const std::string& key,
         return nullptr;
     }
     it->second.fp = fp;
-
+    // clean_size 基准 = open 时既有文件大小（续写既有 shard 时非 0）。
+    // 注意：此基准以含残尾的 on-disk size 起算，不对既有文件做 tail 校验。跨进程 crash
+    // 的残尾若在「同一 root 续写」时读到会被当成干净前缀。依赖部署形态 bootstrap 先
+    // rotate 迁走含残尾旧 root（rotate 产新 root → 全新 shard），此路径才不可达；仅在
+    // bootstrap rotate 失败/缺席时才会续写旧 root（此时无 tail 校验，属已知降级）。
     it->second.clean_size = on_disk_size(fp);
     return &it->second;
 }
@@ -344,6 +376,11 @@ bool LocalFsEventStore::write_frame_(const std::string& key,
         return true;
     }
 
+    // 短写：本帧残片毒化 shard 尾部。先丢 FD（fclose 会尽力把已确认的完整 frame 刷出，
+    // append 模式下也可能把本帧残片重追到 EOF），再重开 path 把尾部 ftruncate 回滚到上一完整
+    // frame 边界 (clean_size)。仅当 on-disk 仍 >= clean_size（[0,clean_size] 即确认帧、尾部是残片）
+    // 时收缩，避免 extend 造零洞；on-disk 已低于 clean_size（确认帧未落盘、干净边界不可定位）或
+    // ftruncate 失败 → 无法保证尾部干净 → 闩死 shard，阻止后续在残尾后续写造成不可见后缀。
     const std::size_t clean = sh.clean_size;
     close_and_drop_shard_(key);
     bool rolled_back = false;
@@ -379,7 +416,8 @@ void LocalFsEventStore::close_and_drop_shard_(const std::string& key) {
 void LocalFsEventStore::poison_shard_(const std::string& key) {
     if (poisoned_shards_.insert(key).second) {
         poisoned_shard_count_.fetch_add(1, std::memory_order_relaxed);
-
+        // 闩死是罕见严重事件（残帧不可回滚 / flush 落盘失败），首次即报；store 不持
+        // logger，直接 stderr。caller 侧另有 append 返 false 的限频告警（XtLiveRecorder）。
         std::fprintf(stderr,
             "[eventstore] shard poisoned fail-closed (torn frame unrecoverable): key=%s\n",
             key.c_str());
@@ -410,6 +448,7 @@ bool LocalFsEventStore::append(std::uint32_t trading_day,
     return write_frame_(key, path, *sh, fbs_buf, fbs_size);
 }
 
+// EventExt 是日级事件流，没有 exchange/symbol 分片；FD cache 仍复用同一个 key map。
 bool LocalFsEventStore::append_event_ext(std::uint32_t trading_day,
                                           const void* fbs_buf,
                                           std::size_t fbs_size) {
@@ -423,6 +462,7 @@ bool LocalFsEventStore::append_event_ext(std::uint32_t trading_day,
         return false;
     }
 
+    // `_events` 是保留 key，只用于复用 open_shard_ / flush() / 析构的路径；真实路径见 events_ext_path。
     const std::string key = make_shard_key(trading_day, "_events", "_events");
     const std::filesystem::path path = events_ext_path(trading_day);
     ShardHandle* sh = open_shard_(key, path);
@@ -435,18 +475,20 @@ bool LocalFsEventStore::append_event_ext(std::uint32_t trading_day,
 std::string LocalFsEventStore::rotate() {
     namespace fs = std::filesystem;
     std::error_code ec;
-
+    // root 从未创建（未 append）或为空 → 无需滚动。仍 flush 防御性关掉任何 FD。
     const bool has_data = fs::exists(root_path_, ec) && !fs::is_empty(root_path_, ec);
-    const bool flush_ok = flush();
+    const bool flush_ok = flush();  // fflush + fsync + fclose 全部 shard，清空 FD cache 使 root 可安全改名。
     if (!has_data) return {};
     if (!flush_ok) {
-
+        // flush 未能确保落盘 → 不改名（避免把未持久化 / 含残尾的 root 当成功滚动交给下游 prune），
+        // root 原地保留供下次重试。fail-closed，不报告成功。
         rotate_fail_count_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[eventstore] rotate skipped: flush persistence failed (root=%s)\n",
                      root_path_.c_str());
         return {};
     }
 
+    // 后缀取 wallclock 秒，与 JSONL 滚动 / prune 的 events.<epoch> 命名契约对齐。
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const fs::path src(root_path_);
@@ -456,15 +498,17 @@ std::string LocalFsEventStore::rotate() {
         dst = src;
         dst += "." + std::to_string(sfx);
         ++sfx;
-    } while (fs::exists(dst, ec));
+    } while (fs::exists(dst, ec));  // 同秒多次滚动时 ++ 后缀防冲突。
 
     fs::rename(src, dst, ec);
     if (ec) {
-
+        // 改名失败：root 仍在原地，下次 append 续写（降级，不致命，不报告成功）。
         rotate_fail_count_.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-
+    // 旧 root 已迁走 → 新 root 下所有 shard 都是全新文件，之前的残尾包袱不复存在，
+    // poison 理由消失。清闩，让曾被短写毒化的 (day|exch|sym) 在新 root 下可再次 append
+    // （与 write_frame_ 短写回滚的 compaction 自愈对称）。
     poisoned_shards_.clear();
     return dst.string();
 }
@@ -548,10 +592,14 @@ bool LocalFsEventStore::flush() {
             ok = false;
         }
         if (!ok) {
-
+            // fflush/fsync 失败：on-disk 尾部可能停着未完整刷出的字节（随后的 fclose 会尽力把
+            // 已缓冲的完整 frame 继续刷出）。这里只追踪 append 路径的 clean_size，无法在 flush 点
+            // 定位精确 frame 边界，故不做原地 ftruncate（会被 fclose 的 append 重刷覆盖），改为闩死
+            // 该 shard，阻止下次 append 在可能的残尾后静默续写造成不可见后缀；残尾本身由 reader 当
+            // 良性 EOF 截止。
             poison_shard_(key);
         }
-
+        // 无论前面是否失败，都必须 fclose（不泄漏 FD）；fclose 也可能因残余缓冲刷出失败。
         if (std::fclose(sh.fp) != 0) {
             ok = false;
         }
@@ -564,4 +612,4 @@ bool LocalFsEventStore::flush() {
     return all_ok;
 }
 
-}
+} // namespace ct::data

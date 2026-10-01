@@ -24,10 +24,13 @@ namespace xt_bt_shard_detail {
 
 #ifdef XT_BT_TEST_SEAMS
 
+/// @brief 计划落定回调；无参数无返回，只用于在窗内制造外部改动。
 using PlanSettledHook = std::function<void()>;
 
+/// @brief 安装钩子；传空 function 即摘除。非线程安全，只在测试单线程装卸。
 void set_plan_settled_hook(PlanSettledHook hook);
 
+/// @brief 触发钩子（未安装时为空操作）。
 void invoke_plan_settled_hook();
 
 /// @brief RAII 装卸；析构必摘，避免钩子泄漏到别的用例。
@@ -46,6 +49,6 @@ public:
 
 inline void invoke_plan_settled_hook() {}
 
-#endif
+#endif  // XT_BT_TEST_SEAMS
 
-}
+}  // namespace xt_bt_shard_detail

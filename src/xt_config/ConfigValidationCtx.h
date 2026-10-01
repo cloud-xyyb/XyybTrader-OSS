@@ -25,6 +25,8 @@ public:
         if (bad) add(msg);
     }
 
+    // read_* helper 共享 optional-field 语义：缺失/null 返回 false 且不报错，
+    // 类型或取值不合法返回 false 并追加中文错误。
     bool read_double(const YAML::Node& n, const std::string& path, double& out) {
         if (!n || n.IsNull()) return false;
         try {

@@ -11,6 +11,7 @@
 
 #include <thread>
 
+// realistic 模式依赖
 #include "XtLiveOrderGateway.h"
 #include "api/ITradeGateway.h"
 #include "api/IMdGateway.h"
@@ -53,6 +54,10 @@ public:
     void on_fill(const XtFillEvent&) override {}
     void on_account(const XtAccountUpdate&) override {}
 };
+
+// ---------------------------------------------------------------------------
+// 通用工具
+// ---------------------------------------------------------------------------
 
 uint64_t now_ns() {
     return static_cast<uint64_t>(
@@ -119,6 +124,10 @@ BenchStats summarize(const std::vector<uint64_t>& samples) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// 策略 (两种模式共享)
+// ---------------------------------------------------------------------------
+
 class InnerBenchStrategy final : public XtStrategyBase {
 public:
     explicit InnerBenchStrategy(std::string symbol, double qty)
@@ -153,6 +162,10 @@ void init_tick(XtRawTick& tick, const std::string& symbol, double mid_price) {
     tick.ask_qty[0] = 10.0;
 }
 
+// ---------------------------------------------------------------------------
+// Mock 模式 (--mock): 空壳 gateway，只做 id++
+// ---------------------------------------------------------------------------
+
 struct MockBenchState {
     uint64_t next_order_id = 1;
     uint64_t submit_ok = 0;
@@ -164,8 +177,8 @@ public:
     explicit BenchExecutionGateway(MockBenchState* st) : st_(st) {}
 
     SubmitResult submit(const char*, bool, int64_t, int64_t, XtTimeInForce,
-                        std::string_view, XtOffset, ExecFlags  ,
-                        std::string_view  ) override {
+                        std::string_view, XtOffset, ExecFlags /*exec_flags*/,
+                        std::string_view /*strategy_id*/) override {
         SubmitResult result;
         if (!st_) return result;
         result.order_id = st_->next_order_id++;
@@ -194,6 +207,10 @@ public:
     xt_runtime::XtAccountSnapshotFp account_snapshot_fp() const override { return {}; }
 };
 
+// ---------------------------------------------------------------------------
+// Realistic 模式 (默认): 走完整生产路径
+// ---------------------------------------------------------------------------
+
 class BenchTradeGateway final : public ITradeGateway {
 public:
     bool init(const Config&) override { return true; }
@@ -202,7 +219,7 @@ public:
 
     uint64_t submit_order(const char*, bool, int64_t, int64_t,
                           XtTimeInForce, const char*, XtOffset,
-                          ExecFlags  ) override {
+                          ExecFlags /*exec_flags*/) override {
         return ++next_id_;
     }
     bool cancel_order(uint64_t) override { return true; }
@@ -210,7 +227,7 @@ public:
     void set_recovery_enabled(bool) {}
     bool is_recovering() const override { return false; }
     Capabilities capabilities() const override {
-        return {true, false, true};
+        return {true, false, true};  // close_today, l2, ioc_fok
     }
     QueryControlStats query_control_stats() const override { return QueryControlStats{}; }
     void bind_callbacks(Callbacks) override {}
@@ -236,14 +253,20 @@ public:
     }
 };
 
-struct BenchComponents {
+// ---------------------------------------------------------------------------
+// BenchComponents — 替代 XtLiveRuntimeState 的直注组件容器
+// ---------------------------------------------------------------------------
 
+struct BenchComponents {
+    // catalog 必须先于 account_store 声明：store 经 acfg.catalog 持 &catalog（vol_scale 源），
+    // 析构反序保证 account_store 先析构、catalog 后析构。
     XtCommodityCatalog                                    catalog;
     std::unique_ptr<xt_account::AccountStateStore>        account_store;
     std::unique_ptr<xt_account::AccountStoreView>          account_view;
-
+    // 风控快照由 xt_account::AccountStateStore hazard snapshot 发布；
+    // 通过 live account_store + AccountStoreView 激活。
     xt_runtime::order::XtOrderRuntimeBook      order_book;
-    XtLiveOrderGateway*                        gateway = nullptr;
+    XtLiveOrderGateway*                        gateway = nullptr;  ///< 终态协议钩子目标（realistic 模式 wire）
 
     void init(double initial_cash, bool futures_mode, double margin_rate,
               const std::string& symbol, double vol_scale) {
@@ -261,7 +284,7 @@ struct BenchComponents {
     }
 
     void pre_warm(const std::string& sym) {
-
+        // cache 由 xt_account::AccountStateStore 内部 own，通过统一接口预注册。
         order_book.pre_warm_instrument(sym.c_str());
         order_book.track_code(sym.c_str());
     }
@@ -271,7 +294,9 @@ struct BenchComponents {
         const int64_t eff_fp    = order_lifecycle::effective_remaining_fp(upd);
         account_store->apply(account_event_build::order_event(upd));
         order_book.on_order_update(upd, final_status, eff_fp);
-
+        // 生产终态协议（镜像 XtHftEngine::finish_terminal_order_update_ 三连调）：
+        // STP 释放边界贡献 + 终态统计 + attribution sidecar 标记。缺此三连 = STP active
+        // set 只进不出（submit 侧 on_order_submitted 持续 stamp），单轮可堆 ~52 万 stale entry。
         if (final_status && gateway) {
             gateway->notify_order_terminal(upd.id);
             gateway->record_order_terminal(upd.status);
@@ -283,10 +308,17 @@ struct BenchComponents {
         for (size_t i = 0; i < count; ++i) on_order_update(updates[i]);
     }
 
+    /// @brief attribution sidecar 终态回收（镜像生产 HftRunnerControl 周期 prune 的稳态效果）。
+    /// @note erase_order_tracking 只 mark 不删（grace window 语义）；不 prune 则 sidecar map
+    ///       随样本数线性膨胀，rehash 成本污染计时。每 drain 批调一次，摊销后可忽略。
     void prune_terminal_sidecar() {
         if (gateway) gateway->prune_terminal_strategy_ids(std::numeric_limits<int64_t>::max());
     }
 };
+
+// ---------------------------------------------------------------------------
+// 循环函数
+// ---------------------------------------------------------------------------
 
 void run_ticks_totalN(XtStrategyContext& ctx, XtRawTick& tick, uint64_t loops) {
     for (uint64_t i = 0; i < loops; ++i) {
@@ -298,13 +330,14 @@ void run_ticks_totalN(XtStrategyContext& ctx, XtRawTick& tick, uint64_t loops) {
     }
 }
 
+// realistic 模式循环: 每 drain_interval 次发送 AllFilled 清空 order book
 void run_ticks_totalN_drain(XtStrategyContext& ctx, XtRawTick& tick,
                             uint64_t loops, BenchComponents& comps,
                             uint64_t& next_drain_id,
                             uint64_t drain_interval,
                             bool batch_drain = false) {
     uint64_t pending_count = 0;
-
+    // 批量 drain 缓冲区（栈分配，避免循环内堆分配）
     std::vector<XtOrderExecUpdate> drain_buf;
     if (batch_drain) drain_buf.reserve(drain_interval);
 
@@ -318,7 +351,7 @@ void run_ticks_totalN_drain(XtStrategyContext& ctx, XtRawTick& tick,
 
         if (pending_count >= drain_interval) {
             if (batch_drain) {
-
+                // 批量 drain：同一 worker 批次内处理全部 fill
                 drain_buf.clear();
                 for (uint64_t d = 0; d < pending_count; ++d) {
                     XtOrderExecUpdate fill{};
@@ -352,6 +385,10 @@ void run_ticks_totalN_drain(XtStrategyContext& ctx, XtRawTick& tick,
     }
 }
 
+// ---------------------------------------------------------------------------
+// 输出
+// ---------------------------------------------------------------------------
+
 void print_results(const char* mode, const std::string& symbol,
                    uint64_t samples, uint64_t warmup,
                    uint64_t submit_ok, uint64_t submit_fail,
@@ -380,12 +417,19 @@ void print_results(const char* mode, const std::string& symbol,
     std::printf("========================================\n");
 }
 
+// ---------------------------------------------------------------------------
+// queue-hop 模式入口（tick 队列一跳实测锚）
+// ---------------------------------------------------------------------------
+
 /// 与 XtHftEventLoop::TickEvent 同 layout 的等价 POD（TickEvent 为私有嵌套类型）。
 struct BenchTickEvent {
     XtTick core_tick{};
     uint64_t enqueue_ts_ns = 0;
 };
 
+/// ping-pong 口径：队列恒空时 push 单事件、consumer busy-spin pop_bulk（复刻
+/// pure_spin 生产形态），测纯 enqueue→dequeue 唤醒延迟——不含 backlog 排队时间。
+/// 服务「直调 vs 队列一跳」类决策的实测数据锚。
 void run_queue_hop_bench(uint64_t samples, uint64_t warmup) {
     XtLockFreeQueue<BenchTickEvent> q(QueueMode::SPSC, 65536);
     std::atomic<uint64_t> consumed{0};
@@ -397,7 +441,7 @@ void run_queue_hop_bench(uint64_t samples, uint64_t warmup) {
         BenchTickEvent batch[256];
         while (!stop.load(std::memory_order_relaxed)) {
             const size_t n = q.pop_bulk(batch, 256);
-            if (n == 0) continue;
+            if (n == 0) continue;  // busy spin（pure_spin 形态）
             const uint64_t now = now_ns();
             for (size_t i = 0; i < n; ++i) {
                 if (consumed.load(std::memory_order_relaxed) >= warmup &&
@@ -414,11 +458,11 @@ void run_queue_hop_bench(uint64_t samples, uint64_t warmup) {
     for (uint64_t i = 0; i < total; ++i) {
         ev.enqueue_ts_ns = now_ns();
         while (!q.push(ev)) {}
-
+        // 等 consumer 消费本事件再发下一个：保证队列恒空（ping-pong）。
         while (consumed.load(std::memory_order_acquire) <= i) {}
     }
     stop.store(true, std::memory_order_relaxed);
-    consumer.join();
+    consumer.join();  // join 之后读 hop_ns（happens-before）
 
     const BenchStats s = summarize(hop_ns);
     std::printf("mode=queue_hop event_bytes=%zu samples=%zu warmup=%llu\n",
@@ -433,12 +477,17 @@ void run_queue_hop_bench(uint64_t samples, uint64_t warmup) {
                 static_cast<unsigned long long>(s.max_ns), s.avg_ns);
 }
 
+// ---------------------------------------------------------------------------
+// mock 模式入口
+// ---------------------------------------------------------------------------
+
 void run_mock_bench(uint64_t samples, uint64_t warmup, double mid_price,
                     double qty, const std::string& symbol) {
     MockBenchState st;
     auto strategy = std::make_unique<InnerBenchStrategy>(symbol, qty);
     BenchExecutionGateway exec_gateway(&st);
 
+    // 构建空壳 XtRuntimeView（mock 模式无真实数据组件）
     XtRuntimeMarketCache market_cache;
     NullAccountView null_account;
     xt_strategy_engine::XtRuntimeView::Components comp;
@@ -469,23 +518,29 @@ void run_mock_bench(uint64_t samples, uint64_t warmup, double mid_price,
                   st.submit_ok, st.submit_fail, t1 - t0);
 }
 
+// ---------------------------------------------------------------------------
+// realistic 模式入口
+// ---------------------------------------------------------------------------
+
 void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
                          double qty, const std::string& symbol,
                          bool bypass_risk = false,
                          bool hft_mode = false) {
-
+    // 在途订单 backlog 大小（drain 间隔）：决定每单 publish_snapshot_ 重建的在途订单数。
+    // 生产 live 在途通常几~几十单；env 可调以贴近真实部署，默认 1000 作为固定压力基准。
     const uint64_t drain_iv = []{ const char* e = std::getenv("XT_BENCH_DRAIN"); return e ? static_cast<uint64_t>(std::strtoull(e, nullptr, 10)) : 1000ull; }();
-
+    // 1. 直注组件容器
     BenchComponents comps;
-    comps.init(1'000'000'000'000.0,  true,  0.10,
-               symbol,  1.0);
+    comps.init(1'000'000'000'000.0, /*futures_mode=*/true, /*margin_rate=*/0.10,
+               symbol, /*vol_scale=*/1.0);
 
+    // 2. OrderGateway
     XtLiveOrderGateway::Config gw_cfg;
-    gw_cfg.risk.max_order_qty = 0.0;
+    gw_cfg.risk.max_order_qty = 0.0;       // 0 = unlimited
     gw_cfg.risk.max_order_notional = 0.0;
     gw_cfg.risk.max_pos_qty = 0.0;
     gw_cfg.risk.allow_short = true;
-    gw_cfg.max_orders_per_sec = 0;
+    gw_cfg.max_orders_per_sec = 0;     // 0 = disabled
     gw_cfg.max_cancels_per_sec = 0;
     gw_cfg.max_rejects_per_min = 0;
     gw_cfg.cooldown_ms = 0;
@@ -493,37 +548,42 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     gw_cfg.closeout_enabled = false;
     gw_cfg.session_gate_enabled = false;
     gw_cfg.bypass_risk_for_bench = bypass_risk;
-
+    // L2 (--no-risk) 口径钉死：真·no-risk 固定成本 → STP 显式关（否则 bypass 只跳 risk
+    // evaluate，submit 侧仍 STP stamp = 「跳过检查、继续写入」半开态）。L3 保持 STP 开，
+    // 终态清理由 BenchComponents 生产三连调闭合。
     if (bypass_risk) {
         gw_cfg.stp_enabled = false;
         gw_cfg.stp_disabled_reason = "bench L2 no-risk baseline: 纯管线口径,显式关 STP";
     }
-    gw_cfg.venue_kind = xt_core::XtVenueKind::FuturesCN;
+    gw_cfg.venue_kind = xt_core::XtVenueKind::FuturesCN;  // venue 非 Unknown：否则 build_submit_slices 入口 InputGuard 直接拒 (TradingNotReady)
     gw_cfg.single_threaded_submit = hft_mode;
 
     std::atomic<bool> trading_ready{true};
     std::atomic<uint32_t> last_tick_action_time{93000000u};
     std::atomic<bool> td_position_ready{true};
-    NoopExecSink exec_sink;
+    NoopExecSink exec_sink;  // reject 回调走空路径
 
     XtLiveOrderGateway order_gw(gw_cfg, &exec_sink,
                                 &trading_ready, &last_tick_action_time,
                                 &td_position_ready,
-                                nullptr,
-                                nullptr);
+                                nullptr,   // param_domain
+                                nullptr);  // latency_tracker
 
+    // 3. 注入组件 + 反向 wire（synthetic fill 终态协议需要打回 gateway 三连调）
     order_gw.inject_components(
         &comps.order_book,
         comps.account_store.get(),
         nullptr, &comps.catalog,
-        nullptr,  false);
+        nullptr, /*stale_guard_enabled=*/false);
     comps.gateway = &order_gw;
 
+    // 4. Bind mock TD/MD
     BenchTradeGateway mock_td;
     BenchMdGateway mock_md;
     order_gw.bind_td(&mock_td);
     order_gw.bind_md(&mock_md);
 
+    // 5. 预热 + 种子 tick
     comps.pre_warm(symbol);
     XtRuntimeMarketCache market_cache;
     market_cache.pre_warm({symbol});
@@ -531,6 +591,7 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     init_tick(seed_raw, symbol, mid_price);
     market_cache.on_tick(xt_tick_convert::to_core(seed_raw));
 
+    // 6. 策略 + Context（构建 XtRuntimeView 从直注组件）
     xt_strategy_engine::XtRuntimeView::Components comp;
     comp.market      = &market_cache;
     comp.account     = comps.account_view.get();
@@ -541,10 +602,12 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     auto strategy = std::make_unique<InnerBenchStrategy>(symbol, qty);
     XtStrategyContext::Config ctx_cfg;
     ctx_cfg.strategy = strategy.get();
-    ctx_cfg.strategy_id = "bench";
-
-    ctx_cfg.exec_gateway = &order_gw;
-    ctx_cfg.runtime_view = &runtime_view;
+    ctx_cfg.strategy_id = "bench";          // 非空 sid：gateway attribution sidecar 只在非空
+                                            // strategy id 时 insert（:1541）——不设则 sidecar
+                                            // 主路径（insert/mark/prune）整条不走，diag
+                                            // sidecar_after=0 是空洞通过（codex R2 P1）
+    ctx_cfg.exec_gateway = &order_gw;       // 真实 gateway
+    ctx_cfg.runtime_view = &runtime_view;   // 真实 runtime view
     XtStrategyContext ctx(ctx_cfg);
     ctx.enable_concurrent_metrics();
     ctx.on_init();
@@ -552,12 +615,14 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     XtRawTick tick;
     init_tick(tick, symbol, mid_price);
 
-    uint64_t drain_id = 1;
+    uint64_t drain_id = 1;  // 跨 warmup+main 持续，与 mock_td phys_id 序列对齐（否则 fill 失配、order book 堆满 512）
 
+    // warmup
     if (warmup > 0) {
         run_ticks_totalN_drain(ctx, tick, warmup, comps, drain_id, drain_iv, hft_mode);
     }
 
+    // 主测量
     const auto stats_before = order_gw.risk_stats_snapshot();
     const uint64_t t0 = now_ns();
     run_ticks_totalN_drain(ctx, tick, samples, comps, drain_id, drain_iv, hft_mode);
@@ -571,7 +636,8 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
         : (hft_mode ? "L3_hft" : "L3_realistic");
     print_results(mode_label,
                   symbol, samples, warmup, submit_ok, submit_fail, t1 - t0);
-
+    // 三个都应为 0：order book 清空 + STP active set 清空 + attribution sidecar 已 prune
+    //（§8.5 验收锚——旧实现 open_orders_after=0 只证 book，证不了 STP/sidecar）。
     std::fprintf(stderr, "[diag] open_orders_after=%zu stp_active_after=%zu sidecar_after=%zu\n",
                  comps.order_book.open_order_count(),
                  order_gw.stp_active_order_count(),
@@ -587,7 +653,7 @@ void run_realistic_bench(uint64_t samples, uint64_t warmup, double mid_price,
     }
 }
 
-}
+} // namespace
 
 int main(int argc, char** argv) {
     const uint64_t samples = parse_u64(argc, argv, 1, 500000);

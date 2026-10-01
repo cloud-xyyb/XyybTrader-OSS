@@ -14,15 +14,20 @@
  */
 class IMarketDataReader {
 public:
-
+    // ── 生命周期 ──────────────────────────────────────────────
     virtual ~IMarketDataReader() = default;
 
+    // ── 读取接口 ──────────────────────────────────────────────
     [[nodiscard]] virtual bool init() = 0;
     virtual void reset() = 0;
     [[nodiscard]] virtual bool next_tick(XtRawTick& out) = 0;
 
+    // ── 状态查询 ──────────────────────────────────────────────
+    /// @brief 判断 `next_tick()` 返回 false 是否由 I/O 错误导致。
+    /// @return true = 文件打开失败、读取中断等 I/O 错误；false = 正常 EOF。
+    /// @note 默认读取基类 sticky `io_error_`；子类在打开/读取/schema 失败时置位，reset() 清空。
     [[nodiscard]] virtual bool has_io_error() const { return io_error_; }
 
 protected:
-    bool io_error_ = false;
+    bool io_error_ = false; ///< sticky I/O 错误标记；子类置位/清空，has_io_error() 默认读取。
 };

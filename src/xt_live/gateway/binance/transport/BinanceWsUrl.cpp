@@ -5,7 +5,7 @@ namespace binance_u {
 BinanceWsUrl parse_binance_ws_url(std::string_view url, std::string_view default_port) {
     BinanceWsUrl out;
     std::string_view rest = url;
-
+    // MD/TD 同一个轻量 parser 复用在 ws 与 rest base URL；scheme 只用于定位 host 起点。
     if (auto p = rest.find("://"); p != std::string_view::npos) rest = rest.substr(p + 3);
 
     const auto slash = rest.find('/');
@@ -24,4 +24,4 @@ BinanceWsUrl parse_binance_ws_url(std::string_view url, std::string_view default
     return out;
 }
 
-}
+}  // namespace binance_u

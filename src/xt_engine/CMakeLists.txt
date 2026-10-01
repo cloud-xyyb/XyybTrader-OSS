@@ -36,3 +36,4 @@ target_link_libraries(xt_engine INTERFACE
 )
 
 add_subdirectory(hft)
+add_subdirectory(sel)  # SEL Selector Engine 与 cta/hft 平行

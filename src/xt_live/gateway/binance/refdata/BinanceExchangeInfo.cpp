@@ -9,13 +9,13 @@
 namespace binance_u {
 
 namespace {
-constexpr double kFpScale = 1.0e6;
-}
+constexpr double kFpScale = 1.0e6;  ///< 价/量 fp 标度，与 snap_price_fp / snap_qty_fp 一致。
+}  // namespace
 
 bool parse_exchange_info(const std::string& body,
                          std::unordered_map<std::string, SymbolFilter>& out,
                          std::string* err) {
-    auto j = nlohmann::json::parse(body, nullptr,  false);
+    auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded()) {
         if (err) *err = "exchangeInfo: invalid json";
         return false;
@@ -42,10 +42,11 @@ bool parse_exchange_info(const std::string& body,
                     f.step = std::stod(flt["stepSize"].get<std::string>());
                 }
             } catch (const std::exception&) {
-
+                // 单个 filter 字段格式异常 → 跳过该字段，不影响其它 symbol。
             }
         }
-
+        // 无 PRICE_FILTER（拿不到 tickSize）→ 无法 snap 价格 → 跳过该 symbol；
+        // 下单路径靠 BinanceSymbolFilters::has() gate fail-closed，绝不发 off-tick。
         if (f.tick <= 0.0) continue;
         f.tick_fp = static_cast<int64_t>(std::llround(f.tick * kFpScale));
         f.step_fp = static_cast<int64_t>(std::llround(f.step * kFpScale));
@@ -54,4 +55,4 @@ bool parse_exchange_info(const std::string& body,
     return true;
 }
 
-}
+}  // namespace binance_u

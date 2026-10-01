@@ -8,6 +8,7 @@ add_library(xt_account
     state/AccountStateStore.cpp
     state/MarkPriceTable.cpp
     state/AccountReducer.cpp
+    state/detail/AccountSymbolTable.cpp
     venue/AccountTruthStoreProvider.cpp
     venue/binance/BinanceAccountTruthSource.cpp
     venue/ctp/CtpAccountTruthSource.cpp

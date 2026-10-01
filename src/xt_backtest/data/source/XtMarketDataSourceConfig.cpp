@@ -14,6 +14,7 @@ bool str_in(const std::string& v, std::initializer_list<const char*> candidates)
     return false;
 }
 
+// 兼容旧配置的 scalar 写法与新配置的 sequence 写法；非 scalar 元素按缺失处理。
 std::vector<std::string> parse_string_list(const YAML::Node& parent, const char* key) {
     std::vector<std::string> out;
     if (!parent || !parent[key]) return out;
@@ -52,7 +53,7 @@ void dedupe_keep_order(std::vector<std::string>& items) {
     items.swap(deduped);
 }
 
-}
+} // namespace
 
 void XtMarketDataSourceConfig::validate(std::vector<std::string>& errors) const {
     if (!str_in(mode, {"tick", "bar"})) {
@@ -114,7 +115,10 @@ void XtMarketDataSourceConfig::validate(std::vector<std::string>& errors) const 
         if (replay_mode == "event_stream" && !has_orderflow_input) {
             errors.push_back("backtest.datasource.replay_mode=event_stream 要求配置 orderflow 文件");
         }
-
+        // event_stream 读端只消费 memory 物化的 tick 缓存，而 fbs / events-parquet
+        // 只支持流式读取 → 该组合到不了 load_memory_source 的任何物化分支，只会撞进
+        // 防御性兜底并以「no data source configured for memory load」收场。在配置层
+        // 直接拒绝，替代那条指向不明的运行期报错。
         if (replay_mode == "event_stream" && (has_fbs_input || has_events_parquet_input)) {
             errors.push_back("backtest.datasource.replay_mode=event_stream 不支持 "
                              "tick.fbs_root / tick.events_parquet_root（这两个源仅支持 stream，"
@@ -146,7 +150,7 @@ XtMarketDataSourceConfig parse_market_data_source_config(
     c.mode = XtConfigYamlUtil::as_or<std::string>(cfg, "mode", defaults.mode);
     c.data_mode = XtConfigYamlUtil::as_or<std::string>(cfg, "data_mode", defaults.data_mode);
     {
-
+        // legacy `stream` 同时需要值与“是否显式出现”两个状态；as_or 只能返回值。
         c.stream_override = false;
         c.stream_override_set = false;
         const YAML::Node sn = (cfg && !cfg.IsNull()) ? cfg["stream"] : YAML::Node();
@@ -173,7 +177,9 @@ XtMarketDataSourceConfig parse_market_data_source_config(
     c.tick_events_parquet_root = XtConfigYamlUtil::as_or<std::string>(tick, "events_parquet_root", defaults.tick_events_parquet_root);
     c.tick_cache_dir = XtConfigYamlUtil::as_or<std::string>(tick, "cache_dir", defaults.tick_cache_dir);
     c.tick_use_bin_cache = XtConfigYamlUtil::as_or<bool>(tick, "use_bin_cache", defaults.tick_use_bin_cache);
-
+    // cache 格式挂在 backtest 根下（backtest.tick_cache.format），不在 datasource 节内：
+    // 它选的是 cache 的落盘布局，与「数据从哪来」正交。传入 datasource 子节点时读不到
+    // 该键，沿用 defaults（v2）——与不写该键同义。
     c.tick_cache_format =
         XtConfigYamlUtil::as_or<std::string>(node["tick_cache"], "format", defaults.tick_cache_format);
     c.tick_volume_mode = XtConfigYamlUtil::as_or<std::string>(tick, "volume_mode", defaults.tick_volume_mode);
@@ -186,7 +192,7 @@ XtMarketDataSourceConfig parse_market_data_source_config(
 
     c.tick_files = parse_string_list(tick, "files");
     c.tick_symbols = parse_string_list(tick, "symbols");
-
+    // orderflow 文件支持嵌套与平铺两套 YAML 形态；去重时保留首个出现顺序。
     YAML::Node orderflow = cfg["orderflow"];
     append_string_list(c.order_queue_files, parse_string_list(orderflow, "order_queue_files"));
     append_string_list(c.order_detail_files, parse_string_list(orderflow, "order_detail_files"));

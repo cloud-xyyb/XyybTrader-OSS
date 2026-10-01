@@ -10,10 +10,17 @@
 
 namespace XtCStringUtil {
 
+/// @brief 判断 C-string 是否为 null 或空串。
+///
+/// 只检查首字节，不扫描完整字符串；适合热路径入参 guard。
 inline bool is_empty(const char* s) noexcept {
     return s == nullptr || s[0] == '\0';
 }
 
+/// @brief 安全拷贝到固定 char buffer（bounded C-string copy）。
+///
+/// 保证目标缓冲区以 '\0' 结尾；src 为 null 时写入空串。输入过长时静默截断到
+/// `cap - 1` 字节，不返回截断状态。
 inline void copy(char* dst, std::size_t cap, const char* src) noexcept {
     if (!dst || cap == 0) return;
     if (!src) {
@@ -33,4 +40,4 @@ inline void copy(char (&dst)[N], const char* src) noexcept {
     copy(dst, N, src);
 }
 
-}
+}  // namespace XtCStringUtil

@@ -17,6 +17,11 @@
 
 namespace ctp_util {
 
+/// @brief CTP OrderRef 字符串解析为 uint64_t local_id。
+///
+/// 手动解析避免 strtoul 的 locale 开销；非法输入返回 0（哨兵值，不会
+/// 与有效 local_id 冲突）。空白容忍前后；中间空白返回 0。
+/// @return 解析后的 local_id；失败返回 0
 inline uint64_t parse_local_id(const char* order_ref) {
     if (!order_ref || order_ref[0] == '\0') return 0;
     auto is_space = [](char c) {
@@ -50,6 +55,7 @@ inline uint64_t parse_local_id(const char* order_ref) {
     return has_digit ? value : 0;
 }
 
+/// @brief 清洗 CTP DBL_MAX 级无效价格哨兵，返回可进入 XtRawTick 的非负价格。
 inline double normalize_price(double v) noexcept {
     if (!std::isfinite(v)) return 0.0;
     if (v <= 0.0) return 0.0;
@@ -57,6 +63,10 @@ inline double normalize_price(double v) noexcept {
     return v;
 }
 
+/// @brief XtOffset 映射为 CTP OffsetFlag。
+///
+/// CloseToday / CloseYesterday 直传；通用 Close 在 SHFE/INE 品种上保守映射为
+/// CloseYesterday，今仓必须由上层 build_close_slices 拆成 CloseToday 切片。
 inline TThostFtdcOffsetFlagType to_ctp_offset_flag(XtOffset offset, const char* code) {
     switch (offset) {
     case XtOffset::Open:
@@ -73,12 +83,16 @@ inline TThostFtdcOffsetFlagType to_ctp_offset_flag(XtOffset offset, const char* 
     }
 }
 
+/// @brief CTP OffsetFlag 映射为平仓侧 XtOffset。
+/// @note Open 由调用方按 CTP 原始 flag 单独判定；此 helper 只保留 CloseToday/CloseYesterday
+///       细分，其他值按通用 Close 处理。
 inline XtOffset to_xt_close_offset(TThostFtdcOffsetFlagType offset_flag) {
     if (offset_flag == THOST_FTDC_OF_CloseToday) return XtOffset::CloseToday;
     if (offset_flag == THOST_FTDC_OF_CloseYesterday) return XtOffset::CloseYesterday;
     return XtOffset::Close;
 }
 
+/// @brief CTP OffsetFlag 可读化标签，用于拒单、诊断和低频日志。
 inline const char* offset_flag_label(TThostFtdcOffsetFlagType offset_flag) noexcept {
     switch (offset_flag) {
     case THOST_FTDC_OF_Open:
@@ -94,6 +108,7 @@ inline const char* offset_flag_label(TThostFtdcOffsetFlagType offset_flag) noexc
     }
 }
 
+/// @brief CTP 委托状态映射为统一订单状态。
 inline XtOrderStatus map_order_status(char status) {
     switch (status) {
     case THOST_FTDC_OST_AllTraded:
@@ -102,7 +117,7 @@ inline XtOrderStatus map_order_status(char status) {
         return XtOrderStatus::PartiallyFilled;
     case THOST_FTDC_OST_PartTradedNotQueueing:
     case THOST_FTDC_OST_NoTradeNotQueueing:
-
+        // NotQueueing 表示委托已不在撮合队列，应作为终态处理。
         return XtOrderStatus::Canceled;
     case THOST_FTDC_OST_NoTradeQueueing:
         return XtOrderStatus::Accepted;
@@ -113,6 +128,7 @@ inline XtOrderStatus map_order_status(char status) {
     }
 }
 
+/// @brief 订单状态排序权重（用于去重过滤）。
 inline int status_rank(XtOrderStatus s) {
     switch (s) {
     case XtOrderStatus::Submitted: return 0;
@@ -125,4 +141,4 @@ inline int status_rank(XtOrderStatus s) {
     }
 }
 
-}
+} // namespace ctp_util

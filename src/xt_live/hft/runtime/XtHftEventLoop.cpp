@@ -26,11 +26,14 @@
 #include "xt_util/time/XtTime.h"
 
 #if defined(__x86_64__)
-#include <immintrin.h>
+#include <immintrin.h>  // _mm_pause for x86 spin-wait backoff.
 #endif
 
 namespace {
 
+// Worker 空转 backoff helper。
+// x86 用 PAUSE 指令提示 CPU 当前是 spin-wait，降低功耗并减少 SMT sibling 干扰；
+// 非 x86 没有统一 pause intrinsic，退化为 yield，让共享核心上的其他线程先运行。
 void backoff_pause(int spins) {
 #if defined(__x86_64__)
     for (int i = 0; i < spins; ++i) {
@@ -43,6 +46,8 @@ void backoff_pause(int spins) {
 #endif
 }
 
+// 原子更新观测峰值：peak_atomic = max(peak_atomic, value)。
+// 仅用于 telemetry 计数；不建立跨线程同步关系。
 void update_atomic_peak(std::atomic<uint64_t>& peak_atomic, uint64_t value) {
     uint64_t peak = peak_atomic.load(std::memory_order_relaxed);
     while (value > peak &&
@@ -50,6 +55,7 @@ void update_atomic_peak(std::atomic<uint64_t>& peak_atomic, uint64_t value) {
                peak, value, std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
 
+// EventLoop 内部 warning 节流窗口；避免持续 backlog/starvation 时刷日志。
 constexpr uint64_t kWarnThrottleIntervalUs = 1000000;
 
 enum class StrategyGuardStage : uint8_t {
@@ -92,7 +98,7 @@ bool run_strategy_guard(StrategyGuardStage stage,
     if (xt_log::run_guarded("RT", stage_name ? stage_name : "", std::forward<Fn>(fn))) {
         return true;
     }
-
+    // 失败策略 (显式): 策略/引擎异常不能跨 worker 线程边界，升级为停机请求。
     if (stop_requested) stop_requested->store(true, std::memory_order_release);
     if (shutdown_flag) shutdown_flag->store(true, std::memory_order_release);
     return false;
@@ -106,7 +112,7 @@ bool run_strategy_guard(StrategyGuardStage stage,
     return QueueMode::MPSC;
 }
 
-}
+} // namespace
 
 XtHftEngine& XtHftEventLoop::require_engine_(XtHftEngine* engine) {
     if (!engine) {
@@ -165,8 +171,8 @@ void XtHftEventLoop::stop() {
 }
 
 bool XtHftEventLoop::try_push_tick(const XtRawTick& tick) {
-
-    return try_push_tick(tick,  0);
+    // capture_ns 未知（直连 venue / 测试路径）→ 传 0，dispatch 起点 fallback enqueue。
+    return try_push_tick(tick, /*capture_ns=*/0);
 }
 
 bool XtHftEventLoop::try_push_tick(const XtRawTick& tick, uint64_t capture_ns) {
@@ -175,14 +181,17 @@ bool XtHftEventLoop::try_push_tick(const XtRawTick& tick, uint64_t capture_ns) {
     }
     TickEvent ev;
     ev.core_tick = xt_tick_convert::to_core(tick);
-
+    // trigger 精确化（µs 内精确，非 1ms cache）：每 tick 直读 steady clock，
+    // 让 strategy_us / event_to_* 数值变准（trigger tap 关联的时间基准）。
     ev.enqueue_ts_us = XtSteadyClock::steady_now_us();
-
+    // SHM connector capture（跨进程 steady ns）截断为 µs；0=未 stamp。dispatch 时经
+    // xt_live::select_trigger_anchor_us 决定 trigger 起点（capture 有效且不晚于 enqueue 则用 capture）。
     ev.capture_ts_us = capture_ns / 1000ULL;
-
+    // reserve-before-publish：backlog 先占位再发布，push 失败回滚；
+    // 与 safe_decrement_backlog() 配对，避免 consumer 先递减导致 underflow。
     tick_backlog_.fetch_add(1, std::memory_order_relaxed);
     if (!tick_q_.push(ev)) {
-        tick_backlog_.fetch_sub(1, std::memory_order_relaxed);
+        tick_backlog_.fetch_sub(1, std::memory_order_relaxed);  // rollback
         return false;
     }
     return true;
@@ -197,7 +206,7 @@ bool XtHftEventLoop::push_td_event(XtHftRunnerEvent ev) {
 }
 
 bool XtHftEventLoop::push_flow_event(XtHftRunnerEvent ev) {
-
+    // Prom/CSV 兼容：flow 峰值仍合并到 td_event_peak_backlog_，不新增字段。
     return enqueue_runner_event(std::move(ev),
                                 flow_event_q_,
                                 cfg_.flow_event_high_watermark,
@@ -237,11 +246,12 @@ std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>>
 XtHftEventLoop::drain_all_strategy_metrics() {
     std::vector<std::pair<std::string, ct::metrics::XtStrategyMetricsSnapshot>> out;
     out.reserve(engine_.context_count());
-
+    // context 遍历归 engine（它是 slots_ 唯一 owner）；EventLoop 只负责容器与转发。
     engine_.drain_all_strategy_metrics(out);
     return out;
 }
 
+// HftRunnerControl 1Hz frame loop 读取后写入 signals，供 panel / Prometheus 观测。
 uint64_t XtHftEventLoop::engine_dropped_fill_count() const noexcept {
     return engine_.dropped_fill_count();
 }
@@ -279,7 +289,7 @@ bool XtHftEventLoop::reject_enqueue_guard(uint64_t high_watermark,
     if (!running_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire)) {
         return true;
     }
-
+    // 成交/终态/断连等保护事件绕过软高水位；仍受物理队列容量约束。
     if (!bypass_watermark && high_watermark > 0 &&
         backlog.load(std::memory_order_relaxed) >= high_watermark) {
         return true;
@@ -293,7 +303,8 @@ bool XtHftEventLoop::enqueue_runner_event(XtHftRunnerEvent ev,
                                                std::atomic<uint64_t>& backlog_counter,
                                                std::atomic<uint64_t>& peak_backlog_counter) {
     const bool no_drop = ev.must_not_drop();
-
+    // WorkerTask 物理满非终局（post_to_worker 溢出侧道接手），告警文案与真丢失区分；
+    // push 可能 move-from ev，先取类型。
     const auto* pre_ctrl = ev.get_if<XtRunnerControlEvent>();
     const bool is_worker_task =
         pre_ctrl && pre_ctrl->type == XtRunnerControlEventType::WorkerTask;
@@ -303,11 +314,11 @@ bool XtHftEventLoop::enqueue_runner_event(XtHftRunnerEvent ev,
     if (ev.enqueue_ts_us == 0) {
         ev.enqueue_ts_us = XtSteadyClock::steady_now_us();
     }
-
+    // reserve-before-publish：先占位再 push；失败回滚，consumer 端按同一计数器递减。
     const uint64_t reserved = backlog_counter.fetch_add(1, std::memory_order_relaxed) + 1;
     update_atomic_peak(peak_backlog_counter, reserved);
     if (!queue.push(std::move(ev))) {
-        backlog_counter.fetch_sub(1, std::memory_order_relaxed);
+        backlog_counter.fetch_sub(1, std::memory_order_relaxed);  // rollback
         if (no_drop) {
             if (is_worker_task) {
                 XtLogger::error_m("RT",
@@ -315,7 +326,7 @@ bool XtHftEventLoop::enqueue_runner_event(XtHftRunnerEvent ev,
                     "— routed to marshal overflow side-channel",
                     backlog_counter.load(std::memory_order_relaxed), high_watermark);
             } else {
-
+                // 保护事件被物理队列拒绝时必须升级为关键告警，避免静默漏成交或连接状态误判。
                 XtLogger::error_m("RT",
                     "CRITICAL runner event DROPPED (physical queue full); backlog={} watermark={} "
                     "— phantom/missed-fill risk",
@@ -343,6 +354,7 @@ void XtHftEventLoop::request_worker_stop() noexcept {
     if (shutdown_flag_) shutdown_flag_->store(true, std::memory_order_release);
 }
 
+// ── Event dispatch ────────────────────────────────────────────────
 bool XtHftEventLoop::dispatch_strategy_event(XtHftRunnerEvent& ev) {
     if (const auto* exec    = ev.get_if<XtRunnerExecEvent>())    return dispatch_exec_event(*exec);
     if (const auto* account = ev.get_if<XtRunnerAccountEvent>()) return dispatch_account_event(*account);
@@ -437,25 +449,29 @@ bool XtHftEventLoop::dispatch_control_event(const XtRunnerControlEvent& control)
         }
         return true;
     case XtRunnerControlEventType::ReverseSyncBatch:
-
+        // venue gateway reverse-synced alive in-flight orders → 灌入 order book
+        // 直接调 engine handler；不走 strategy guard（无策略回调，纯 book 内部状态同步）
         if (const auto* p = control.get_if<ReverseSyncBatchEventPayload>()) {
             engine_.on_reverse_sync_batch(p->orders, p->is_cold_start);
         }
         return true;
     case XtRunnerControlEventType::ReapRecoveredOrphans:
-
+        // 孤儿回收 / lost-terminal 对账 sweep：worker 线程扫 book + gateway 撤单/合成终态；
+        // 无策略回调，不走 strategy guard。两能力各自 flag 门控（HFT-D6 解耦）：只开 reconcile
+        // 时不跑 orphan reap（reap_orphans=false），反之亦然。
         if (const auto* p = control.get_if<XtRunnerReapOrphansEvent>()) {
             if (p->reap_orphans) {
                 (void)engine_.reap_recovered_orphans(p->now_ms, p->grace_ms, p->max_cancels);
             }
-
+            // lost-terminal reconcile：venue-terminal 但 book-open 的 owned 单合成终态。
             if (p->reconcile_lost_terminals) {
                 (void)engine_.reconcile_lost_terminals(p->max_cancels);
             }
         }
         return true;
     case XtRunnerControlEventType::WorkerTask:
-
+        // off-worker submit 的注册闭包：与 td rtn 同队列 FIFO 保证注册先于
+        // 首条回报。纯 book/account 写，无策略回调，不走 strategy guard（同 ReverseSyncBatch）。
         if (const auto* p = control.get_if<XtRunnerWorkerTaskEvent>()) {
             if (p->fn) p->fn();
         }
@@ -464,11 +480,14 @@ bool XtHftEventLoop::dispatch_control_event(const XtRunnerControlEvent& control)
     return true;
 }
 
+// ── Exec event handling ───────────────────────────────────────────
 bool XtHftEventLoop::handle_exec_order_update_(const XtRunnerOrderUpdateEvent& evt) {
-
+    // recording 是 telemetry：异常 swallow + counter，不停机（JSONL/recorder 抖动不该杀交易 runner）。
     xt_log::run_guarded("RT", "live.record_order", record_fail_ct_,
                         [&]() { emit_order_update_record(evt); });
-
+    // engine_.on_order_update 抛异常由 run() worker-body backstop 接住升级停机；
+    // 此处只处理其 bool-return drop-signaling（现状语义不变）。
+    // latency_ineligible（gateway 边界盖章）→ elig，仅 gate observer latency feed。
     const XtLatencyEligibility elig = evt.latency_ineligible
         ? XtLatencyEligibility::kIneligible
         : XtLatencyEligibility::kEligible;
@@ -480,12 +499,15 @@ bool XtHftEventLoop::handle_exec_order_update_(const XtRunnerOrderUpdateEvent& e
 }
 
 bool XtHftEventLoop::handle_exec_trade_(const XtRunnerTradeEvent& evt) {
-
+    // normalize：抛异常时 passthrough 原始成交（fill 已发生，优先保 account ingest）+ counter + loud log；
+    // 该笔 fee/PnL 未成本归一化，下游/ops 勿当权威。default-construct + 失败重置保强异常安全（无半赋值）。
     XtTradeRecord normalized;
     if (!xt_log::run_guarded("RT", "live.normalize", normalize_fail_ct_,
                              [&]() { normalized = normalize_trade_event(evt); })) {
-        normalized = evt.value;
-
+        normalized = evt.value;   // passthrough raw：必须能走到下面 engine_.on_trade ingest
+        // 兜底日志 best-effort：XtLogger::error_m 非 noexcept（module 前缀 std::string 分配可抛）。
+        // 必须包 swallow guard，否则日志异常会逃到 worker-body backstop，
+        // 在 fill 落账前停机并击穿 "passthrough 保 account ingest" 的兜底语义。
         xt_log::run_guarded("RT", "live.normalize.log", [&]() {
             XtLogger::error_m("RT",
                 "normalize threw -> passthrough RAW fill (fee/PnL un-normalized) "
@@ -495,19 +517,26 @@ bool XtHftEventLoop::handle_exec_trade_(const XtRunnerTradeEvent& evt) {
     }
 
     int64_t realized_fp = 0;
-
+    // 初值取 gateway 边界 stamping（Recovering 早退时 engine 不写回）；
+    // engine 处理路径写回入口 sid 恢复后的归因终值。
     std::string effective_sid = normalized.strategy_id;
-
+    // engine_.on_trade 抛异常由 run() worker-body backstop 接住升级停机（有意不在此 inner guard，
+    // 避免与其 bool-return drop-signaling 语义纠缠）；此处只处理 bool-return。
+    // latency_ineligible（gateway 边界盖章）→ elig，仅 gate observer latency feed。
     const XtLatencyEligibility trade_elig = evt.latency_ineligible
         ? XtLatencyEligibility::kIneligible
         : XtLatencyEligibility::kEligible;
     const bool engine_ok =
         engine_.on_trade(normalized, evt.td_state, &realized_fp, &effective_sid, trade_elig);
 
+    // self-match 是 post-trade safety fallback：抛异常（detector emplace bad_alloc 或 blacklist_sink）
+    // → fail-stop（run_strategy_guard 升级 stop/shutdown，null-safe）。命中不算异常，照常 blacklist+log。
     const bool self_match_ok =
         run_strategy_guard(StrategyGuardStage::SelfMatch, &stop_requested_, shutdown_flag_,
                            [&]() { check_post_trade_self_match(evt.value); });
 
+    // record-then-stop：fill 已落账（on_trade 之上），无论 self_match 是否抛都先记该笔审计再停机，
+    // 避免"状态已变却无 TRADE_RTN"的审计缺口。recording 抛异常 swallow + counter（telemetry 不停机）。
     xt_log::run_guarded("RT", "live.record_trade", record_fail_ct_,
                         [&]() { emit_trade_record(evt, normalized, realized_fp, effective_sid); });
 
@@ -518,6 +547,7 @@ bool XtHftEventLoop::handle_exec_trade_(const XtRunnerTradeEvent& evt) {
     return true;
 }
 
+// ── Trade adaptation ──────────────────────────────────────────────
 XtTradeRecord XtHftEventLoop::normalize_trade_event(const XtRunnerTradeEvent& evt) const {
     return (live_cost_ != nullptr)
         ? xt_fill_cost::normalize_trade_cost(evt.value, live_cost_, live_fees_, catalog_)
@@ -525,7 +555,7 @@ XtTradeRecord XtHftEventLoop::normalize_trade_event(const XtRunnerTradeEvent& ev
 }
 
 void XtHftEventLoop::check_post_trade_self_match(const XtTradeRecord& trade) {
-
+    // 成交后自成交兜底读原始 TD 回报，不依赖 engine 内部持仓状态。
     if (self_match_detector_ && self_match_detector_->on_trade(trade)) {
         if (blacklist_sink_) {
             blacklist_sink_(trade.code.c_str(), "self_match_post_trade");
@@ -536,6 +566,7 @@ void XtHftEventLoop::check_post_trade_self_match(const XtTradeRecord& trade) {
     }
 }
 
+// ── Live recording ────────────────────────────────────────────────
 void XtHftEventLoop::emit_order_update_record(const XtRunnerOrderUpdateEvent& evt) const {
     if (auto* rec = XtLiveRecorder::global()) {
         const uint64_t ts_local_ns = XtSteadyClock::steady_now_ns();
@@ -549,15 +580,15 @@ void XtHftEventLoop::emit_order_update_record(const XtRunnerOrderUpdateEvent& ev
         }
         const char* sid_cstr = xt_identity::StrategySidRegistry::resolve_sid_cstr_or_null(evt.value.sid_id);
         rec->emit_order_rtn(ts_local_ns,
-                             evt.value.id,
-                             evt.value.id,
+                            /*logical_id=*/evt.value.id,
+                            /*phys_id=*/evt.value.id,
                             order_status_to_str(evt.value.status),
                             evt.value.filled_fp,
-                             err_buf,
+                            /*err_msg=*/err_buf,
                             initiator_buf,
-                             sid_cstr,
-                             sid_cstr,
-                             nullptr);
+                            /*strat_id=*/sid_cstr,
+                            /*book_id=*/sid_cstr,    // recorder 暂以 sid 填充 book_id
+                            /*account_id=*/nullptr);
     }
 }
 
@@ -592,7 +623,8 @@ void XtHftEventLoop::emit_trade_record(const XtRunnerTradeEvent& evt,
             .account_id        = nullptr,
             .fee_fp            = xt_fp::to_fp(normalized.fee),
             .realized_pnl_fp   = realized_fp,
-
+            // Recovering 期 engine 不计算 realized；recorder 下游必须走自重算 fallback，
+            // 不能把默认 0 标记为权威 realized PnL。
             .has_realized      = (evt.td_state != ITradeGateway::TdState::Recovering),
             .is_close          = normalized.is_close,
             .route_status      = route_status,
@@ -611,7 +643,8 @@ XtHftEventLoop::WorkerBudgets XtHftEventLoop::compute_worker_budgets_(const Conf
     b.flow_budget_per_loop = cfg.flow_event_budget_per_loop > 0
                                  ? cfg.flow_event_budget_per_loop
                                  : b.flow_batch_size;
-
+    // 0 = 禁用 backlog 告警，与 cfg 注释及 high_watermark sentinel 语义一致；
+    // 生产环境由 parser 默认值（= td_event_high_watermark）提供非零启用阈值。
     b.td_backlog_warn_threshold =
         cfg.td_backlog_warn_threshold > 0
             ? std::min(cfg.td_backlog_warn_threshold, cfg.td_event_queue_capacity)
@@ -659,7 +692,7 @@ bool XtHftEventLoop::drain_runner_queue_([[maybe_unused]] WorkerRuntime& st,
                                          bool& progressed) {
     while (budget > 0) {
         if constexpr (kCheckTickWait) {
-
+            // TD 让位：tick 等待超过 tick_max_wait_us 时中断本轮 TD drain，优先处理行情。
             if (cfg_.tick_max_wait_us > 0 && st.tick_pending_since_us > 0) {
                 const uint64_t now = XtSteadyClock::steady_now_us();
                 const uint64_t wait_us = now >= st.tick_pending_since_us ? (now - st.tick_pending_since_us) : 0;
@@ -746,10 +779,18 @@ void XtHftEventLoop::update_tick_session_flags(const XtTick& tick) {
 }
 
 bool XtHftEventLoop::dispatch_tick_to_engine(const TickEvent& ev) {
-
+    // ORDER_SUBMIT tap 只在 on_tick 调用窗口内读取该 TLS，非 tick 路径保持 0。
+    // trigger 起点选择器：SHM 路径下用 connector capture（含 +IPC hop 的真 md_ingress 起点），
+    // 直连 venue / capture 无效则 fallback 本进程 enqueue。
+    // ── migration delta（SHM binance 路径生效，直连 venue capture=0 逐字不变）──────
+    //   xt_strategy_us（trigger→submit_begin）与 event_to_ack/fill 的起点、以及 recorder
+    //   ORDER_SUBMIT 的 trigger_tick_ts，从本地 enqueue 前移到 connector capture（多 +IPC hop）。
+    //   → latency budget（strategy_us 阈值系本地 CPU-bound 口径）在 shm 路径部署后需重估（入债）。
     const uint64_t trigger_us = xt_live::select_trigger_anchor_us(ev.capture_ts_us, ev.enqueue_ts_us);
     xt_core::tap::set_current_tick_ts_ns(trigger_us * 1000ULL);
-
+    // event clock re-anchor（BestEffort observability，不参与准入）：用行情
+    // payload 的 action 对算 event 时刻，发布进程共享 offset，让 panel/
+    // watchdog 等非 worker 线程的 submit 也能投影 event_ts。
     if (ev.core_tick.action_time != 0) {
         const uint32_t ad = ev.core_tick.action_date != 0 ? ev.core_tick.action_date
                                                           : ev.core_tick.trading_date;
@@ -770,6 +811,7 @@ bool XtHftEventLoop::dispatch_tick_to_engine(const TickEvent& ev) {
 bool XtHftEventLoop::process_ticks(WorkerRuntime& st, bool& progressed) {
     const size_t n = tick_q_.pop_bulk(st.tick_batch.data(), budgets_.tick_batch_size);
 
+    // 队列为空：无积压时正常空转；有积压时计入等待轮次并按节流规则告警。
     if (n == 0) {
         if (tick_backlog_.load(std::memory_order_relaxed) == 0) return true;
         ++st.tick_wait_loops;
@@ -781,6 +823,7 @@ bool XtHftEventLoop::process_ticks(WorkerRuntime& st, bool& progressed) {
     st.tick_pending_since_us = 0;
     st.tick_wait_loops = 0;
 
+    // batch 内共享 stale_quote 心跳时间；该值只服务秒级 stale 检测，不是 tick 时间戳。
     const uint32_t batch_steady_ms = last_tick_steady_ms_
         ? static_cast<uint32_t>(XtSteadyClock::steady_now_us() / 1000) : 0;
 
@@ -791,7 +834,7 @@ bool XtHftEventLoop::process_ticks(WorkerRuntime& st, bool& progressed) {
 
         const uint64_t lag = observe_tick_lag_us(ev);
         if (lag > batch_max_lag) batch_max_lag = lag;
-
+        // enqueue_ts_us==0 表示时间戳不可用，不喂直方图（lag=0µs 是有效样本，落桶 0）。
         if (ev.enqueue_ts_us != 0) tick_lag_hist_.record(lag);
 
         update_tick_observability(ev.core_tick, batch_steady_ms);
@@ -817,13 +860,16 @@ void XtHftEventLoop::drain_pending_queues() {
     TickEvent tick_ev;
     XtHftRunnerEvent sev;
     while (tick_q_.pop(tick_ev)) {}
-
+    // td 队列：WorkerTask 注册闭包执行而非丢弃——兜住 producer 以 stale running_ 在
+    // worker 收尾 sweep 之后才 push 成功的窄竞态窗（worker 已 join，本线程执行无并发
+    // 写者；book 侧注册经 post_to_worker 撞 enqueue 拒 → 溢出侧道，由 runner
+    // enter_quiescent 后 drain 落地）。其余事件维持既有 stop 丢弃语义。
     while (td_event_q_.pop(sev)) {
         if (const auto* ctrl = sev.get_if<XtRunnerControlEvent>()) {
             if (ctrl->type == XtRunnerControlEventType::WorkerTask) {
                 const auto* p = ctrl->get_if<XtRunnerWorkerTaskEvent>();
                 if (p && p->fn) {
-
+                    // 回调守卫政策：闭包异常不得穿透 stop 调用线程；log 后吞掉继续。
                     try {
                         p->fn();
                     } catch (...) {
@@ -841,19 +887,31 @@ void XtHftEventLoop::drain_pending_queues() {
 }
 
 void XtHftEventLoop::run() {
-
+    // ── worker-body backstop（对齐 CTA XtCtaLiveEventLoop.cpp:26）─────────────
+    // guarded body 内任何逃逸异常都升级为 fail-stop，不让其逃出 worker 线程触发
+    // std::terminate。覆盖：prologue 分配（make_worker_runtime_ bad_alloc）、affinity/
+    // priority、engine 业务调用（on_trade/on_order_update）、account/control dispatch、
+    // WorkerTask 闭包、tick-path helper、及将来新增的未守护调用。inner 已 guard 的
+    // strategy 回调先被各自 run_strategy_guard 接住（不逃逸、不重复计 worker_body_ex_ct_）。
+    // 注意：run_guarded 自身 noexcept，其 catch 内日志分配的 double-OOM terminate 面
+    // 为所有 callsite 既有属性，本改动不 regress，不在本次 scope。
     const bool no_escape = xt_log::run_guarded("RT", "worker.body", worker_body_ex_ct_, [&]() {
     if (cfg_.worker_affinity >= 0) {
         ThreadUtil::set_current_thread_affinity(cfg_.worker_affinity);
-
+        // 绑核后同步绑定 NUMA 本地内存分配，避免跨 NUMA 访问 100+ ns 额外延迟。
         ThreadUtil::bind_current_thread_numa(cfg_.worker_affinity);
     }
     if (!cfg_.worker_priority.empty()) {
         ThreadUtil::set_current_thread_priority(cfg_.worker_priority);
     }
 
+    // 延迟采样：worker 线程体首部显式绑定一个确定性 SPSC producer slot，让本线程上的
+    // on_submit_result/on_order_update/on_trade tap 走无锁 slot（未绑线程走 overflow）。
     if (latency_tracker_) latency_tracker_->bind_producer_slot();
 
+    // engine_.start() 负责 multi-strategy fan-out；EventLoop 不直接访问单个 context。
+    // 单策略 on_init 失败已在 engine 内 disable + 触发 per-sid latch 回调，report
+    // 只作可观测补充（不改变 worker 继续跑的语义）。
     XtHftEngine::StartReport start_report;
     if (!run_strategy_guard(StrategyGuardStage::OnInit, &stop_requested_, shutdown_flag_,
                             [&]() { start_report = engine_.start(); })) return;
@@ -869,15 +927,19 @@ void XtHftEventLoop::run() {
         XtLogger::info_m("RT", "initial params applied version={}", initial_param_version_);
     }
 
+    // WorkerRuntime 含多个大型批次缓冲区，堆分配避免线程栈溢出。
     auto st = make_worker_runtime_();
 
+    // 独占核心模式：配置开启且已绑核；提前固化，避免热循环内重复读 cfg_。
     const bool pure_spin = cfg_.enable_pure_spin && (cfg_.worker_affinity >= 0);
 
     int spin = 1;
-
+    // stop_requested_ 通常为 false（运行态），__builtin_expect 引导分支预测器走
+    // "继续运行"路径，减少循环头部的分支预测惩罚（branch misprediction penalty）。
     while (__builtin_expect(!stop_requested_.load(std::memory_order_acquire), 1)) {
         bool progressed = false;
-
+        // off-worker 注册溢出侧道 drain：置于 process_td_events 之前 → 溢出注册整体先于
+        // 本轮 td 队列回报被消费（保「注册先于回报」）。侧道空时 hook 内 O(1) 早退。
         if (marshal_overflow_drain_) marshal_overflow_drain_();
         update_tick_pending_state(*st);
         if (__builtin_expect(!process_td_events(*st, progressed), 0)) return;
@@ -886,25 +948,37 @@ void XtHftEventLoop::run() {
         if (__builtin_expect(!process_flow_events(*st, progressed), 0)) return;
 
         if (__builtin_expect(progressed, 1)) {
-
+            // 有进展：重置 spin 计数器，立即进入下一轮
             spin = 1;
             continue;
         }
 
+        // 空闲等待（idle backoff）
         if (pure_spin) {
-
+            // 独占核心模式：单次 PAUSE 后立即重新检查队列。
+            // 不调用 yield/sleep，降低空闲唤醒延迟。
+            // CPU 占用率 100%（预期行为，该核心专用于此线程）。
             backoff_pause(1);
         } else {
-
+            // 共享核心模式：指数退避，减少与其他线程的 CPU 竞争。
+            // spin: 1 → 2 → 4 → ... → 64 次 PAUSE，之后 yield。
+            // 每次退避最多执行 64 次 PAUSE，超出后 yield 让出 CPU 时间片。
             backoff_pause(spin);
             if (spin < 64) spin <<= 1;
             else std::this_thread::yield();
         }
     }
     });
-
+    // guarded body 逃逸（engine/account/control/WorkerTask/prologue 分配等抛异常）→ fail-stop。
+    // 干净路径（no_escape==true）：bool-false 早退已各自 request_worker_stop()/run_strategy_guard
+    // 自置 stop，无需重复置位。request_worker_stop() null-safe。
     if (!no_escape) request_worker_stop();
 
+    // stop 边沿收尾（仍在 worker 线程、join 前；guarded body 早退/异常逃逸路径同样覆盖）：
+    // 把 td 队列里已入队成功但未被消费的 WorkerTask 注册闭包捞出直接执行（worker 单写者
+    // 合法），其余事件维持既有 stop 丢弃语义（drain_pending_queues 统一清理）；随后清
+    // 溢出侧道。stop 之后的新 post 被 enqueue 拒 → 溢出侧道，由 runner 在 join 后
+    // enter_quiescent + drain_marshal_side_channel 收尾——注册全程不丢。
     {
         XtHftRunnerEvent ev;
         while (td_event_q_.pop(ev)) {
@@ -913,7 +987,7 @@ void XtHftEventLoop::run() {
                 if (ctrl->type == XtRunnerControlEventType::WorkerTask) {
                     const auto* p = ctrl->get_if<XtRunnerWorkerTaskEvent>();
                     if (p && p->fn) {
-
+                        // 回调守卫政策：闭包异常不得逃逸 worker 线程主函数；log 后吞掉继续。
                         try {
                             p->fn();
                         } catch (...) {

@@ -11,6 +11,16 @@
 
 namespace xt_live {
 
+/// @brief per-tick 提交门禁 flag 更新（HFT/CTA event loop 共用）。
+///
+/// 按 tick.action_time 计算 active_sections 半开命中与 closeout 闭区间命中，
+/// 写入 XtRunnerSignals 的两个 atomic — XtStrategyContext::can_submit() 的读端。
+/// update_session_gate_flags() 使用 `xt_core::in_hhmm_sections_halfopen()` 与
+/// `xt_core::in_closeout_no_open_window_closed()`，与 risk guard 读侧共用同一 predicate。
+///
+/// @pre 调用必须先于本 tick 的策略 dispatch（同 tick 一致性：策略 can_submit
+///      读到的 gate 与 risk 对同一 tick 的判定一致）。
+/// @note 仅变化才 store，避免每 tick 无谓的 release 写。
 inline void update_session_gate_flags(
         uint32_t action_time,
         const std::vector<std::pair<int, int>>* sections,
@@ -36,4 +46,4 @@ inline void update_session_gate_flags(
     }
 }
 
-}
+}  // namespace xt_live

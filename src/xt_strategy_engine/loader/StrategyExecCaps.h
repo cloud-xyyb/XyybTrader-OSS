@@ -12,10 +12,13 @@
 
 namespace xt_strategy_engine {
 
+/// @brief 当前部署形态无法兑现 exec sink 回调时的 capability gate 判定。
 inline bool exec_sink_caps_violation(uint64_t caps) {
     return (caps & kExecSinkRequiredCaps) != 0;
 }
 
+/// @brief gate 命中时的统一拒绝文案（deploy_desc 描述部署形态，如
+///        "multi-strategy mode" / "multi-strategy tick-mode BT"）。
 inline std::string exec_sink_caps_error(const std::string& sid, uint64_t caps,
                                           const char* deploy_desc) {
     char buf[256];
@@ -29,4 +32,4 @@ inline std::string exec_sink_caps_error(const std::string& sid, uint64_t caps,
     return std::string(buf);
 }
 
-}
+}  // namespace xt_strategy_engine

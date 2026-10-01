@@ -11,21 +11,31 @@
 #include <fstream>
 #include <sstream>
 
-static constexpr int    kMinTicksPerBar      = 4;
+// ---------------------------------------------------------------------------
+// 文件内部常量
+// ---------------------------------------------------------------------------
+
+static constexpr int    kMinTicksPerBar      = 4;   // OHLC 四锚点各一 tick
 static constexpr int    kMaxExtraTicksPerBar = 16;
 static constexpr double kVolumePerExtraTick  = 500.0;
 
-static constexpr int kOhlcPathSegments = 3;
+static constexpr int kOhlcPathSegments = 3;  // open -> mid1 -> mid2 -> close 共 3 段
 
 static constexpr double kSkewDampRatio       = 0.8;
 static constexpr double kSkewJitterAmplitude = 0.04;
 static constexpr int    kSkewJitterPeriod    = 5;
 static constexpr double kSkewClampAbs        = 0.6;
 static constexpr double kDepthLevelSpread    = 0.5;
-static constexpr double kDepthQtyScalePerLevel = 1.0;
+static constexpr double kDepthQtyScalePerLevel = 1.0;  // 档 k 的量倍率 = 1 + k * factor
 static constexpr double kMinQty              = 1.0;
-static constexpr double kMinPriceRange       = 1e-6;
+static constexpr double kMinPriceRange       = 1e-6;   // 除零保护
 
+// ---------------------------------------------------------------------------
+// 文件内部辅助函数
+// ---------------------------------------------------------------------------
+
+// 根据 bar 成交量计算应生成的 tick 数，量越大 tick 越密。
+// 安全性：volume <= 0 或 NaN 返回最小值；先在 double 域截断再转 int，避免 UB。
 static int calc_ticks_per_bar(double volume) {
     if (!(volume > 0.0)) return kMinTicksPerBar;
     const double extra_d = volume / kVolumePerExtraTick;
@@ -35,6 +45,7 @@ static int calc_ticks_per_bar(double volume) {
     return kMinTicksPerBar + extra;
 }
 
+// OHLC 四锚点路径：看涨 open->low->high->close，看跌 open->high->low->close。
 static void build_ohlc_anchors(const ParsedBarRow& row, double anchors[4]) {
     anchors[0] = row.open;
     if (row.close >= row.open) {
@@ -47,6 +58,7 @@ static void build_ohlc_anchors(const ParsedBarRow& row, double anchors[4]) {
     anchors[3] = row.close;
 }
 
+// 分段线性插值，bar_frac 属于 [0, 1]。
 static double interpolate_ohlc_path(const double anchors[4], double bar_frac) {
     const double seg_pos  = bar_frac * kOhlcPathSegments;
     const int    seg      = std::min(static_cast<int>(seg_pos), kOhlcPathSegments - 1);
@@ -54,6 +66,7 @@ static double interpolate_ohlc_path(const double anchors[4], double bar_frac) {
     return anchors[seg] + (anchors[seg + 1] - anchors[seg]) * seg_frac;
 }
 
+// 模拟盘口买卖量偏斜：主偏斜由价格相对 open 位置决定，叠加周期性抖动增加多样性
 static double calc_book_skew(double price, double open_price,
                              double price_range, int tick_idx) {
     const double price_skew = (price - open_price) / price_range;
@@ -62,8 +75,14 @@ static double calc_book_skew(double price, double open_price,
     return std::clamp(price_skew * kSkewDampRatio + jitter, -kSkewClampAbs, kSkewClampAbs);
 }
 
-bool parse_bar_row_line(const std::string& line, ParsedBarRow& out) {
+// ---------------------------------------------------------------------------
+// 对外接口实现
+// ---------------------------------------------------------------------------
 
+bool parse_bar_row_line(const std::string& line, ParsedBarRow& out) {
+    // 两种 CSV 格式：
+    //   格式 A（独立时间列）：date/time, HH:MM:SS, open, high, low, close, volume
+    //   格式 B（日期含时间）：datetime,            open, high, low, close, volume
     std::stringstream ss(line);
     std::string col1, col2, o, h, l, c, v;
     if (!std::getline(ss, col1, ',')) return false;
@@ -83,6 +102,7 @@ bool parse_bar_row_line(const std::string& line, ParsedBarRow& out) {
     v    = XtStringUtil::trim(v);
     if (col1.empty()) return false;
 
+    // col2 含 ':' 且 col1 含 '/' 表示格式 A（独立时间列）。
     const bool has_separate_time = !col2.empty()
                                    && col2.find(':') != std::string::npos
                                    && col1.find('/') != std::string::npos;
@@ -91,7 +111,7 @@ bool parse_bar_row_line(const std::string& line, ParsedBarRow& out) {
         if (!XtTimeParse::parse_time_hms(col2, out.action_time)) return false;
     } else {
         if (!XtTimeParse::parse_datetime(col1, out.trading_date, out.action_time)) return false;
-        o = col2;
+        o = col2;  // 格式 B：col2 即为 open 列
     }
 
     if (!XtStringUtil::parse_double(o, out.open))   return false;
@@ -122,8 +142,9 @@ void generate_ticks_from_bar_row(const ParsedBarRow&     row,
     out_ticks.clear();
     out_ticks.reserve(static_cast<size_t>(ticks_n));
 
+    // ticks_n >= kMinTicksPerBar == 4，故 ticks_n - 1 >= 3，除法安全。
     for (int i = 0; i < ticks_n; ++i) {
-
+        // bar_frac 属于 [0, 1]：i=0 对应 open，i=ticks_n-1 对应 close。
         const double bar_frac = static_cast<double>(i) / (ticks_n - 1);
         const double price = interpolate_ohlc_path(anchors, bar_frac);
         const double skew  = calc_book_skew(price, row.open, price_range, i);
@@ -137,9 +158,9 @@ void generate_ticks_from_bar_row(const ParsedBarRow&     row,
         t.low          = row.low;
         t.price        = price;
         t.trading_date = row.trading_date;
-
+        // bar CSV date 列为 trading day；legacy bar mode 不重建夜盘 calendar action_date。
         t.action_date  = row.trading_date;
-        t.action_time  = XtTimeParse::add_ms(bar_start, step_ms * (i + 1));
+        t.action_time  = XtTimeParse::add_ms(bar_start, step_ms * (i + 1));  // tick 落在子区间末尾。
         t.volume       = vol_per_tick;
         t.total_volume = running_total_volume;
 
@@ -180,6 +201,7 @@ std::string extract_yymm_from_bar_path(const std::string& path) {
     const size_t sep       = path.find_last_of("/\\");
     const std::string name = (sep == std::string::npos) ? path : path.substr(sep + 1);
 
+    // 扫描首个满足 YYMM 格式的四位数字串：前后无多余数字，且 MM 属于 [01, 12]。
     for (size_t i = 0; i + 3 < name.size(); ++i) {
         if (!std::isdigit(static_cast<unsigned char>(name[i]))     ||
             !std::isdigit(static_cast<unsigned char>(name[i + 1])) ||

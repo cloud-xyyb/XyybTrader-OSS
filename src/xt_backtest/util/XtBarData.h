@@ -13,48 +13,77 @@
 #include <string>
 #include <vector>
 
+// 依赖 XtCtaBarLoader::TimedBar；通常由 XtCtaBarLoader.h 在该类型定义后 include。
+
 #ifdef XT_HAS_LZ4
 #include <lz4.h>
 #endif
 
 namespace xt_data {
 
+// ── 压缩类型 ──────────────────────────────────────────────────────────────────
 enum CompressType : uint8_t {
     kNone = 0,
     kLZ4  = 1,
 };
 
+// ── V2 wire header（32 字节） ─────────────────────────────────────────────────
+//
+// 格式说明：
+//   magic[8]       = "CTBR V2\0"
+//   version        = 2
+//   bar_size       = sizeof(TimedBar)，用于版本兼容校验
+//   bar_count      = bar 条数
+//   period_s       = 周期秒数（300=5m, 900=15m, 1800=30m）
+//   compress_type  = CompressType (0=none, 1=LZ4)
+//   reserved[3]    = {0,0,0}
+//
+/// @brief XTBR V2 `.bar.bin` wire header，固定 32 字节。
 struct BarBinHeaderV2 {
-    char     magic[8];
-    uint32_t version;
-    uint32_t bar_size;
-    uint64_t bar_count;
-    uint32_t period_s;
-    uint8_t  compress_type;
-    uint8_t  reserved[3];
+    char     magic[8];          // "CTBR V2\0"
+    uint32_t version;           // 2
+    uint32_t bar_size;          // sizeof(TimedBar)
+    uint64_t bar_count;         // bar 条数
+    uint32_t period_s;          // 周期秒数
+    uint8_t  compress_type;     // CompressType
+    uint8_t  reserved[3];       // 保留字段
 };
 static_assert(sizeof(BarBinHeaderV2) == 32, "BarBinHeaderV2 必须为 32 字节");
 
 inline constexpr char kBarBinMagicV2[8] = {'C','T','B','R',' ','V','2','\0'};
 
+// ── 周期转换工具 ──────────────────────────────────────────────────────────────
+
+/// 周期字符串转秒数（"5m"→300, "15m"→900, "30m"→1800, "1h"→3600）
 inline uint32_t period_str_to_seconds(const std::string& period) {
-    if (period.empty()) return 900;
+    if (period.empty()) return 900; // 默认 15m
     char* end_ptr = nullptr;
     long n = std::strtol(period.c_str(), &end_ptr, 10);
     if (!end_ptr || n <= 0) return 900;
     if (*end_ptr == 'h' || *end_ptr == 'H') return static_cast<uint32_t>(n * 3600);
-    return static_cast<uint32_t>(n * 60);
+    return static_cast<uint32_t>(n * 60); // 默认分钟
 }
 
+/// 秒数转周期字符串（300→"5m", 900→"15m", 3600→"1h"）
 inline std::string period_seconds_to_str(uint32_t s) {
     if (s >= 3600 && s % 3600 == 0) return std::to_string(s / 3600) + "h";
     return std::to_string(s / 60) + "m";
 }
 
+/// 周期字符串转目录下的文件名（"5m"→"5m.bar.bin"）
 inline std::string period_to_filename(const std::string& period) {
     return period + ".bar.bin";
 }
 
+// ── write_bars — 写入 XTBR V2 格式 ───────────────────────────────────────────
+
+/// @brief 将 TimedBar 序列写入 XTBR V2 二进制文件
+///
+/// @param path        输出文件路径
+/// @param bars        TimedBar 序列
+/// @param period_s    周期秒数（300/900/1800）
+/// @param compress    压缩类型；未启用 XT_HAS_LZ4 时 kLZ4 会降级为 kNone
+/// @return true 表示文件完整写入；false 表示目录、文件或压缩写入失败。
 inline bool write_bars(const std::filesystem::path& path,
                        const std::vector<XtCtaBarLoader::TimedBar>& bars,
                        uint32_t period_s,
@@ -84,12 +113,12 @@ inline bool write_bars(const std::filesystem::path& path,
     if (bars.empty()) return out.good();
 
     const auto* raw_data = reinterpret_cast<const char*>(bars.data());
-
+    // LZ4 API 使用 int 表示字节数；超过范围的输入应在调用侧拆分文件。
     const auto  raw_size = static_cast<int>(bars.size() * sizeof(XtCtaBarLoader::TimedBar));
 
     if (compress == kLZ4) {
 #ifdef XT_HAS_LZ4
-
+        // 压缩 payload 前置原始字节数，读路径据此恢复 TimedBar 数组。
         const int max_dst = LZ4_compressBound(raw_size);
         std::vector<char> buf(max_dst);
         const int compressed_size = LZ4_compress_default(raw_data, buf.data(), raw_size, max_dst);
@@ -106,6 +135,14 @@ inline bool write_bars(const std::filesystem::path& path,
     return out.good();
 }
 
+// ── read_bars — 读取 XTBR V2 格式 ────────────────────────────────────────────
+
+/// @brief 从 .bar.bin 文件读取 TimedBar 序列（XTBR V2 header required）
+///
+/// @param path          输入文件路径
+/// @param out           输出 TimedBar 序列；成功读取时追加到现有内容后面
+/// @param period_s_out  若非空，返回文件中记录的周期秒数
+/// @return true 表示 header、bar_size、payload 均校验通过；false 不保证 out 不变。
 inline bool read_bars(const std::filesystem::path& path,
                       std::vector<XtCtaBarLoader::TimedBar>& out,
                       uint32_t* period_s_out = nullptr) {
@@ -172,6 +209,21 @@ inline bool read_bars(const std::filesystem::path& path,
     return false;
 }
 
+// ── derive_bars — 从细粒度 bar 聚合为粗粒度 ──────────────────────────────────
+
+/// @brief 将细粒度 bar 聚合为粗粒度 bar（如 5m → 15m）
+///
+/// 按目标周期的时间槽分组，合并 OHLCV：
+///   open = 组内第一根 bar 的 open
+///   high = max(highs), low = min(lows)
+///   close = 组内最后一根 bar 的 close
+///   volume/turnover = sum，open_interest = 组内最后一根 bar 的值
+///   key = 组内第一根 bar 的 key
+///
+/// @param src           源 bar 序列（需已按时间排序）
+/// @param src_period_s  源周期秒数（如 300）
+/// @param dst_period_s  目标周期秒数（如 900），必须为 src 的整数倍
+/// @return              聚合后的 bar 序列
 inline std::vector<XtCtaBarLoader::TimedBar> derive_bars(
         const std::vector<XtCtaBarLoader::TimedBar>& src,
         uint32_t src_period_s,
@@ -185,6 +237,7 @@ inline std::vector<XtCtaBarLoader::TimedBar> derive_bars(
 
     result.reserve(src.size() / (dst_min / src_min) + 1);
 
+    // 聚合槽只看分钟，毫秒级输入会落入同一分钟槽。
     auto bar_slot = [&](const XtCtaBarLoader::TimedBar& tb) -> uint64_t {
         uint32_t date = tb.bar.action_date;
         uint32_t at = tb.bar.action_time;
@@ -222,4 +275,4 @@ inline std::vector<XtCtaBarLoader::TimedBar> derive_bars(
     return result;
 }
 
-}
+} // namespace xt_data

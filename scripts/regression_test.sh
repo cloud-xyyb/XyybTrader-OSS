@@ -1,5 +1,4 @@
-#!/bin/bash
-# 完整回归入口：6 个 HFT 基线场景全部 byte-identical 才算过。
-# 细节与单场景用法见 scripts/run_baselines.sh。
+#!/usr/bin/env bash
+# HFT 六场景与 SEL 三组 golden；临时配置/报告由 Python finally 清理。
 set -euo pipefail
-exec bash "$(dirname "$0")/run_baselines.sh" "$@"
+exec python3 "$(dirname "$0")/validate_dev.py" --regression-only "$@"

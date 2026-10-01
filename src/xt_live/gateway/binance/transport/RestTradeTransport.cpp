@@ -8,7 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
+#include <cmath>  // std::isfinite（P15 executedQty 防线）
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -32,6 +32,7 @@ inline uint64_t lat_now_us() noexcept {
     return XtSteadyClock::steady_now_us();
 }
 
+/// @brief 从 Binance 错误响应体解析 `code` 字段；缺失 / 非整数 / 非法 JSON → 0。
 int parse_rest_error_code(const std::string& body) noexcept {
     auto j = nlohmann::json::parse(body, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return 0;
@@ -40,17 +41,18 @@ int parse_rest_error_code(const std::string& body) noexcept {
     return it->get<int>();
 }
 
+/// @brief execution-unknown 事件的限频告警窗口（steady µs）；对齐 cancel-fail 日志节奏。
 constexpr uint64_t kExecUnknownLogIntervalUs = 5'000'000ULL;
 
 struct ReqSubmit {
-    TransportSubmitReq req;
-    TransportLatencyTrace trace;
+    TransportSubmitReq req;          ///< 已移交给 REST worker 的 submit 请求。
+    TransportLatencyTrace trace;     ///< submit 从策略入口到 REST ack 的 latency 切片。
 };
 
 struct ReqCancel {
-    TransportCancelReq req;
-    TransportLatencyTrace trace;
-    int tries_done = 0;
+    TransportCancelReq req;          ///< 已移交给 REST worker 的 cancel 请求。
+    TransportLatencyTrace trace;     ///< cancel 从策略入口到 REST ack 的 latency 切片。
+    int tries_done = 0;              ///< 已完成的 REST 尝试次数（限频重试调度用）。
 };
 
 /// @brief 等待退避到期的 cancel 重试项；due_us 为 steady µs。
@@ -61,7 +63,7 @@ struct DelayedCancel {
 
 using Req = std::variant<ReqSubmit, ReqCancel>;
 
-}
+}  // anonymous namespace
 
 bool rest_cancel_error_retryable(long http_status, int err_code) {
     if (http_status == 429 || http_status == 418) return true;
@@ -70,23 +72,30 @@ bool rest_cancel_error_retryable(long http_status, int err_code) {
 
 RestSubmitFailureClass classify_rest_submit_failure(long http_status,
                                                     int err_code) noexcept {
-
+    // http==0：curl transport 失败（DNS / 连接 / 读超时），请求可能已抵达 venue。
     if (http_status == 0) return RestSubmitFailureClass::kExecutionUnknown;
-
+    // 3xx：LB / 反代重定向（Binance fapi 实际不发）；请求是否被处理不可判定，保守当未知。
     if (http_status >= 300 && http_status < 400) return RestSubmitFailureClass::kExecutionUnknown;
-
+    // 5xx：Binance 官方明示服务端内部错误，execution status unknown（可能已成交）。
     if (http_status >= 500) return RestSubmitFailureClass::kExecutionUnknown;
-
+    // 执行状态未知的业务码（可能以 4xx 到达，不能当业务拒终态化）：
+    //   -1007 TIMEOUT           后端响应超时，发送/执行状态均未知。
+    //   -1006 UNEXPECTED_RESP   Binance 官方明示 "execution status unknown"（可能已成交）。
+    //   -1001 DISCONNECTED      内部错误 "unable to process your request"，是否被处理不可判定。
+    // 保守方向：真拒被当未知，只多一次 reconcile 查 not-exist 终态化（安全）；反之漏判
+    // （未知当业务拒终态化）会本地销账而委托仍挂/成交 → 漏成交 / 幽灵仓（危险）。
+    // 刻意不纳入 -1008 SERVER_BUSY：过载拒绝，委托明确未挂出（限流业务拒，见
+    // BinanceOrderLedger），storm 期纳入未知反而累积幽灵在途并延迟拒因信号。
     if (err_code == -1007 || err_code == -1006 || err_code == -1001)
         return RestSubmitFailureClass::kExecutionUnknown;
-
+    // 其余（4xx 业务拒 / 限流 429/418 / -1003 / -1008）：订单未挂出，可安全终态化为 Rejected。
     return RestSubmitFailureClass::kBusinessReject;
 }
 
 uint64_t rest_cancel_backoff_ms(int tries_done, long retry_after_sec,
                                 const RestCancelRetryCfg& cfg) {
     if (retry_after_sec > 0) {
-
+        // venue 已明示等待窗口（429→418 封禁升级语义），优先于指数退避。
         const uint64_t ra_ms = static_cast<uint64_t>(retry_after_sec) * 1000ULL;
         return std::min(ra_ms, cfg.max_retry_after_ms);
     }
@@ -136,6 +145,9 @@ public:
         enqueue_or_reject_on_stop(std::move(item));
     }
 
+    /// @brief submit/cancel 共享的入队路径：running 双检 → 入队 + notify，任一 gate
+    ///        失败即按 stop-before-send 拒绝（拒绝动作由 reject_before_wire_on_stop
+    ///        的 ReqSubmit/ReqCancel 重载分别决定，与 worker stop drain 同口径）。
     template <typename Item>
     void enqueue_or_reject_on_stop(Item&& item) {
         if (!running.load(std::memory_order_relaxed)) {
@@ -173,7 +185,9 @@ public:
 
 private:
     void worker_loop() {
-
+        // submit/cancel 共用单 worker：保证 REST 调用顺序与队列顺序一致，
+        // 同时把 HTTP 阻塞从策略线程移出。到期的 cancel 重试与主队列同 worker
+        // 串行执行；未到期的重试只决定等待超时，不阻塞新请求。
         while (true) {
             Req req{ReqSubmit{}};
             {
@@ -258,7 +272,7 @@ private:
     }
 
     BinanceSubmitOrderParams build_submit_params(const TransportSubmitReq& r) {
-
+        // Binance REST 签名按参数 map 的稳定顺序生成；数量/价格在发送边界统一截断。
         return build_submit_order_params(r);
     }
 
@@ -286,13 +300,18 @@ private:
             const std::string reject_reason =
                 resp.curl_err.empty() ? resp.body : resp.curl_err;
 
+            // BIN-D14：5xx / 网络层失败 / -1007 下委托可能已挂出或成交，终态化会让
+            // 本地销账而单仍 live 在 venue（漏成交 / 幽灵仓）。保留在途，派发
+            // kTransportError_TimeoutAfterSend（needs_reconcile），由 reconcile /
+            // openOrders / userTrades 补查真实终态；ledger 对该 kind 保持 inflight。
             if (classify_rest_submit_failure(resp.http_status, err_code) ==
                 RestSubmitFailureClass::kExecutionUnknown) {
                 note_submit_exec_unknown(r.req.local_id, resp.http_status, err_code,
                                          reject_reason);
                 emit_wire_reject_trace(r.req, "RestSubmitExecUnknown",
                                        reject_reason.c_str());
-
+                // R2-P1-1：execution-unknown 双义——收到真实 HTTP 响应（5xx/-1007，
+                // http!=0）是 venue 响应可采端点；http==0 是本地 transport 失败不可采。
                 dispatch(make_submit_transport_error(
                              r.req.local_id,
                              TransportAck::Kind::kTransportError_TimeoutAfterSend,
@@ -303,6 +322,8 @@ private:
                 return;
             }
 
+            // 明确业务拒绝（4xx / 限流）：订单未挂出，按 kRejected 终态化。
+            // 此分支 http_status 必非 0（http==0 已归 execution-unknown），故必有 HTTP 响应。
             XtLogger::warn_m("BinanceTD",
                              "submit REST rejected: http={} code={} body={} curl_err={}",
                              resp.http_status, err_code, resp.body, resp.curl_err);
@@ -321,14 +342,14 @@ private:
 
         TransportAck ack;
         ack.kind = TransportAck::Kind::kAccepted;
-        ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;
+        ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;  // REST 2xx = venue 响应
         ack.local_id = r.req.local_id;
         ack.raw_status = j.value("status", std::string("NEW"));
         if (j.contains("orderId")) ack.sys_id = std::to_string(j.value("orderId", 0LL));
         if (j.contains("executedQty")) {
             try {
                 const double eq = std::stod(j["executedQty"].get<std::string>());
-
+                // P15：stod("nan") 不抛；非有限不进 fp（保持 filled_fp=0，同字段缺失语义）。
                 if (std::isfinite(eq)) ack.filled_fp = order_exec_to_fp(eq);
             } catch (...) {}
         }
@@ -351,7 +372,8 @@ private:
             const int code = (!j.is_discarded() && j.contains("code"))
                                   ? j["code"].get<int>() : 0;
             if (code == -2011) {
-
+                // -2011 "Unknown order" 在本地撤单语义中等价于目标委托已不可撤；
+                // 上层订单状态机按 cancel noop 收敛，避免误报业务拒绝。
                 dispatch(make_cancel_ack(r.req.local_id, TransportAck::Kind::kCancelNoop,
                                          TransportAck::TimingOrigin::kVenueResponse),
                          r.trace);
@@ -371,6 +393,9 @@ private:
                                  TransportAck::TimingOrigin::kVenueResponse), r.trace);
     }
 
+    /// @brief 限频类 cancel 失败的有界重试调度；超出 max_tries 弃单并升级 error。
+    /// @note 弃重试后委托可能仍在交易所挂着，占用 per-symbol max-open-order 限额
+    ///       （-2025 根因），收敛依赖 reconcile / UDS 终态推送。
     void schedule_cancel_retry(ReqCancel&& r, long http_status, int err_code,
                                long retry_after_sec) {
         r.tries_done += 1;
@@ -401,7 +426,7 @@ private:
                                            int err_code) {
         TransportAck ack;
         ack.kind = TransportAck::Kind::kRejected;
-
+        // 业务拒绝 / 2xx 坏 JSON 均在 http!=0 分支构造 → venue 响应，可采端点。
         ack.timing_origin = TransportAck::TimingOrigin::kVenueResponse;
         ack.local_id = local_id;
         ack.err_msg = std::move(err_msg);
@@ -443,12 +468,14 @@ private:
                                    TransportAck::Kind kind) {
         emit_wire_reject_trace(r.req, reject_code, reason);
         r.trace.t1_us = lat_now_us();
-
+        // pre-wire 拒绝（stop-before-send）从未触达 venue → 本地失败，不可采。
         dispatch(make_submit_transport_error(r.req.local_id, kind,
                                              TransportAck::TimingOrigin::kLocalFailure, reason),
                  r.trace);
     }
 
+    /// @brief 记录一次 submit execution-unknown：累计 counter + 限频 warn。
+    /// @note 仅 worker 线程调用；last_exec_unknown_log_us_ 为该线程私有。
     void note_submit_exec_unknown(uint64_t local_id, long http_status, int err_code,
                                   const std::string& reason) {
         const uint64_t total =
@@ -474,26 +501,31 @@ public:
     }
 
 private:
-
+    // ── 外部依赖（不拥有）────────────────────────────────────────────
     BinanceRestClient& rest;
     AckHandler ack_handler;
 
+    // ── cancel 限频重试配置（构造期注入，只读）──────────────────────
     const RestCancelRetryCfg retry_cfg;
 
+    // ── worker 生命周期 ─────────────────────────────────────────────
     std::atomic<bool> running{false};
     std::thread worker_thread;
 
+    // ── 请求队列（queue_mu 保护）────────────────────────────────────
     mutable std::mutex queue_mu;
     std::condition_variable queue_cv;
     std::deque<Req> queue;
-    std::deque<DelayedCancel> retry_queue;
+    std::deque<DelayedCancel> retry_queue;   ///< 按 due_us 升序；worker 到点取出重发。
 
+    // ── 健康指标（跨线程原子观测）────────────────────────────────────
     std::atomic<uint32_t> inflight_count{0};
     std::atomic<uint64_t> last_ack_us{0};
 
-    std::atomic<uint64_t> submit_exec_unknown_count_{0};
-    uint64_t last_exec_unknown_log_us_ = 0;
-    uint64_t exec_unknown_suppressed_count_ = 0;
+    // ── execution-unknown 观测（BIN-D14）──────────────────────────────
+    std::atomic<uint64_t> submit_exec_unknown_count_{0};  ///< 累计 exec-unknown 事件数（跨线程读）。
+    uint64_t last_exec_unknown_log_us_ = 0;               ///< worker-only：上次限频 warn 时刻。
+    uint64_t exec_unknown_suppressed_count_ = 0;          ///< worker-only：窗口内被抑制的日志条数。
 };
 
 RestTradeTransport::RestTradeTransport(BinanceRestClient& rest,
@@ -529,4 +561,4 @@ uint64_t RestTradeTransport::submit_exec_unknown_count() const {
     return impl_->submit_exec_unknown_count();
 }
 
-}
+}  // namespace binance_u

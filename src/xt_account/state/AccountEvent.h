@@ -25,60 +25,62 @@ struct XtAccountEvent {
     };
 
     Type type = Type::Invalid;
-    const char* code = nullptr;
-    uint64_t order_id = 0;
+    const char* code = nullptr;    ///< non-owning；合约代码（仅持仓/行情类事件使用）
+    uint64_t order_id = 0;         ///< 订单 ID（仅订单类事件使用）
 
     union {
         // SetCash / CashTransfer：资金事件；SetCash 写现金绝对值，CashTransfer 累加现金变动。
         struct {
-            int64_t amount;
+            int64_t amount;  ///< 金额（fp）。
         } cash;
 
-        // SetPosition：broker/recovery 持仓真值；last_price 只作为 MarkPriceTable 的 mark hint。
+        // SetPosition：broker/recovery 持仓真值。
         struct {
-            int64_t long_qty;
-            int64_t long_avg_price;
-            int64_t short_qty;
-            int64_t short_avg_price;
+            int64_t long_qty;        ///< 多头持仓（fp）
+            int64_t long_avg_price;  ///< 多头均价（fp）
+            int64_t short_qty;       ///< 空头持仓（fp）
+            int64_t short_avg_price; ///< 空头均价（fp）
+            /// broker 快照携带的最新价（fp）。**AccountStateStore 不消费**：成本价
+            /// fallback 由 apply 之后按持仓终态派生，事件里的价格不参与任何估值。
             int64_t last_price;
-            int64_t long_today;
-            int64_t short_today;
-            int64_t broker_long_frozen_fp;
-            int64_t broker_short_frozen_fp;
-            int64_t broker_frozen_last_update_ms;
+            int64_t long_today;      ///< 多头今仓（fp）
+            int64_t short_today;     ///< 空头今仓（fp）
+            int64_t broker_long_frozen_fp;  ///< broker 侧冻结多头平仓量（CTP push / XTP 由 sellable 派生）；无源 venue 为 0。
+            int64_t broker_short_frozen_fp; ///< broker 侧冻结空头平仓量（同上）；无源 venue 为 0。
+            int64_t broker_frozen_last_update_ms; ///< broker frozen 更新时间（steady ms）。
         } set_position;
 
         // MarketTick：store-level 盯市事件；reducer 不消费，AccountStateStore 用它更新 mark。
         struct {
-            int64_t price;
+            int64_t price;  ///< mark price（fp）。
         } tick;
 
         // OrderAccepted：订单通过风控后创建冻结保证金账本项。
         struct {
-            int64_t required_margin;
-            int64_t per_unit_margin;
+            int64_t required_margin;  ///< 冻结保证金（fp）
+            int64_t per_unit_margin;  ///< 每手保证金（fp）
         } order_accepted;
 
         // OrderExecUpdate：订单状态回报；终态释放冻结。
         struct {
-            int64_t filled;
-            bool is_final;
+            int64_t filled;     ///< 已成交手数（fp）
+            bool is_final;      ///< 是否为终态（terminal state）
         } order_state;
 
         // DailySettlement：结算确认；同时调整 realized、cash 和 fees。
         struct {
-            int64_t realized_delta;
-            int64_t settlement_fee;
+            int64_t realized_delta;   ///< 本日结算盈亏增量（fp）
+            int64_t settlement_fee;   ///< 结算费用（fp）
         } daily_settlement;
 
         // TradeEx：成交入账；更新持仓、均价、手续费和 realized PnL。
         struct {
-            bool is_buy;
-            bool is_close;
-            bool is_today;
-            int64_t qty;
-            int64_t price;
-            int64_t fee;
+            bool is_buy;      ///< 买卖方向
+            bool is_close;    ///< 是否为平仓成交
+            bool is_today;    ///< 是否平今仓
+            int64_t qty;      ///< 成交手数（fp）
+            int64_t price;    ///< 成交价格（fp）
+            int64_t fee;      ///< 手续费（fp）
         } trade_ex;
     } payload = {};
 
@@ -88,6 +90,7 @@ struct XtAccountEvent {
         return ev;
     }
 
+    /// @brief 仓位 recovery 擦除事件：reducer 清 pos/order_slots/frozen，保留 cash/realized/fees。
     static XtAccountEvent reset() {
         XtAccountEvent ev;
         ev.type = Type::Reset;

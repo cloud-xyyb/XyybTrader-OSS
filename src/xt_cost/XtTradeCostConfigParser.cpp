@@ -12,4 +12,4 @@ XtTradeCostConfig parse_trade_cost_config(const YAML::Node& node) {
     return cfg;
 }
 
-}
+} // namespace engine_config

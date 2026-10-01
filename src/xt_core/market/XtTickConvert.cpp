@@ -2,6 +2,9 @@
 
 #include <cstring>
 
+// to_core() 是 MD 线程热路径；固定数组来自外部数据源，复制后必须强制补 null terminator。
+// to_raw() 只用于 debug/export/replay 边界。
+
 namespace xt_tick_convert {
 
 XtTick to_core(const XtRawTick& raw) {
@@ -87,4 +90,4 @@ XtRawTick to_raw(const XtTick& core) {
     return out;
 }
 
-}
+}  // namespace xt_tick_convert

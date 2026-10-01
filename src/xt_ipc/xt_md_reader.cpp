@@ -26,7 +26,7 @@ using Ring = xt_ipc::XtShmRing<xt_ipc::XtMdWireSlot>;
 
 struct ReaderOptions {
     std::string ring_name = "/xt_md_shadow";
-    int64_t expect = 0;
+    int64_t expect = 0;  // >0 时作 attach-relative 完成条件
     int64_t slow_ms = 0;
     int64_t timeout_ms = 10000;
     int64_t attach_timeout_ms = 5000;
@@ -61,7 +61,7 @@ bool parse_options(int argc, char** argv, ReaderOptions& opt) {
 }
 
 MappedRing attach_ring(const ReaderOptions& opt) {
-
+    // 等 connector 建段（reader 可能早于 connector 启动）
     const auto t_attach0 = std::chrono::steady_clock::now();
     int fd = -1;
     for (;;) {
@@ -127,10 +127,10 @@ int run_reader(const ReaderOptions& opt, const MappedRing& mapping) {
     xt_ipc::XtMdWireSlot slot{};
     for (;;) {
         if (rd.next(slot)) {
-            const XtRawTick& out = slot.tick;
-            const uint64_t idx = rd.cursor() - 1;
+            const XtRawTick& out = slot.tick;  // wire 元素含 capture_ns 前缀；诊断只看 tick 载荷
+            const uint64_t idx = rd.cursor() - 1;  // 刚消费的逻辑 index
             if (received == 0) first = out.price;
-            if (received > 0 && !(out.price > last)) ordered = false;
+            if (received > 0 && !(out.price > last)) ordered = false;  // 严格递增（synthetic）
             last = out.price;
             if (opt.verify_synthetic &&
                 (out.price != static_cast<double>(idx) || out.action_time != static_cast<uint32_t>(idx)))
@@ -143,7 +143,7 @@ int run_reader(const ReaderOptions& opt, const MappedRing& mapping) {
         } else {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
-
+        // 完成：attach 后该见的都见齐（received + gap 覆盖 expect-attach），或超时
         if (opt.expect > 0 && (received + static_cast<int64_t>(rd.gap_count()) >=
                                opt.expect - static_cast<int64_t>(attach_cursor)))
             break;
@@ -165,11 +165,12 @@ int run_reader(const ReaderOptions& opt, const MappedRing& mapping) {
 
     if (dump) std::fclose(dump);
 
+    // ordered（严格递增）是 synthetic 专属不变量；bin 真行情价非单调，正确性靠 dump-diff。
     const bool pass = (!opt.verify_synthetic || ordered) && verify_ok && conserved && received > 0;
     return pass ? 0 : 1;
 }
 
-}
+}  // namespace
 
 int main(int argc, char** argv) {
     ReaderOptions opt;

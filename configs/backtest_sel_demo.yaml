@@ -1,0 +1,101 @@
+# SEL 回测示例：30 个交易日、3 个合成股票、2 次调仓，输出 5 笔成交。
+# 从仓库根目录运行，见 docs/SEL_BACKTEST.md。
+
+datalake:
+  # 此示例使用 trading_dates_csv；root 留空
+  root: ""
+  allow_schema_skew: true
+
+selector:
+  # 30 天交易日列表 csv（头行 "date" 自动识别为 header）
+  trading_dates_csv: data/regression/sel_demo/trading_dates.csv
+  # 日 close 价 csv（date,code,close）— sim 撮合用 T 日 close 成交
+  close_prices_csv: data/regression/sel_demo/close_prices.csv
+  # 闭区间过滤；0 = 不过滤
+  date_from: 20260109
+  date_to:   20260219
+
+  task:
+    strategy_id: sel_demo
+    period: daily       # daily 让我们看到 weights.csv 中两个 rebalance 日期都触发
+    day: 0
+    time: 1500          # 收盘后 15:00 触发
+    strict_time: true
+    trdtpl: CHINA
+    session: default
+
+  strategy:
+    so:    var/plugins/strategies/libsel_weights_csv_strategy.so
+    id:    sel_demo
+    params:
+      weights_path: data/regression/sel_demo/weights.csv
+      normalize: true
+
+account:
+  initial_cash: 1000000.0
+
+# A 股 commodity capability flags（venue-neutral）
+commodities:
+  '600000.SH':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+  '000001.SZ':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+  '600519.SH':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+
+# 演示 fee schedule（map 形式 — symbol → rule）
+# 参数仅用于回归演示，不代表当前市场费率
+fees:
+  '600000.SH':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    min_commission: 5.0
+  '000001.SZ':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.0
+    min_commission: 5.0
+  '600519.SH':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    min_commission: 5.0
+
+# risk
+risk:
+  max_order_qty: 1000000.0
+  max_pos_qty: 10000000.0
+  enforce_long_t_plus_1: true
+  allow_short: false
+
+# cost slippage（此示例为 0）
+trade_cost:
+  slippage: 0.0
+
+report:
+  output_dir: ../reports/sel_demo

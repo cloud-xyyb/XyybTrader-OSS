@@ -59,7 +59,10 @@ std::string parse_argv(int argc, char** argv) {
             return std::string(arg + std::strlen(prefix));
         }
     }
-
+    // 裸 YAML 位置参数与 `--config` 等价，便于 `Runner path/to/x.yaml` 调用。
+    // 非 YAML 未知参数只告警并保留搜索链，避免破坏既有 argv 宽松兼容。
+    // 约束：本循环只跳过 `-` 开头的 flag 本身，不识别「flag 的值」；新增接收
+    // YAML 路径值的 flag 时，必须在第一轮显式消费，避免被当作主配置路径。
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
         if (!arg || arg[0] == '-') continue;
@@ -80,12 +83,14 @@ std::string find_config_in_base(const std::string& base, const std::string& defa
     return "";
 }
 
-}
+}  // namespace
 
 std::string xt_locate_config(int argc, char** argv,
                              const char* env_name,
                              const char* default_name) {
-
+    // 显式来源（argv/env）的路径原样返回、不做存在性兜底：路径写错时由 loader 以
+    // "config not found: <path>" fail-closed，而不是进入默认 profile 搜索链。
+    // 搜索兜底链仅在 argv/env 均未提供时生效。
     std::string p = parse_argv(argc, argv);
     if (!p.empty()) return p;
 
@@ -96,6 +101,7 @@ std::string xt_locate_config(int argc, char** argv,
 
     if (!default_name) default_name = "config.yaml";
 
+    // 支持本地调试（cwd/configs）与部署包（binary 目录及上两层）两种启动形态。
     p = find_config_in_base(".", default_name);
     if (!p.empty()) return p;
 

@@ -25,7 +25,8 @@ void XtLiveStrategyTelemetrySink::emit_intent_trace(
     const xt_strategy_engine::StrategyIntentTrace& t) {
     auto* rec = XtLiveRecorder::global();
     if (!rec) return;
-
+    // SDK POD → recorder wire 类型逐字段映射；ctx 不生产的深层字段（venue/account/
+    // wire 价量/local_id/slice_*）留默认值，由 gateway 后续 stage 直填 recorder。
     XtLiveRecorder::IntentTraceParams p;
     p.trace_id           = t.trace_id;
     p.stage              = t.stage;
@@ -61,4 +62,4 @@ XtLiveStrategyTelemetrySink& live_strategy_telemetry_sink() {
     return sink;
 }
 
-}
+}  // namespace xt_live::common

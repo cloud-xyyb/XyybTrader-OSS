@@ -5,13 +5,14 @@
 #include "XtLogger.h"
 #include "OrderFlowCsvUtil.h"
 #include "xt_util/path/PathUtil.h"
-#include "TickCsvUtil.h"
+#include "TickCsvUtil.h"  // make_tick_sort_key
 
 #include <algorithm>
 #include <fstream>
 
 namespace {
 
+// 同一 sort key 下先派发 tick，再派发逐笔/委托簿事件，保持策略上下文先看到盘口。
 int replay_event_priority(XtReplayEventType type) {
     switch (type) {
     case XtReplayEventType::Tick: return 0;
@@ -26,6 +27,7 @@ bool is_bin_file(const std::string& path) {
     return PathUtil::lower_ext(path) == "bin";
 }
 
+// orderflow loader 同时支持历史 bin 定长记录和 CSV 表头解析；单文件失败会让整体返回 false。
 template <typename RecordT, typename ParseFn, typename FillFn, typename KeyFn>
 bool append_orderflow_files(const std::vector<std::string>& files,
                             const char* tag,
@@ -161,7 +163,7 @@ bool append_transaction_events(const std::vector<std::string>& files,
         seq);
 }
 
-}
+} // namespace
 
 bool build_replay_event_stream(const std::vector<XtRawTick>& ticks,
                                const std::vector<std::string>& order_queue_files,
@@ -172,6 +174,7 @@ bool build_replay_event_stream(const std::vector<XtRawTick>& ticks,
                            "请确认数据格式正确后再用于生产回测。");
     out.clear();
 
+    // seq 在 append 阶段分配，stable_sort 后仍可恢复同 key 的原始读取顺序。
     uint64_t seq = 0;
     append_tick_events(ticks, out, seq);
     const bool order_detail_ok = append_order_detail_events(order_detail_files, out, seq);
@@ -179,6 +182,7 @@ bool build_replay_event_stream(const std::vector<XtRawTick>& ticks,
     const bool order_queue_ok  = append_order_queue_events(order_queue_files, out, seq);
     const bool orderflow_files_ok = order_detail_ok && transaction_ok && order_queue_ok;
 
+    // 统一按 key 排序；同 key 先看事件优先级，再按 seq 保持稳定顺序。
     std::stable_sort(out.begin(), out.end(), [](const XtReplayEvent& a, const XtReplayEvent& b) {
         if (a.key != b.key) return a.key < b.key;
         int pa = replay_event_priority(a.type);

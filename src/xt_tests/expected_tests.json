@@ -1,0 +1,1447 @@
+[
+  {
+    "name": "CtaGatewayContract.AutoOffsetResolvedToOpenBeforeFanout",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.CloseFirstDefersOnOppositeOpenPending",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.CloseFirstRewritesOpenIntoCloseSlicesPlusRemainder",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.FuturesMarginFrozenOnSubmitReleasedOnFill",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.MarketOrderWithoutAnyMarketPriceIsRejected",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.OpenAllowedDefaultSingleSlicePassthrough",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.RejectUpdateLocalCbUsMatchesDrainEncoding",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.RejectedOrderEmitsSubmitThenTerminal",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.RiskRejectErasesSidecar",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.SameTickSecondCloseSeesOutstandingCloseQty",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "CtaGatewayContract.SubmitRegistersSidInBookForOpenOrderFilter",
+    "source": "src/xt_tests/backtest/CtaGatewayContractTest.cpp",
+    "sha256": "8ef90f28208b697bb65a453ead353f2a46ba59fb2776a4c74d31b48a7b1f7f81"
+  },
+  {
+    "name": "SchemaV1.ConstantsMatchProtocol",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "SelArtifactsFixture.Adv20SumDoesNotOverflowAtCanonicalVolumeCeiling",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.AffordabilityCapPreventsNegativeCash",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.AllowShortFalseAccepted",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.AllowShortTrueRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.CarryDroppedAfterMaxDays",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.CarryLifecycleCountersAreConserved",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.CarryMaxDaysZeroDoesNotCrossDay",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.CarryRecomputesAgainstLivePositionAcrossCorporateAction",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.CarryResubmitsNextDayWithoutDoubleCounting",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.DailyPositionsSumMatchesDailyEquity",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.DecisionRowsKeepCodeOrderAcrossEarlyExits",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.FailFastRunLeavesNoPartialArtifacts",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.FillCostsBreakdownMatchesTradesFee",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.FloorProjectionLeavesResidualCashUninvested",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.InvalidIntegerProjectionRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.InvalidTraceModeRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.LargestRemainderGivesLotToBiggestRemainderWithinCash",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.MalformedVolumeCellFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.MinLotZeroTargetIsVisibleInSummary",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NegativeTargetWeightRejected",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NewFireDropsCarryForCodesAbsentFromDecisionSet",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NewFireSupersedesOutstandingCarry",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NoAffordabilityCapWhenCashSuffices",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NoPriceDecisionDoesNotSupersedeCarry",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.NoVolumeNoExecutionSectionInSummary",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.OutOfRangeParticipationRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ParticipationCapAppliesToSellLegs",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ParticipationCapLimitsDailyFillToVolumeShare",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ParticipationQuantizingToZeroRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ProjectionContractHoldsWhenMinLotIsOne",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ProjectionCountsOnlySellableProceedsAsCash",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ProjectionPriceGapFallsBackToAffordabilityCap",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ProjectionSellCapBelowOneLotYieldsZeroProceeds",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.SameConfigRunsFromAnyCwd",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.ScheduleFiresSeparatesFiredFromNoWeights",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.SellDeferredWhenParticipationCapLeavesFeeUnaffordable",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.StaleCarryFromEarlierSameDayFireIsNotCreated",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.T1TodayQuantityRollsAtSessionBegin",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.TargetWeightsRecordsUnacceptedSubmit",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.TraceModeFullEmitsCompleteSelChain",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.TraceModeOffProducesNoEventStream",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.VolumeColumnDoesNotPerturbPricing",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelArtifactsFixture.VolumeUsdHeaderIsNotTreatedAsShareVolume",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelCaBadRowFixture.DelistRowWithValuesFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.DuplicateCodeExDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.HeaderOnlyFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.ImpossibleMonthDayInPayDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.MissingFileFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.NonExistentCalendarDayFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.NonNumericRateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.PayBeforeExDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.RecordAfterExDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.ShortDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.ShortRowFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaBadRowFixture.ShuffledHeaderFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.AcceptedSubmitKeepsNoErrorRejectCode",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.AllowShortDefaultsToFalseWithoutRiskSection",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.BonusSharesDefaultToNextTradingDayListing",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.BonusSharesListedLaterStayInReceivable",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.BonusTransferPreservesRealizedPnlAttribution",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.CashDividendAtOrAbovePrevCloseFailsFast",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ConversionLatchRejectsLaterSameDayBonusLeg",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ConversionOddLotCostDoesNotPolluteExistingPosition",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ConversionRowShapeIsRejected",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DailyPositionsKeepsSingleSchemaWithoutT1",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DeferredBonusWindowSellRealizesOnUnamortizedAvg",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistEventAfterWindowIsIgnored",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistFeeCappedAtProceeds",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistLiquidatesPendingBonusSharesToo",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistLiquidationConservesCashAndRebasesToTradingDate",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistProceedsDoNotFundSameDayDecisions",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DelistedCodeRejectsLaterBuyAndCountsPriceReappearance",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DividendQtyLockedAtRecordDate",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.DividendTaxIsTheOnlyEquityDrop",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ExDayEquityContinuousAcrossReceivableWindow",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ExDayRefPriceNotWrittenBackWhenCloseRowMissing",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.FullyCappedRightsEmitsCashCappedRow",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.InFlightSharesCountInSizingPreQty",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.NoCorporateActionConfigKeepsBaselineOutputs",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.OutOfRangeRatesRejectedAtParse",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.OverlongTracePayloadIsTruncatedNotOverread",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.PortfolioEquityConsistentAcrossArtifacts",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ReceivableNotSpendableInExToPayWindow",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RecordBeforeWindowCountsSeparatelyFromAbsent",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RecordEqualsExDateAccruesOnExOpenQtyWithCount",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RejectCodeCarriesRealRiskReason",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RelativeDatalakeRootResolvedFromConfigDir",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ReportDirFileSetIsWhitelistedAndDeterministic",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ReportWriterOpenFailureYieldsRc9",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsBelowOneShareEntitlementIsANoOp",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsContentionCountsCashStarvedSecondLeg",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsForfeitBooksExRightsLoss",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsIssueSkippedWhenAllowed",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsRowRequiresRatioAndPriceTogether",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsSubscriptionCappedByAvailableCash",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RightsSubscriptionConservesCashAndEquity",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.RiskRejectedLegsEmitRejectEventsNotOrderSubmit",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SameCodeRebasedToSameDateAppliesInRawExDateOrder",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SameDayCorporateActionPrecedesSizing",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SecurityConversionCashesOutOddSharesAndLatchesOldCode",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SecurityConversionMigratesCostBasis",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SellLegClampedToDeliverableWhenSharesInFlight",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SellRejectedWhenFeeExceedsCashPlusProceeds",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SubCentFeeRoundingDoesNotOverdrawCash",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SummaryAbsentLagCountsStayZeroWhenLagDatesGiven",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.SummaryDisclosesHaircutAndAbsentLagDateCounts",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.TraceBridgesFireSeqAndSeparatesRejects",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.WindowEndExDateKeepsSharesPendingBeyondWindow",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ZeroOptionalDateStillMeansAbsent",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCaFixture.ZeroPositionConversionStillEmitsTargetCode",
+    "source": "src/xt_tests/backtest/XtSelCorporateActionTest.cpp",
+    "sha256": "279ce6f816930ec70d030ad20f66326285c686dec6252b1d30e1d2bcaad0d491"
+  },
+  {
+    "name": "SelCalendarFallbackTest.EmptyCsvLoadsParquetCalendar",
+    "source": "src/xt_tests/data/SelCalendarFallbackTest.cpp",
+    "sha256": "ecbc811663de2254602ffde4c4483fded17a15d48d0c112d1029d1bc1a60835d"
+  },
+  {
+    "name": "SelConsumedManifest.CleanCalendarNoBadRows",
+    "source": "src/xt_tests/backtest/SelConsumedManifestTest.cpp",
+    "sha256": "c02c8be4f3741fe16735cfcb1dbbece9beea11dd08d1fee6e6f6e7498e5ddf41"
+  },
+  {
+    "name": "SelConsumedManifest.LoaderCountsRawFilteredAndBadRows",
+    "source": "src/xt_tests/backtest/SelConsumedManifestTest.cpp",
+    "sha256": "c02c8be4f3741fe16735cfcb1dbbece9beea11dd08d1fee6e6f6e7498e5ddf41"
+  },
+  {
+    "name": "SelDrainInvariantE2E.AllGatewayReportsConsumedAtExit",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.EmptySoWithoutExternalFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.EmptyStrategiesGuardRejects",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.ExternalStubMatchesPluginTradesByteIdentical",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.ExternalStubRunsWithEmptySo",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.ExternalTakesPrecedenceOverNonEmptySo",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelExternalSeamE2E.ExternalWithMultiStrategyRejects",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelMarkTimingE2E.FirstDaySizingUsesWarmupT1CloseNotTClose",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelMarkTimingE2E.FirstDayWithoutT1FailsFastWhenStrategySizes",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelMarkTimingE2E.FirstDayWithoutT1PassesWhenNoSizingRequested",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelMarkTimingE2E.HeldSymbolWithoutTCloseCarriesStaleMark",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelMarkTimingE2E.TCloseMarkRefreshValuesFillsEodAndFinal",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelTaskScheduler.AddTask_ReturnsIncrementalId",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.Daily_TriggersOncePerDay",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.FireCallbackPassesEpochFireTime",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.FireCallback_PassesFireTime",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.Holiday_SkipsTrigger",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.MonthlyHolidayRollsToNextTradingDateOnce",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.Monthly_TriggersOnDayOfMonth",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.NonStrict_FiresAfterTime",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.StrictTime_BlocksDelayed",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTaskScheduler.WeeklyHolidayRollsAcrossWeekend",
+    "source": "src/xt_tests/engine/sel/SelTaskSchedulerTest.cpp",
+    "sha256": "ea1d5f6ea81a1127014f476bb71644e2abc5ca8d998f8f6298c5419ae19b44bb"
+  },
+  {
+    "name": "SelTradabilityCalendar.CodeMatchIsExactNoNormalization",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.DuplicateDateCodeLastRowWins",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.FindMissingDateOrCodeReturnsNull",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadFailsOnEmptyFile",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadFailsOnHeaderOnlyFile",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadFailsOnMissingFile",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadFailsWhenAllDataRowsInvalid",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadsWithHeaderAndFindsFlags",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.LoadsWithoutHeaderFirstDataRowKept",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.SkipsRowWithExtraColumns",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.SkipsRowWithMissingColumns",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.SkipsRowWithNonBinaryFlagValue",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.SkipsRowWithNonNumericDate",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.SkipsRowWithOverlongDate",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCalendar.ToleratesCrlfLineEndings",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.BothLimitFlagsRejectPerSide",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.DefaultFlagsIsFullyTradable",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.LimitDownRejectsSellOnly",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.LimitUpRejectsBuyOnly",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.NullFlagsIsFullyTradable",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.SuspendedRejectsBothSides",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityCheck.SuspendedTakesPriorityOverLimitFlags",
+    "source": "src/xt_tests/backtest/XtSelTradabilityTest.cpp",
+    "sha256": "473b9b67af605b0800685231c12334c5e0110677cd78538cc7b2def0867557d7"
+  },
+  {
+    "name": "SelTradabilityE2E.ControlGroupWithoutTradabilityIsByteStable",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelTradabilityE2E.GateBlocksSuspendedAndLimitLegs",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelTradabilityE2E.MissingTradabilityCsvFailsFastWithoutReports",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelTradabilityE2E.PerSymbolSlippageOverridesGlobalInFullChain",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.AsOfHeaderFormAcceptedAndValueIgnored",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.AsOfHeaderRequiresFourColumnDataRows",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.BadFirstLineIsNotSwallowedAsHeader",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.CalendarCheckCoversMonthAndLeapYear",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.EightDigitDateAccepted",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.ExactSlotWinsOverWildcardFallback",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.ExtraColumnRejectedNotSilentlyIgnored",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.NoWarnWhenNormalizeDisabled",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.NonCalendarDateRejected",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.NonClockEffectiveTimeRejected",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.NormalizeDriftWarnTriggersOnSubUnityGross",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.NormalizeNoWarnWhenGrossIsOne",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.OversizedDateDoesNotWrapThroughRangeCheck",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.ReadIoErrorIsNotTreatedAsEof",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.SameDayTwoFiresPickTheirOwnSlot",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.SameSymbolAllowedAcrossSlotsButNotWithinOne",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.TaskUidSelectsItsOwnSlot",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.UnknownOptionalColumnRejected",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.WhitespaceOnlyLineSkipped",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsCsvStrategy.WrongHeaderNamesRejected",
+    "source": "src/xt_tests/strategy/SelWeightsCsvStrategyTest.cpp",
+    "sha256": "a2740ea7b45a2c02e59de5a936d8fac3e30ea51eb06516e77d8f6b63a823db8a"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.BadDateFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.BadNumberFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.CleanWeightsRunsToCompletion",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.DuplicateKeyFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.EmptySymbolFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.HeaderOnlyFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.MissingFileFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.RunnerPicksWeightSlotByConfiguredTaskTime",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "SelWeightsFailClosedFixture.ShortRowFailsFast",
+    "source": "src/xt_tests/backtest/XtSelBtArtifactsTest.cpp",
+    "sha256": "c5f3a4233e82140e98ea5c41c23d4c9ba1d85f2f0135e3496e7f1c419f6367b2"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.AdvanceClockReleasesEarliestDueOnly",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.FillEmitsFilledOrderUpdate",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.FillLatencyDelaysVisibility",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.FilledUpdateSharesFillLatency",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.NightCrossMidnightFillMaturesOnEventAxis",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.SameDueBatchPreservesEnqueueOrder",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Causality.ZeroLatencyDefaultBackwardCompat",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineCausalityTest.cpp",
+    "sha256": "38c17d2df3f648d3b1ab8095c1a87b1325178e7ebad525d614f7fc91d5c203ea"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.DrainSemanticsCorrectness",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.SessionEndCanceledUpdateNotDelayedPastFlush",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.SessionEndDrainsInFlightDelayedFillWithinSession",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.SessionEndFlushProducesCanceledUpdates",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.SessionEndMarketFillNotLostUnderFillLatency",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.SessionEndMarketOrderNoLastPriceEmitsCanceled",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtCtaMatchEngine_Isolation.ZeroDependencyLifecycle",
+    "source": "src/xt_tests/cta/XtCtaMatchEngineIsolationTest.cpp",
+    "sha256": "99b213e74ec5f4c5357859262947c7403ed8e89deaa16f44973203e0482681f7"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_BinarySearchBoundaries",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_ExchangeFilter",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_Int32Date_BoolFlag",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_Int64Date_Int8Flag_WideTypeCoercion",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_MissingFileFails",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeReaderTest.Calendar_MissingRequiredColumnFails",
+    "source": "src/xt_tests/data/XtDatalakeReaderTest.cpp",
+    "sha256": "253ca2aeba9e12384396da5f8572ddc89f5e0d04340b485822899af18310074f"
+  },
+  {
+    "name": "XtDatalakeRootTest.ResolvePath_Calendar_SingleFile",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ResolvePath_DailyBasic_PartitionByMonth",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ResolvePath_PriceBarHfq",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ValidateSchema_AllowSkew_NoThrow",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ValidateSchema_StrictFails_OnMissingColumn",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ValidateSchema_StrictFails_OnVersionMismatch",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ValidateSchema_StrictPasses_WhenMatch",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtDatalakeRootTest.ValidateSchema_StrictThrows_OnMissingFile",
+    "source": "src/xt_tests/data/XtDatalakeRootTest.cpp",
+    "sha256": "bbbb8bc42f369b1647414d922acab4817f5ccdf9ce236d0d345111bce81bac92"
+  },
+  {
+    "name": "XtSelBacktestE2E.FullChain_StrategyContextWeightsForward",
+    "source": "src/xt_tests/engine/sel/XtSelBacktestE2ETest.cpp",
+    "sha256": "4e8628bd8fc52999b467b42412bc1f04d633d3a3538ec8e478a1f7d32a2b160f"
+  },
+  {
+    "name": "XtSelBacktestE2E.FullChain_StrategyToHandlePosChange",
+    "source": "src/xt_tests/engine/sel/XtSelBacktestE2ETest.cpp",
+    "sha256": "4e8628bd8fc52999b467b42412bc1f04d633d3a3538ec8e478a1f7d32a2b160f"
+  },
+  {
+    "name": "XtSelBacktestE2E.MainLoop_DailyDateRange",
+    "source": "src/xt_tests/engine/sel/XtSelBacktestE2ETest.cpp",
+    "sha256": "4e8628bd8fc52999b467b42412bc1f04d633d3a3538ec8e478a1f7d32a2b160f"
+  },
+  {
+    "name": "XtSelEngine.AddContextResolvesSidWhenRegistryFrozen",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.AddTask_ForwardsToScheduler",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.ConstructEmpty",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.OnMinuteTick_NoTasks_NoCallback",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.OnScheduleFireRoutesNamedStrategyId",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.OnTargetWeights_InvokesHandlePosChange",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.SetStrategyControlEnabledTargetsNamedContextOnly",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.SparseWeightsGuardCatchesSameCountDifferentSet",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.SparseWeightsGuardCountsUncoveredHeldSymbols",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.SparseWeightsGuardDetectsMissingHeldRegardlessOfCount",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.SparseWeightsGuardInertWithoutResolver",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.UnregisteredSidTargetWeightsDropped",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine.UpdateParamsRefreshesContextsAndEnabledGate",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngineSink.CrossSidSameCodePendingCounted",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.CurrentFireSeqResetsOutsideDispatch",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.DecisionEmitOrderIsCodeOrderRegardlessOfEarlyExits",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.EveryPlanningEarlyExitIsVisible",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.FireRecordEmittedOnEquityNonPositiveSkip",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.FireSeqIsMonotonicAcrossCalls",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.ProjectionContractViolationRestoresBaselinePerEntry",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.ProjectionNegativeAndThrowingWritebacksAreRejected",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SameSlotDuplicateTargetDoesNotDoubleUp",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SameSlotLowerTargetWinsWithDirectionFlip",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SameSlotZeroTargetCancelsEarlierFire",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SellBucketFlipToBuyDeferredAcrossFlushPhases",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SellBucketFlipToBuyDeferredToBuyPhase",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SingleFireKeepsSellFirstAndCodeOrder",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.SinkInjectionDoesNotChangeDispatchSequence",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.StalePendingDroppedAtSessionBegin",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.TwoFiresInSameSlotBothDispatched",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngineSink.TwoFiresInSameSlotBothFlushed",
+    "source": "src/xt_tests/engine/sel/XtSelEngineSinkTest.cpp",
+    "sha256": "e68fae8995188e37cabf4fd05af48de6bf63a8de7271cbd71ec4ae188860093d"
+  },
+  {
+    "name": "XtSelEngine_InitFailure.MarkInitFailedDisablesCtxFailClosed",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine_ThreadGuard.BoundOffThreadDropsAllGuardedEntries",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine_ThreadGuard.BoundOffThreadTargetWeightsDropped",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelEngine_ThreadGuard.PreBindCallsPassThroughUncounted",
+    "source": "src/xt_tests/engine/sel/XtSelEngineTest.cpp",
+    "sha256": "b0fbd72364eaa503d47258f006bc022e0ff52188623991530458e4c43df8e670"
+  },
+  {
+    "name": "XtSelOffsetInference.BuyWithFlatPos_Opens",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.BuyWithLongPos_Opens",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.BuyWithShortPos_Closes",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.M1_5_RegressionTrace",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.SellWithFlatPos_OpensShort",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.SellWithLongPos_ClosesLong",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.SellWithShortPos_OpensMoreShort",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelOffsetInference.ZeroPos_BothDirectionsOpen",
+    "source": "src/xt_tests/engine/sel/XtSelOffsetInferenceTest.cpp",
+    "sha256": "cc29b2b965ef0ef9d6d59e8b0bffc0e427ff71b66d23356cea7c687296cde1ee"
+  },
+  {
+    "name": "XtSelRunnerConfig.AcceptsConfigEqualsFlag",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.AcceptsEmptyStrategySoForExternalInjection",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.AcceptsLongConfigFlag",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.AcceptsShortConfigFlag",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsEmptyStrategyIdEvenWithSo",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsMissingTaskPeriod",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsMissingTaskSection",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsMisspelledTaskPeriodKey",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsUnknownCliFlagBeforePositionalConfig",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.RejectsUnknownTaskPeriod",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.SchemaAcceptsWtParityForeignSections",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.SchemaRejectsUnknownSelectorKey",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  },
+  {
+    "name": "XtSelRunnerConfig.SchemaRejectsUnknownTopLevelKey",
+    "source": "src/xt_tests/backtest/XtSelBacktestRunnerTest.cpp",
+    "sha256": "79bc85b99ceebbd4294e746941d97fd86f8f2ca30ff0de2a4c36655ff6e3c5e7"
+  }
+]

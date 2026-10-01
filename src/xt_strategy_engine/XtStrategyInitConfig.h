@@ -16,7 +16,9 @@
 /// 用 get_* 读取，key 缺失或解析失败时返回调用方传入的默认值。
 /// 对象不做同步；跨线程共享时调用方保证只读发布或外部同步。
 struct XtStrategyInitConfig {
-    std::unordered_map<std::string, std::string> values;
+    std::unordered_map<std::string, std::string> values;  ///< 展开后的原始 key-value 参数表。
+
+    // ── 单值查询（scalar query） ────────────────────────────────────────
 
     bool has(const std::string& key) const {
         return values.find(key) != values.end();
@@ -27,6 +29,11 @@ struct XtStrategyInitConfig {
         return it == values.end() ? def : it->second;
     }
 
+    /// @note 全串严格解析（尾随非数字字符如 "10x" 返回 def），与
+    ///       IStrategyContext::get_param_int 的严格性对齐。返回域差异：
+    ///       本方法返回 int，超出 int32 范围的值按非法返回 def；
+    ///       get_param_int 返回 int64 无此钳制——超大参数值两条路径会分叉，
+    ///       参数取值应保持在 int32 域内。
     int get_int(const std::string& key, int def) const {
         const auto it = values.find(key);
         if (it == values.end()) return def;
@@ -44,6 +51,7 @@ struct XtStrategyInitConfig {
         }
     }
 
+    /// @note 全串严格解析，同 get_int。
     double get_double(const std::string& key, double def) const {
         const auto it = values.find(key);
         if (it == values.end()) return def;
@@ -69,6 +77,12 @@ struct XtStrategyInitConfig {
         return def;
     }
 
+    // ── 列表/结构化查询（list & structured query） ────────────────────────
+
+    /// @brief 按 `<prefix>.<index>` 提取有序 double 列表。
+    ///
+    /// index 必须是非负整数；缺失、非法或无法解析为 double 的条目会被跳过。
+    /// 返回值按 index 升序排列，index 不要求连续。
     std::vector<double> get_double_list(const std::string& key_prefix) const {
         std::map<int, double> ordered;
         const std::string prefix = key_prefix + ".";
@@ -80,7 +94,7 @@ struct XtStrategyInitConfig {
             const long idx = std::strtol(index_str.c_str(), &end, 10);
             if (!end || *end != '\0' || idx < 0) continue;
             try {
-
+                // 全串严格（同 scalar getter）：尾随垃圾按"无法解析"跳过该条目。
                 size_t parsed = 0;
                 const double v = std::stod(kv.second, &parsed);
                 if (parsed != kv.second.size()) continue;
@@ -94,6 +108,10 @@ struct XtStrategyInitConfig {
         return out;
     }
 
+    /// @brief 按 `<prefix>.<index>.start/end` 提取区间段列表。
+    ///
+    /// 仅返回同时具备正数 start/end 的 section；非法 index、未知字段和解析失败字段都会被丢弃。
+    /// 返回值按 index 升序排列，调用方负责解释 start/end 的业务单位。
     std::vector<std::pair<int, int>> get_sections(const std::string& key_prefix) const {
         struct SectionDraft {
             int start = -1;

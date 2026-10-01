@@ -14,6 +14,8 @@ using XtParseUtil::split_csv_trim_sv;
 
 namespace {
 
+// "bidprice7" → prefix "bidprice" + 纯数字档位 7；非纯数字后缀或超出
+// MAX_DEPTH 返回 0（L1 由调用方显式分支处理，本函数只服务 L2+）。
 int depth_alias_level(const std::string& norm, const char* prefix) {
     const std::size_t plen = std::strlen(prefix);
     if (norm.size() <= plen || norm.compare(0, plen, prefix) != 0) return 0;
@@ -27,7 +29,7 @@ int depth_alias_level(const std::string& norm, const char* prefix) {
     return level;
 }
 
-}
+}  // namespace
 
 XtTickVolumeMode parse_tick_volume_mode(const std::string& mode) {
     const std::string v = XtStringUtil::lower(XtStringUtil::trim(mode));
@@ -36,13 +38,14 @@ XtTickVolumeMode parse_tick_volume_mode(const std::string& mode) {
 }
 
 bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
-
+    // 复用 split buffer；字段视图只在本次调用期间有效。
     thread_local std::vector<std::string_view> cols;
     split_csv_trim_sv(line, cols);
 
     for (int idx = 0; idx < static_cast<int>(cols.size()); ++idx) {
         const std::string norm = XtParseUtil::normalize_col(cols[idx]);
 
+        // 表头别名映射到统一列索引。
         if      (norm == "instrumentid")   spec.idx_instrument     = idx;
         else if (norm == "code")           spec.idx_instrument     = idx;
         else if (norm == "tradingday")     spec.idx_trading_day    = idx;
@@ -65,7 +68,7 @@ bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
         else if (norm == "bidvolume1") { spec.idx_bid_qty1   = idx; spec.idx_bid_qty_n[0]   = idx; }
         else if (norm == "askprice1")  { spec.idx_ask_price1 = idx; spec.idx_ask_price_n[0] = idx; }
         else if (norm == "askvolume1") { spec.idx_ask_qty1   = idx; spec.idx_ask_qty_n[0]   = idx; }
-
+        // L2..L20 别名走统一档位解析（"bidprice2".."askvolume20"）。
         else if (int lv = depth_alias_level(norm, "bidprice"); lv >= 2)
             spec.idx_bid_price_n[lv - 1] = idx;
         else if (int lv = depth_alias_level(norm, "askprice"); lv >= 2)
@@ -75,7 +78,8 @@ bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
         else if (int lv = depth_alias_level(norm, "askvolume"); lv >= 2)
             spec.idx_ask_qty_n[lv - 1] = idx;
     }
-
+    // header 判定：必须命中至少一个已知列别名。旧判据「任意字母即 header」
+    // 会把 headerless 首行（"ag2606,..."）吞成空 spec，整文件静默解析为空。
     bool alias_hit =
         spec.idx_instrument >= 0 || spec.idx_trading_day >= 0 ||
         spec.idx_update_time >= 0 || spec.idx_update_ms >= 0 ||
@@ -100,6 +104,7 @@ bool build_tick_spec_from_header(const std::string& line, XtTickCsvSpec& spec) {
             spec.detected_depth = i + 1;
     }
 
+    // simple 格式不提供时间；调用方会得到 key=0。
     if (spec.idx_instrument >= 0 && spec.idx_last_price >= 0 &&
         spec.idx_trading_day < 0 && spec.idx_update_time < 0) {
         spec.simple = true;
@@ -115,13 +120,13 @@ bool parse_tick_csv_line(const std::string& line,
                          double qty_base,
                          XtTickVolumeMode vol_mode,
                          TickParseDrop* out_drop) {
-
+    // out_drop 观测参数：默认 None，各 false 分支覆写为具体原因；成功保持 None。
     if (out_drop) *out_drop = TickParseDrop::None;
     const auto drop = [&](TickParseDrop reason) {
         if (out_drop) *out_drop = reason;
         return false;
     };
-
+    // 复用 split buffer；字段视图引用 line，调用返回后立即失效。
     thread_local std::vector<std::string_view> cols;
     split_csv_trim_sv(line, cols);
     if (cols.empty()) return drop(TickParseDrop::BadRow);
@@ -135,7 +140,7 @@ bool parse_tick_csv_line(const std::string& line,
         const std::string_view code  = col(0);
         const std::string_view price = col(1);
         if (code.empty() || price.empty()) return drop(TickParseDrop::BadRow);
-
+        // C++17 unordered_set 无异构查找；典型合约代码走 SSO 临时 string。
         if (!symbol_filter.empty() && !symbol_filter.count(std::string(code)))
             return drop(TickParseDrop::SymbolMiss);
 
@@ -161,10 +166,12 @@ bool parse_tick_csv_line(const std::string& line,
     if (!symbol_filter.empty() && !symbol_filter.count(std::string(code)))
         return drop(TickParseDrop::SymbolMiss);
 
+    // last_price 是标准格式唯一强制字段；提交点前失败不修改 out。
     double last_price = 0.0;
     if (!XtParseUtil::parse_double(col(spec.idx_last_price), last_price))
         return drop(TickParseDrop::BadRow);
 
+    // 提交点：此后不再 early return，out 会被完整重建。
     std::memset(&out, 0, sizeof(out));
     const std::size_t nc = std::min(code.size(), sizeof(out.code) - 1);
     std::memcpy(out.code, code.data(), nc);
@@ -187,6 +194,7 @@ bool parse_tick_csv_line(const std::string& line,
     }
     out.action_time = action_time;
 
+    // CTP TradingDay 夜盘前段归属下一交易日；action_date 反推为实际自然日。
     if (trading_date != 0) {
         const uint32_t hhmm = action_time / 100000;
         if (hhmm >= 1900) {
@@ -207,6 +215,9 @@ bool parse_tick_csv_line(const std::string& line,
     out.total_turnover = turnover;
     out.open_interest  = oi;
 
+    // 涨跌停价：列缺失、解析失败或哨兵值保持 0（消费侧 0 = 无限制 fail-open）。
+    // 清洗口径对齐 live CTP（ctp_util::normalize_price：非有限/非正/>1e20 归 0），
+    // 本地实现不引 xt_live 头；DBL_MAX 类哨兵直通会在 to_fp 越界（UB）。
     const auto clean_limit = [](double v) {
         return (std::isfinite(v) && v > 0.0 && v <= 1e20) ? v : 0.0;
     };
@@ -216,6 +227,7 @@ bool parse_tick_csv_line(const std::string& line,
     out.upper_limit = clean_limit(upper);
     out.lower_limit = clean_limit(lower);
 
+    // L1 缺价时回退 last_price，缺量时回退 qty_base。
     {
         double bp = 0.0, ap = 0.0, bq = 0.0, aq = 0.0;
         if (spec.idx_bid_price_n[0] >= 0) XtParseUtil::parse_double(col(spec.idx_bid_price_n[0]), bp);
@@ -228,6 +240,7 @@ bool parse_tick_csv_line(const std::string& line,
         out.ask_qty[0]    = (aq > 0.0) ? aq : qty_base;
     }
 
+    // L2-L20 缺价时继承上一档价格；缺量保持 0。
     for (int i = 1; i < XtTickCsvSpec::MAX_DEPTH; ++i) {
         double bp = 0.0, ap = 0.0, bq = 0.0, aq = 0.0;
         if (spec.idx_bid_price_n[i] >= 0) XtParseUtil::parse_double(col(spec.idx_bid_price_n[i]), bp);
@@ -240,6 +253,8 @@ bool parse_tick_csv_line(const std::string& line,
         out.ask_qty[i]    = aq;
     }
 
+    // XtRawTick 深度超过 CSV 可识别档数时，延续末档价格并清零数量
+    //（当前 MAX_DEPTH == XtRawTick::DEPTH，本循环为空转守卫）。
     for (int i = XtTickCsvSpec::MAX_DEPTH; i < XtRawTick::DEPTH; ++i) {
         out.bid_prices[i] = out.bid_prices[XtTickCsvSpec::MAX_DEPTH - 1];
         out.ask_prices[i] = out.ask_prices[XtTickCsvSpec::MAX_DEPTH - 1];

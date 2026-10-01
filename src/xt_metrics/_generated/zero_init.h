@@ -21,7 +21,7 @@ enum class MetricType { Gauge, Counter, Histogram };
 struct BucketFamily {
     std::string_view name;
     std::string_view version;
-    std::string_view hash;
+    std::string_view hash;       // sha256[:16] of canonical_json
     std::array<double, 16> buckets;
     std::size_t bucket_count;
 };
@@ -40,7 +40,7 @@ struct ZeroInitMetric {
     std::string_view help;
     std::array<std::string_view, 8> labels;
     std::size_t label_count;
-    std::string_view buckets_ref;
+    std::string_view buckets_ref;  // empty for non-histogram
 };
 
 inline constexpr std::array<ZeroInitMetric, 5> kZeroInitMetrics = {{
@@ -51,4 +51,4 @@ inline constexpr std::array<ZeroInitMetric, 5> kZeroInitMetrics = {{
     ZeroInitMetric{"xt_submit_to_fill_us", MetricType::Histogram, "Submit→Fill latency distribution (μs); query via histogram_quantile()", {{"strategy", "book", "symbol", "", "", "", "", ""}}, 3, "order_us"},
 }};
 
-}
+}  // namespace xt::metrics::contract

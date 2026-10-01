@@ -121,4 +121,4 @@ inline void emit_wire_reject_trace(const TransportSubmitReq& req,
     });
 }
 
-}
+}  // namespace binance_u

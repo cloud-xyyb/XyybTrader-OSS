@@ -15,6 +15,7 @@
 
 namespace {
 
+/// @brief 把具体 truth 实现装进两个 port 视图（编译期上行转换，无 dynamic_cast）。
 template <typename T>
 RunnerAccountTruth make_ports(std::unique_ptr<T> impl) {
     RunnerAccountTruth out;
@@ -23,7 +24,7 @@ RunnerAccountTruth make_ports(std::unique_ptr<T> impl) {
     return out;
 }
 
-}
+}  // namespace
 
 RunnerAccountTruth make_runner_account_truth_source(
     const xt_account::AccountStateStore& account_store,
@@ -49,7 +50,7 @@ RunnerAccountTruth make_runner_account_truth_source(
             account_store, signals, trading_day_policy, fill_store_per_symbol);
     };
     if (is_binance) {
-
+        // income provider 由 caller 注入（binance REST 细节留在 gateway 侧）。
         return make_ports(std::make_unique<BinanceAccountTruthSource>(
             std::move(provider),
             std::move(income_provider)));

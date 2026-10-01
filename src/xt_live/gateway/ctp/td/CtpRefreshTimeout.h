@@ -13,10 +13,18 @@ namespace ctp_refresh {
 
 /// @brief 一次 refresh 查询超时的自愈决策结果。
 struct RefreshTimeoutDecision {
-    bool reissue     = false;
-    bool raise_wedge = false;
+    bool reissue     = false;  ///< 解开 stuck inflight 后是否重发 query（page-then-continue 恒重发）
+    bool raise_wedge = false;  ///< 连续超时轮数达阈值 → 置 refresh wedged 观测状态
 };
 
+/// @brief 计算一次 refresh 查询超时的自愈决策。
+///
+/// @param consecutive_timeouts 自上次成功回包以来的连续超时次数（本次 ≥ 1）。
+/// @param wedge_rounds         连续超时达此值置 wedged；<=0 表示恒不置（仅重发）。
+/// @return reissue 恒 true（不放弃重试）；raise_wedge = (wedge_rounds > 0 且达阈值)。
+///
+/// @note 有意保持无状态：wedge 仅作观测告警，不改变重发行为（超阈仍继续重试，
+///       与 recovery re-arm 的 page-then-continue 语义一致）。
 inline RefreshTimeoutDecision refresh_timeout_decision(int consecutive_timeouts, int wedge_rounds) {
     RefreshTimeoutDecision d;
     d.reissue     = true;
@@ -24,4 +32,4 @@ inline RefreshTimeoutDecision refresh_timeout_decision(int consecutive_timeouts,
     return d;
 }
 
-}
+}  // namespace ctp_refresh

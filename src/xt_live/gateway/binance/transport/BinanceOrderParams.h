@@ -18,6 +18,8 @@
 
 namespace binance_u {
 
+/// @brief 将内部 time-in-force + 执行标志映射为 Binance LIMIT 单 timeInForce 串。
+/// @note PostOnly 优先映射 GTX；其余 GTC/IOC/FOK 直译，未知 tif 兜底 GTC。
 inline const char* tif_to_binance(XtTimeInForce tif, ExecFlags flags) {
     if (has_flag(flags, ExecFlag::PostOnly)) return "GTX";
     switch (tif) {
@@ -28,17 +30,18 @@ inline const char* tif_to_binance(XtTimeInForce tif, ExecFlags flags) {
     return "GTC";
 }
 
+/// @brief 是否携带 reduceOnly：显式 ReduceOnly 标志或任意非 Open 平仓方向。
 inline bool binance_reduce_only(ExecFlags flags, XtOffset close_offset) {
     return has_flag(flags, ExecFlag::ReduceOnly) || close_offset != XtOffset::Open;
 }
 
 /// @brief INTENT_TRACE 用的 normalized wire 字段；与实际 params 由同一 builder 生成。
 struct BinanceSubmitWireValues {
-    int64_t     price_wire_fp = 0;
-    int64_t     qty_wire_fp = 0;
-    std::string tif_wire;
-    bool        reduce_only = false;
-    uint64_t    client_order_id_hash = 0;
+    int64_t     price_wire_fp = 0;     ///< snap_price_fp 后的 wire 价格。
+    int64_t     qty_wire_fp = 0;       ///< snap_qty_fp 后的 wire 数量。
+    std::string tif_wire;              ///< Binance `timeInForce`。
+    bool        reduce_only = false;   ///< 是否写入 reduceOnly=true。
+    uint64_t    client_order_id_hash = 0; ///< newClientOrderId 的 FNV-1a hash。
 };
 
 /// @brief Binance submit 公共参数与同源 normalized 值。
@@ -52,6 +55,7 @@ inline uint64_t binance_wire_hash(std::string_view s) noexcept {
     return xt_core::sync::fnv1a_bytes(s.data(), s.size());
 }
 
+/// @brief 生成 Binance 下单公共参数，并返回同源 snap 后 wire 值。
 inline BinanceSubmitOrderParams build_submit_order_params(const TransportSubmitReq& req) {
     BinanceSubmitOrderParams out;
     out.wire.price_wire_fp = snap_price_fp(req.price_fp, req.symbol);
@@ -74,4 +78,4 @@ inline BinanceSubmitOrderParams build_submit_order_params(const TransportSubmitR
     return out;
 }
 
-}
+}  // namespace binance_u

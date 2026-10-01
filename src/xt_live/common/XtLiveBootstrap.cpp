@@ -15,6 +15,8 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
     const XtLiveBootstrapPlan& bp = cfg.bootstrap;
     const XtLiveRuntimeStateCfg& rc = bp.runtime_state_cfg;
 
+    // 合约目录：静态品种信息 + margin override。catalog 必须先于 account_store 备好——
+    // 期货 realized/unrealized 经其 vol_scale 归一化，AccountStateStore 构造期强制非空。
     XtCommodityCatalog::Config catalog_cfg;
     catalog_cfg.map = rc.commodity_map;
     catalog_cfg.margin_overrides = rc.margin_by_symbol;
@@ -50,18 +52,19 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
     latency_tracker = std::make_unique<XtLiveLatencyTracker>(
         resolve_latency_cfg(param_domain, bp.latency_cfg));
 
+    // 录制器启动成功后发布到 process-global 指针，供 tap point 消费。
     if (bp.recording_cfg.enabled) {
         recorder = std::make_unique<XtLiveRecorder>(bp.recording_cfg);
         recorder->start();
         if (!recorder->enabled()) {
-
+            // start 内部因文件打开失败禁用了 recorder；不作为致命错误，仅 warn。
             XtLogger::warn_m("RT", "live recorder disabled: failed to open file_path={}",
                              bp.recording_cfg.file_path);
             recorder.reset();
         } else {
-
+            // event_store 必须在 set_global 前注入；之后由 recorder drain 线程写入。
             if (bp.event_store_cfg.enabled && !bp.event_store_cfg.root_path.empty()) {
-
+                // 启动时 rotate 旧 events/，避免 append-only store 混入上一轮 session。
                 try {
                     const std::filesystem::path events_root(bp.event_store_cfg.root_path);
                     if (std::filesystem::exists(events_root) &&
@@ -84,11 +87,11 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
                 XtLogger::info_m("RT", "live fbs event store enabled root={}",
                                  bp.event_store_cfg.root_path);
             }
-
-            int8_t vk = 0;
-            if (cfg.parsed.md_provider == "ctp") vk = 1;
-            else if (cfg.parsed.md_provider == "binance_u") vk = 4;
-            else if (cfg.parsed.md_provider == "xtp") vk = 5;
+            // venue_kind 用于非 MD 事件的 FBS SourceKind；MD_TICK 优先由 exchange_id 派生。
+            int8_t vk = 0;  // UNKNOWN: provider 缺失/非法时 fail-closed
+            if (cfg.parsed.md_provider == "ctp") vk = 1;             // LIVE_CTP
+            else if (cfg.parsed.md_provider == "binance_u") vk = 4;  // LIVE_BINANCE
+            else if (cfg.parsed.md_provider == "xtp") vk = 5;        // LIVE_XTP (A 股)
             recorder->set_venue_kind(vk);
 
             XtLiveRecorder::set_global(recorder.get());
@@ -98,8 +101,10 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
         }
     }
 
+    // post-trade self-match 检测器不依赖 config，始终创建。
     self_match_detector = std::make_unique<xt_risk::SelfMatchDetector>();
 
+    // Active risk monitor 始终构造，enabled=false 时 on_frame no-op。
     risk_monitor_state = std::make_unique<xt_risk::XtRiskMonitorState>();
     risk_monitor = std::make_unique<xt_risk::XtRiskMonitor>(
         bp.risk_monitor_cfg, risk_monitor_state.get());
@@ -109,14 +114,15 @@ bool XtLiveBootstrap::create(const XtLiveConfig& cfg, std::string& err) {
 }
 
 void XtLiveBootstrap::shutdown_recorder() noexcept {
-
+    // 先清空全局指针，阻止后续 tap point 写入；再 stop 后台线程。
     XtLiveRecorder::set_global(nullptr);
     if (recorder) {
-        recorder->set_event_store(nullptr);
+        recorder->set_event_store(nullptr);  // drain 停前先断开 store 指针
         recorder->stop();
     }
-    if (event_store && !event_store->flush()) {
-
+    if (event_store && !event_store->flush()) {  // fflush + fsync + fclose 全部 shard
+        // 停机 flush 落盘失败：fbs 事件流尾部可能未持久化（磁盘满 / IO 错误）。telemetry 失败
+        // 不影响交易，warn 不升级；store 侧已把失败 shard 闩死并计数（poisoned_shard_count）。
         XtLogger::warn_m("RT", "fbs event store flush reported persistence failure on shutdown "
                                "(tail events may not be durable)");
     }

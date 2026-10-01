@@ -21,6 +21,9 @@
 
 namespace xt_ipc {
 
+// seqlock 的 plain payload 访问在 C++ 抽象机下形式上是 data race；x86 +
+// atomic_signal_fence 下由 seq 协议保护，但 TSan 仍会报告。no_sanitize 只包
+// payload copy，让 TSan 继续检查 seq/head 等真实同步状态。
 #if defined(__SANITIZE_THREAD__)
 #define XT_IPC_NO_TSAN __attribute__((no_sanitize("thread")))
 #elif defined(__has_feature)
@@ -35,13 +38,13 @@ namespace xt_ipc {
 
 template <class T>
 XT_IPC_NO_TSAN inline void seqlock_copy_payload(T& dst, const T& src) noexcept {
-    dst = src;
+    dst = src;  // seqlock 窗口内的 plain copy（撕裂由 seq 奇偶 + signal_fence 保护）
 }
 
 /// @brief ring slot。seq 与 payload 各独占 cache line（避免 payload 写 invalidate seq 读行）。
 template <class T>
 struct MdRingSlot {
-    alignas(64) std::atomic<uint64_t> seq;
+    alignas(64) std::atomic<uint64_t> seq;  ///< 0=空；((idx+1)<<1)=稳定持有 logical idx；|1=写入中
     alignas(64) T payload;
 };
 
@@ -54,9 +57,10 @@ class XtShmRing {
 public:
     using Slot = MdRingSlot<T>;
     static constexpr uint64_t kSlotStride = sizeof(Slot);
-
+    /// @brief wire 元素字节数（== init_ctrl 写入 element_size，validate_ring 的 typed 期望值）。
     static constexpr uint32_t kElementSize = static_cast<uint32_t>(sizeof(T));
 
+    /// @brief attach 到已 mmap 的段（reader/writer 共用；校验另走 validate_ring）。
     explicit XtShmRing(void* base) noexcept
         : ctrl_(reinterpret_cast<RingControlBlock*>(base)),
           slots_(reinterpret_cast<Slot*>(static_cast<char*>(base) + sizeof(RingControlBlock))),
@@ -66,6 +70,8 @@ public:
     uint64_t head() const noexcept { return ctrl_->head.load(std::memory_order_acquire); }
     const RingControlBlock* ctrl() const noexcept { return ctrl_; }
 
+    /// @brief owner 在 owner-create（零初始化）的段上写控制块 + 清 slot。
+    /// @pre capacity 是 2 的幂；段已 ftruncate 到 segment_bytes(capacity, kSlotStride)。
     static void init_ctrl(void* base, uint64_t capacity) noexcept {
         auto* c = reinterpret_cast<RingControlBlock*>(base);
         c->magic = kMdRingMagic;
@@ -76,52 +82,56 @@ public:
         c->head.store(0, std::memory_order_relaxed);
         auto* s = reinterpret_cast<Slot*>(static_cast<char*>(base) + sizeof(RingControlBlock));
         for (uint64_t i = 0; i < capacity; ++i) s[i].seq.store(0, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);  // slot 清零对 reader 可见
     }
 
+    /// @brief 单写者 publish（不阻塞，满则覆盖最旧）。
+    /// @pre 同一 ring 同时只能有一个 writer 线程/进程调用。
     void publish(const T& v) noexcept {
         const uint64_t h = ctrl_->head.load(std::memory_order_relaxed);
         Slot& s = slots_[h & mask_];
-        const uint64_t token = (h + 1) << 1;
-        s.seq.store(token | 1, std::memory_order_release);
+        const uint64_t token = (h + 1) << 1;                       // 稳定 token = 持有 logical h
+        s.seq.store(token | 1, std::memory_order_release);         // 写入中（奇）
         std::atomic_signal_fence(std::memory_order_acq_rel);
-        seqlock_copy_payload(s.payload, v);
+        seqlock_copy_payload(s.payload, v);                        // plain copy（seqlock 保护）
         std::atomic_signal_fence(std::memory_order_acq_rel);
-        s.seq.store(token, std::memory_order_release);
-        ctrl_->head.store(h + 1, std::memory_order_release);
+        s.seq.store(token, std::memory_order_release);             // 完成（偶）
+        ctrl_->head.store(h + 1, std::memory_order_release);       // 发布
     }
 
     /// @brief reader 游标。每个 reader 一个，互不影响，绝不反压 writer。
     class Reader {
     public:
         explicit Reader(const XtShmRing* ring) noexcept
-            : ring_(ring), cursor_(ring->head()) {}
+            : ring_(ring), cursor_(ring->head()) {}  // attach 时从当前 head 起，不回放存量
 
         uint64_t cursor() const noexcept { return cursor_; }
         uint64_t gap_count() const noexcept { return gap_count_; }
 
+        /// @brief 读下一条逻辑 tick。
+        /// @return true=拿到一条；false=暂无新数据或本次竞争自旋耗尽。
         bool next(T& out) noexcept {
             const uint64_t cap = ring_->capacity();
             for (int spin = 0; spin < kMaxSpins; ++spin) {
                 const uint64_t h = ring_->ctrl_->head.load(std::memory_order_acquire);
-                if (cursor_ >= h) return false;
-                if (h - cursor_ >= cap) {
-                    const uint64_t nc = h - cap + 1;
+                if (cursor_ >= h) return false;                    // 无新数据
+                if (h - cursor_ >= cap) {                          // 落后被 lap，cursor 不再安全
+                    const uint64_t nc = h - cap + 1;               // 最旧仍安全可读（留 1 格余量避正写 slot）
                     gap_count_ += (nc - cursor_);
                     cursor_ = nc;
                 }
                 const Slot& s = ring_->slots_[cursor_ & ring_->mask_];
                 const uint64_t s1 = s.seq.load(std::memory_order_acquire);
-                if (s1 & 1) continue;
-                if (s1 != ((cursor_ + 1) << 1)) continue;
-                seqlock_copy_payload(out, s.payload);
+                if (s1 & 1) continue;                              // 写入中 → 重试
+                if (s1 != ((cursor_ + 1) << 1)) continue;          // slot 不持有 cursor_（被覆盖/竞态）→ 顶部重判
+                seqlock_copy_payload(out, s.payload);              // plain copy（seqlock 保护）
                 std::atomic_signal_fence(std::memory_order_acq_rel);
                 const uint64_t s2 = s.seq.load(std::memory_order_acquire);
-                if (s2 != s1) continue;
+                if (s2 != s1) continue;                            // 读中途被写 → 重试
                 ++cursor_;
                 return true;
             }
-            return false;
+            return false;  // 自旋上限：writer 持续覆盖该位，本次放弃（gap 已计），下次再来
         }
 
     private:
@@ -139,4 +149,4 @@ private:
     uint64_t mask_;
 };
 
-}
+}  // namespace xt_ipc

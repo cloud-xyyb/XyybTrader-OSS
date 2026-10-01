@@ -11,17 +11,23 @@
 
 namespace xt_bar_slot {
 
+/// @brief 计算分钟级 bar 的槽边界（minute boundary floor）。
+/// @param action_time  HHMMSSMMM 格式（如 93015500 = 09:30:15.500）
+/// @param period_min   周期分钟数（如 1, 5, 15, 60）
+/// @return 槽编号 = total_minutes / period_min × period_min（分钟）
 inline uint32_t minute_slot(uint32_t action_time, int period_min) {
-    const uint32_t t = action_time / 1000;
+    const uint32_t t = action_time / 1000;  // HHMMSSMMM → HHMMSS
     const uint32_t total_min = (t / 10000) * 60 + ((t / 100) % 100);
     return total_min / static_cast<uint32_t>(period_min)
            * static_cast<uint32_t>(period_min);
 }
 
+/// @brief 将分钟槽号转回 action_time 格式（HH × 10000000 + MM × 100000）。
 inline uint32_t slot_to_action_time(uint32_t slot_min) {
     return (slot_min / 60) * 10000000u + (slot_min % 60) * 100000u;
 }
 
+/// @brief 返回完整 slot ID；分钟级含 action_date，日线及以上用 trading_date。
 inline uint64_t compute_slot_id(uint32_t action_date, uint32_t action_time,
                                 uint32_t trading_date, int period_min) {
     if (period_min >= 1440)
@@ -31,4 +37,4 @@ inline uint64_t compute_slot_id(uint32_t action_date, uint32_t action_time,
            + total_min / static_cast<uint32_t>(period_min);
 }
 
-}
+}  // namespace xt_bar_slot

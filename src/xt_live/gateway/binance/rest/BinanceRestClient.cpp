@@ -1,6 +1,6 @@
 #include "BinanceRestClient.h"
 
-#include "BinanceCurlDetail.h"
+#include "BinanceCurlDetail.h"  // curl_write_cb
 #include "BinanceSign.h"
 
 #include <curl/curl.h>
@@ -21,7 +21,10 @@ struct SlistGuard {
     void append(const std::string& hdr) { list = curl_slist_append(list, hdr.c_str()); }
 };
 
-}
+}  // anonymous namespace
+
+// 每次 do_request reset 后显式开启 TCP keepalive。部分公网链路会在长 idle 后
+// 静默丢弃半开连接，OS 探测能提前发现失效连接，避免下一笔 REST 请求才付重连成本。
 
 namespace {
 /// @brief 进程级 curl_global_init 守卫。
@@ -32,10 +35,10 @@ struct CurlGlobalInit {
     ~CurlGlobalInit() { curl_global_cleanup(); }
 };
 const CurlGlobalInit g_curl_init;
-}
+}  // namespace
 
 BinanceRestClient::BinanceRestClient(Config cfg) : cfg_(std::move(cfg)) {
-
+    // curl_global_init 已由 g_curl_init 静态守卫完成；实例只创建自己的 easy handle。
     curl_handle_ = curl_easy_init();
 }
 
@@ -66,21 +69,28 @@ BinanceRestClient::Response BinanceRestClient::do_request(
         return resp;
     }
     CURL* curl = static_cast<CURL*>(curl_handle_);
-
+    // 注意：curl_easy_reset 重置 *option*，但保留 connection cache / DNS cache
+    //       / TLS session cache（per libcurl docs）。所以单 CURL 实例 + reset
+    //       仍能 keep-alive 复用连接，每次只重设 option 不付 reconnect 成本。
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, full_url.c_str());
     if (timeout_ms_override > 0) {
-
+        // shutdown path 用毫秒级 timeout 上限（e.g. 3000ms）替代
+        // cfg_.timeout_sec(10s)，把 close_listen_key 阻塞控制在 ~3s 内。
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms_override);
     } else {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, cfg_.timeout_sec);
     }
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);  // binance 不走 redirect
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "XyybTrader/binance_u/1.0");
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
-
+    // ── HFT keep-alive 三件套 ────────────────────────────────────────────
+    // 单 CURL handle + reset 默认已保留连接池；以下三项让 OS 在长 idle
+    // (binance demo 实测 30-60s 无单空闲) 时主动探测，杜绝半开连接导致
+    // 下一笔订单付 TLS 握手 ~70ms。FORBID_REUSE=0 是默认；显式写出避免被
+    // 后续未显式置 0 的 setopt 误改。
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 10L);
@@ -113,7 +123,8 @@ BinanceRestClient::Response BinanceRestClient::do_request(
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     resp.http_status = http_code;
-
+    // 429/418 限频响应携带 Retry-After；CURLINFO_RETRY_AFTER 统一解析
+    // delta-seconds / HTTP-date 两种写法，无 header 时保持 0。
     curl_off_t retry_after = 0;
     if (curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retry_after) == CURLE_OK) {
         resp.retry_after_sec = static_cast<long>(retry_after);
@@ -175,13 +186,16 @@ bool BinanceRestClient::sync_server_time() {
     return true;
 }
 
-std::string BinanceRestClient::acquire_listen_key(std::string* err) {
+// ── listenKey lifecycle（binance 特例：有 X-MBX-APIKEY header 但无 HMAC 签名）──
 
+std::string BinanceRestClient::acquire_listen_key(std::string* err) {
+    // listenKey 端点是 Binance 特例：只需要 X-MBX-APIKEY header，不需要 HMAC signature。
     std::map<std::string, std::string> headers;
     headers["X-MBX-APIKEY"] = cfg_.api_key;
-
+    // acquire/keepalive 在 UDS io_context 线程同步执行；这里用 3s 上限，避免
+    // testnet HTTPS 卡住时阻塞成交/持仓处理到默认 10s。
     auto r = do_request("POST", cfg_.base_url + "/fapi/v1/listenKey", "", headers,
-                         3000);
+                        /*timeout_ms_override=*/3000);
     if (!r.ok()) {
         if (err) *err = r.curl_err.empty() ? ("HTTP " + std::to_string(r.http_status) + ": " + r.body)
                                            : r.curl_err;
@@ -198,9 +212,9 @@ std::string BinanceRestClient::acquire_listen_key(std::string* err) {
 bool BinanceRestClient::keepalive_listen_key(std::string* err) {
     std::map<std::string, std::string> headers;
     headers["X-MBX-APIKEY"] = cfg_.api_key;
-
+    // 与 acquire 一样限制在 3s 内，失败后由 UDS 重连流程重新申请 listenKey。
     auto r = do_request("PUT", cfg_.base_url + "/fapi/v1/listenKey", "", headers,
-                         3000);
+                        /*timeout_ms_override=*/3000);
     if (!r.ok()) {
         if (err) *err = r.curl_err.empty() ? ("HTTP " + std::to_string(r.http_status) + ": " + r.body)
                                            : r.curl_err;
@@ -222,4 +236,4 @@ bool BinanceRestClient::close_listen_key(std::string* err, long timeout_ms) {
     return true;
 }
 
-}
+}  // namespace binance_u

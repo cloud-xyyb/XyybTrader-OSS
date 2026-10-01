@@ -15,9 +15,11 @@ struct XtMdConnectorExporter::Impl {
     std::unique_ptr<prometheus::Exposer> exposer;
     bool running = false;
 
+    // ring head delta → published_ticks_total 累加；首次 update 只锚不累加。
     uint64_t last_head = 0;
     bool have_last_head = false;
 
+    // family child（按 {ring} 单 series 取一次，热路径直 Set/Increment）。
     prometheus::Gauge* up = nullptr;
     prometheus::Gauge* ring_head = nullptr;
     prometheus::Counter* published_total = nullptr;
@@ -37,17 +39,20 @@ bool XtMdConnectorExporter::start(uint16_t port,
                                   std::string_view bind_addr) {
     if (impl_->running) return false;
     try {
-
+        // connector 使用独立 registry，只注册 xt_md_connector_* 指标面。
         impl_->registry = std::make_shared<prometheus::Registry>();
 
+        // 每个 family 只创建一个 {ring} child；ring 是 connector 进程身份键。
         const prometheus::Labels lbl{{"ring", std::string(ring_label)}};
 
+        // 存活状态：start 成功后置 1，stop 前置 0。
         auto& fam_up = prometheus::BuildGauge()
             .Name("xt_md_connector_up")
             .Help("MD connector exposer serving (1=up, 0=stopping)")
             .Register(*impl_->registry);
         impl_->up = &fam_up.Add(lbl);
 
+        // 发布进度：head 给出绝对位置，total 用 delta 支持 rate() 算 tick/s。
         auto& fam_head = prometheus::BuildGauge()
             .Name("xt_md_connector_ring_head")
             .Help("Current shm ring head (absolute monotonic ticks published)")
@@ -60,6 +65,7 @@ bool XtMdConnectorExporter::start(uint16_t port,
             .Register(*impl_->registry);
         impl_->published_total = &fam_pub.Add(lbl);
 
+        // 健康探测：gauge 记录最近一次 check_health 结果，counter 记录 false 采样次数。
         auto& fam_health = prometheus::BuildGauge()
             .Name("xt_md_connector_check_health")
             .Help("Gateway check_health result (1=healthy or offhours-suppressed, 0=stale/reconnecting)")
@@ -72,12 +78,14 @@ bool XtMdConnectorExporter::start(uint16_t port,
             .Register(*impl_->registry);
         impl_->check_health_fail_total = &fam_health_fail.Add(lbl);
 
+        // stale watchdog armed 状态：区分「真健康」与「expected-tick 窗外抑制」。
         auto& fam_watchdog = prometheus::BuildGauge()
             .Name("xt_md_connector_stale_watchdog_active")
             .Help("stale watchdog armed (1=in expected-tick window / gate off, 0=offhours-suppressed)")
             .Register(*impl_->registry);
         impl_->stale_watchdog_active = &fam_watchdog.Add(lbl);
 
+        // 进程元信息：uptime 用于重启识别，epoch 用于 reader 换代可见性。
         auto& fam_uptime = prometheus::BuildGauge()
             .Name("xt_md_connector_uptime_seconds")
             .Help("Seconds since connector exposer start")
@@ -91,7 +99,7 @@ bool XtMdConnectorExporter::start(uint16_t port,
         impl_->epoch = &fam_epoch.Add(lbl);
 
         const std::string endpoint = std::string(bind_addr) + ":" + std::to_string(port);
-
+        // Exposer 构造会 bind endpoint；失败时 connector 降级为无 metrics。
         impl_->exposer = std::make_unique<prometheus::Exposer>(endpoint);
         impl_->exposer->RegisterCollectable(impl_->registry);
 
@@ -151,4 +159,4 @@ void XtMdConnectorExporter::set_epoch(uint64_t epoch_ns) {
     impl_->epoch->Set(static_cast<double>(epoch_ns));
 }
 
-}
+}  // namespace ct::metrics

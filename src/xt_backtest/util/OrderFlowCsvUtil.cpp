@@ -3,7 +3,7 @@
 #include "XtParseUtil.h"
 #include "xt_util/string/XtStringUtil.h"
 #include "xt_util/time/XtTimeParse.h"
-#include "TickCsvUtil.h"
+#include "TickCsvUtil.h"  // make_tick_sort_key 统一 tick 与 Level-2 夜盘排序口径。
 
 #include <algorithm>
 #include <cstring>
@@ -31,6 +31,7 @@ enum class FieldId {
     VolStart,
 };
 
+// Level-2 行排序键使用 trading_date + action_time，和 tick/event stream 共用夜盘旋转口径。
 uint64_t make_key(uint32_t trading_date, uint32_t action_time) {
     return make_tick_sort_key(trading_date, action_time);
 }
@@ -62,6 +63,7 @@ void copy_text(char* dst, size_t cap, const std::string& src) {
     if (!src.empty()) std::strncpy(dst, src.c_str(), cap - 1);
 }
 
+// 解析热路径只传 FieldId，不做字符串列名查找。
 int get_idx_by_id(const XtOrderFlowCsvSpec& spec, XtOrderFlowCsvKind kind, FieldId id) {
     int idx = -1;
     switch (id) {
@@ -100,12 +102,12 @@ bool has_required_header_fields(const XtOrderFlowCsvSpec& spec, XtOrderFlowCsvKi
     return spec.idx_volume >= 0 && spec.idx_index >= 0;
 }
 
-}
+} // namespace
 
 bool build_orderflow_spec_from_header(const std::string& line,
                                       XtOrderFlowCsvKind kind,
                                       XtOrderFlowCsvSpec& spec) {
-
+    // 表头解析允许别名，但后续逐行解析严格依赖这里生成的 idx_*。
     thread_local std::vector<std::string> cols;
     split_csv_trim(line, cols);
     if (cols.empty()) return false;
@@ -147,7 +149,7 @@ bool parse_order_queue_csv_line(const std::string& line,
                                 const XtOrderFlowCsvSpec& spec,
                                 XtOrderQueue& out,
                                 uint64_t& key) {
-
+    // 复用分割 buffer；本函数不保留字段指针或引用。
     thread_local std::vector<std::string> cols;
     split_csv_trim(line, cols);
     if (cols.empty()) return false;
@@ -192,7 +194,7 @@ bool parse_order_detail_csv_line(const std::string& line,
                                  const XtOrderFlowCsvSpec& spec,
                                  XtOrderDetail& out,
                                  uint64_t& key) {
-
+    // 复用分割 buffer；本函数不保留字段指针或引用。
     thread_local std::vector<std::string> cols;
     split_csv_trim(line, cols);
     if (cols.empty()) return false;
@@ -230,7 +232,7 @@ bool parse_transaction_csv_line(const std::string& line,
                                 const XtOrderFlowCsvSpec& spec,
                                 XtTransaction& out,
                                 uint64_t& key) {
-
+    // 复用分割 buffer；本函数不保留字段指针或引用。
     thread_local std::vector<std::string> cols;
     split_csv_trim(line, cols);
     if (cols.empty()) return false;

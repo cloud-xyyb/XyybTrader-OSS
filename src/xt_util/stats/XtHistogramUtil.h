@@ -28,6 +28,7 @@ struct LatencyHistogram {
     std::array<uint64_t, NBuckets> buckets{};
 };
 
+/// @brief 返回样本所在 bucket；超出范围时 clamp 到最后一桶。
 inline size_t hist_bucket(uint64_t us, size_t n_buckets) {
     if (us <= 1) return 0;
 #if defined(__clang__) || defined(__GNUC__)
@@ -40,6 +41,7 @@ inline size_t hist_bucket(uint64_t us, size_t n_buckets) {
     return idx < n_buckets - 1 ? idx : n_buckets - 1;
 }
 
+/// @brief 返回 bucket 上界（inclusive）。
 inline uint64_t hist_bucket_upper(size_t bucket_idx, size_t n_buckets) {
     if (bucket_idx == 0) return 1;
     if (bucket_idx >= n_buckets - 1) {
@@ -48,6 +50,7 @@ inline uint64_t hist_bucket_upper(size_t bucket_idx, size_t n_buckets) {
     return uint64_t(1) << bucket_idx;
 }
 
+/// @brief 添加样本并维护 samples/sum/max/bucket count。
 template <size_t NBuckets>
 inline void hist_add(LatencyHistogram<NBuckets>& h, uint64_t us) {
     ++h.samples;
@@ -56,6 +59,7 @@ inline void hist_add(LatencyHistogram<NBuckets>& h, uint64_t us) {
     ++h.buckets[hist_bucket(us, NBuckets)];
 }
 
+/// @brief 最后一段有样本的 bucket 用 max_us 收紧插值上界。
 inline uint64_t clamp_upper_with_max_us(
         uint64_t upper, uint64_t lower, uint64_t max_us,
         uint64_t cum_acc, uint64_t total_samples) {
@@ -65,11 +69,14 @@ inline uint64_t clamp_upper_with_max_us(
     return upper;
 }
 
+/// @brief 返回 `ceil(samples * num / den)` 对应的分位值。
+///
+/// `num/den` 应满足 `1 <= num <= den`，如 p99 = 99/100，p999 = 999/1000。
 template <size_t NBuckets>
 inline uint64_t hist_percentile_ratio(const LatencyHistogram<NBuckets>& h,
                                       uint64_t num, uint64_t den) {
     if (h.samples == 0 || num == 0 || den == 0) return 0;
-    const uint64_t target = (h.samples * num + den - 1) / den;
+    const uint64_t target = (h.samples * num + den - 1) / den;  // ceil
     uint64_t acc = 0;
     for (size_t i = 0; i < NBuckets; ++i) {
         const uint64_t in_bucket = h.buckets[i];
@@ -81,10 +88,10 @@ inline uint64_t hist_percentile_ratio(const LatencyHistogram<NBuckets>& h,
         const uint64_t upper = clamp_upper_with_max_us(
             hist_bucket_upper(i, NBuckets), lower, h.max_us,
             acc + in_bucket, h.samples);
-        const uint64_t rank = target - acc;
+        const uint64_t rank = target - acc;  // 1..in_bucket
         return lower + (upper - lower) * rank / in_bucket;
     }
-
+    // target <= samples 时循环应命中；保留兜底避免坏状态外泄。
     return h.max_us > 0 ? h.max_us : hist_bucket_upper(NBuckets - 1, NBuckets);
 }
 
@@ -99,16 +106,17 @@ struct QRatio {
     uint64_t den;
 };
 
+/// @brief 单遍计算多个分位数，输出顺序与 queries 一致。
 template <size_t NBuckets, size_t NQ>
 inline void hist_percentile_multi(const LatencyHistogram<NBuckets>& h,
                                   const std::array<QRatio, NQ>& queries,
                                   std::array<uint64_t, NQ>& out) {
-
+    // 空 histogram 的所有分位数定义为 0。
     if (h.samples == 0) {
         for (size_t k = 0; k < NQ; ++k) out[k] = 0;
         return;
     }
-
+    // 预计算每个 query 的 target（ceil(samples*num/den)）。
     std::array<uint64_t, NQ> targets{};
     std::array<bool, NQ> filled{};
     for (size_t k = 0; k < NQ; ++k) {
@@ -130,7 +138,7 @@ inline void hist_percentile_multi(const LatencyHistogram<NBuckets>& h,
         const uint64_t lower = (i == 0) ? 0 : hist_bucket_upper(i - 1, NBuckets);
         const uint64_t upper = clamp_upper_with_max_us(
             hist_bucket_upper(i, NBuckets), lower, h.max_us, new_acc, h.samples);
-
+        // 落在同一 bucket 的 query 共享 lower/upper 插值边界。
         bool all_filled = true;
         for (size_t k = 0; k < NQ; ++k) {
             if (filled[k]) continue;
@@ -145,7 +153,7 @@ inline void hist_percentile_multi(const LatencyHistogram<NBuckets>& h,
         if (all_filled) return;
         acc = new_acc;
     }
-
+    // 坏状态兜底：未填入的分位数用 max_us 或最后一桶上界。
     for (size_t k = 0; k < NQ; ++k) {
         if (!filled[k]) {
             out[k] = h.max_us > 0
@@ -165,16 +173,17 @@ inline void hist_percentile_multi(const LatencyHistogram<NBuckets>& h,
 template <size_t NBuckets, size_t NSlots>
 struct RollingHistogram {
     static_assert(NSlots >= 2, "RollingHistogram 至少需要 2 slot");
-    LatencyHistogram<NBuckets> current;
-    std::array<LatencyHistogram<NBuckets>, NSlots> ring{};
-    size_t head = 0;
-    uint64_t current_start_us = 0;
+    LatencyHistogram<NBuckets> current;                    ///< 正在填充 slot
+    std::array<LatencyHistogram<NBuckets>, NSlots> ring{}; ///< 过去 N slot
+    size_t head = 0;                                       ///< 下一个覆盖 ring idx
+    uint64_t current_start_us = 0;                         ///< current slot 起点
 };
 
+/// @brief 按 `now_us` 推进 slot；未跨 slot 时 O(1) 返回。
 template <size_t NBuckets, size_t NSlots>
 inline void rolling_rotate_if_needed(RollingHistogram<NBuckets, NSlots>& h,
                                      uint64_t now_us, uint64_t slot_dur_us) {
-    if (slot_dur_us == 0) return;
+    if (slot_dur_us == 0) return;  // 守卫: 调用方传 0 视为禁用 rotate
     if (h.current_start_us == 0) {
         h.current_start_us = now_us;
         return;
@@ -184,7 +193,7 @@ inline void rolling_rotate_if_needed(RollingHistogram<NBuckets, NSlots>& h,
                                  : 0;
     size_t full_slots = static_cast<size_t>(elapsed / slot_dur_us);
     if (full_slots == 0) return;
-
+    // idle 超过整窗时直接清空，避免旧 current 被写回 ring 留存。
     if (full_slots >= NSlots) {
         h.current = {};
         h.ring = {};
@@ -207,6 +216,7 @@ inline void rolling_add(RollingHistogram<NBuckets, NSlots>& h,
     hist_add(h.current, us);
 }
 
+/// @brief 合并 ring + current，返回可直接计算分位数的普通 histogram。
 template <size_t NBuckets, size_t NSlots>
 inline LatencyHistogram<NBuckets> rolling_merge(
         const RollingHistogram<NBuckets, NSlots>& h) {
@@ -224,4 +234,4 @@ inline LatencyHistogram<NBuckets> rolling_merge(
     return out;
 }
 
-}
+}  // namespace xt_util

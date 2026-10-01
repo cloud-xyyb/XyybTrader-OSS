@@ -20,13 +20,14 @@ namespace xt_bt::hft {
 
 std::unique_ptr<ILatencyModel> make_latency_model(const LatencyModelCfg& cfg) {
     if (cfg.type == "constant") {
-
+        // 构造期域校验；消费点（sample_*）二次校验保 custom/test model 不绕过。
+        // checked_us_to_ns 先验乘法溢出（裸 us*1000 溢出会 wrap 成小正值绕过 validate）。
         return std::make_unique<ConstantLatencyModel>(
             xt_latency::checked_us_to_ns(cfg.entry_us, "constant entry_us"),
             xt_latency::checked_us_to_ns(cfg.response_us, "constant response_us"));
     }
     if (cfg.type == "cdf") {
-
+        // CDF 输入使用 percentile YAML；先校验后缀，避免误读时间序列 CSV。
         if (cfg.source.empty()) {
             throw std::runtime_error(
                 "backtest.latency_model.type='cdf' 必须指定 source 路径 (.yaml/.yml)");
@@ -52,7 +53,7 @@ std::unique_ptr<ILatencyModel> make_latency_model(const LatencyModelCfg& cfg) {
                 "实际后缀='." + ext + "' 路径=" + cfg.source +
                 "（CDF YAML 请改用 type:cdf）");
         }
-
+        // 时变维度已接线（event-axis 采样）；ctor 强制 v2 header + 非法值 fail-fast。
         return std::make_unique<InterpolatedLatencyModel>(cfg.source);
     }
     throw std::runtime_error(
@@ -77,4 +78,4 @@ std::unique_ptr<IQueueModel> make_queue_model(const QueueModelCfg& cfg) {
         "' 不支持 (期望: ratio | prob_power1 | prob_power2)");
 }
 
-}
+} // namespace xt_bt::hft

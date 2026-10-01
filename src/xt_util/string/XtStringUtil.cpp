@@ -82,4 +82,4 @@ std::string gbk_to_utf8_or_original(const char* s) {
 #endif
 }
 
-}
+}  // namespace XtStringUtil

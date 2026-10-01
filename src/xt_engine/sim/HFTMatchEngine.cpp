@@ -16,6 +16,11 @@
 
 namespace {
 
+// 将单笔成交按 fixed-point 整数步长拆成多笔较小成交；输出缓冲由调用方复用。
+// 数量守恒不变式：Σout == qty_fp 逐整数相等。采样预算耗尽后残量按最大对齐块
+// 确定性切完；末片可小于 min / 不对齐 tick，其余每片 tick 对齐且在 tick<=max 时
+// <= max（退化配置 tick>max 下每片 = tick）。病态大单超片数上限时整笔单片不拆。
+// 前置：min_fp/max_fp/tick_fp 已由 set_config 归一化为正值且 min<=max。
 void split_qty_fp(int64_t qty_fp,
                   int64_t min_fp,
                   int64_t max_fp,
@@ -28,7 +33,7 @@ void split_qty_fp(int64_t qty_fp,
     int64_t max_steps = max_fp / tick_fp;
     if (min_steps <= 0) min_steps = 1;
     if (max_steps < min_steps) max_steps = min_steps;
-
+    // 病态大单防御：片数上限（shipped 配置远不可达）；超限整笔单片，守恒优先于拆分粒度。
     constexpr int64_t kMaxSplitParts = 100'000;
     const int64_t chunk = max_steps * tick_fp;
     if (qty_fp / chunk >= kMaxSplitParts) {
@@ -40,11 +45,11 @@ void split_qty_fp(int64_t qty_fp,
     int sample_budget = 1000;
     while (left > 0 && --sample_budget > 0) {
         int64_t cur = dist(rng) * tick_fp;
-        if (cur > left) cur = left;
+        if (cur > left) cur = left;  // 末片残量：可小于 min / 不对齐 tick。
         out.push_back(cur);
         left -= cur;
     }
-
+    // 采样预算耗尽（qty 远大于 max×预算）：残量按最大对齐块确定性切完，保守恒。
     while (left > 0) {
         const int64_t cur = std::min(left, chunk);
         out.push_back(cur);
@@ -60,14 +65,14 @@ void reject_retired_split_fill_keys(const YAML::Node& node) {
     if (node["split_qty_tick"]) throw std::runtime_error("split_qty_tick 已退役，请改用 fill.qty_tick");
 }
 
-}
+} // namespace
 
 void XtHftMatchEngine::set_config(const Config& cfg) {
     XtOrderManager::RuntimeConfig om_cfg;
     om_cfg.queue_cancel_ratio         = cfg.queue_cancel_ratio;
     om_cfg.ack_delay_ticks            = cfg.ack_delay_ticks;
     om_cfg.ttl_ticks                  = cfg.ttl_ticks;
-    om_cfg.ack_delay_us               = 0;
+    om_cfg.ack_delay_us               = 0;          // 由 submit 层采样覆盖
     om_cfg.ttl_us                     = cfg.ttl_us;
     om_cfg.ofi_queue_scale            = cfg.ofi_queue_scale;
     om_cfg.market_impact_enabled      = cfg.market_impact_enabled;
@@ -77,12 +82,12 @@ void XtHftMatchEngine::set_config(const Config& cfg) {
     error_rate_    = cfg.error_rate;
     reject_rate_   = cfg.reject_rate;
     split_fills_   = cfg.split_fills;
-
+    // split 参数 NaN/Inf fail-fast（脏值进整数换算未定义）；<=0/倒挂沿用宽松归一化。
     if (!std::isfinite(cfg.split_min_qty) || !std::isfinite(cfg.split_max_qty) ||
         !std::isfinite(cfg.split_qty_tick)) {
         throw std::runtime_error("fill.min_qty/max_qty/qty_tick 必须是有限数值");
     }
-    constexpr double kMaxSplitQty = 9.0e12;
+    constexpr double kMaxSplitQty = 9.0e12;  // ×1e6 后仍在 int64 表示范围内。
     const double tick_q = std::min(cfg.split_qty_tick > 0.0 ? cfg.split_qty_tick : 1.0, kMaxSplitQty);
     const double min_q  = std::min(cfg.split_min_qty > 0.0 ? cfg.split_min_qty : tick_q, kMaxSplitQty);
     const double max_q  = std::min(cfg.split_max_qty < min_q ? min_q : cfg.split_max_qty, kMaxSplitQty);
@@ -95,6 +100,8 @@ void XtHftMatchEngine::set_config(const Config& cfg) {
     ack_delay_us_          = cfg.ack_delay_us;
     ack_delay_stddev_us_   = cfg.ack_delay_stddev_us;
 
+    // model 注入独立于 Config；未注入时 latency 和 queue_ahead 都按 0 处理。
+
     if (cfg.random_seed > 0) {
         rng_.seed(static_cast<uint32_t>(cfg.random_seed));
     } else {
@@ -103,7 +110,7 @@ void XtHftMatchEngine::set_config(const Config& cfg) {
 }
 
 void XtHftMatchEngine::reset_volume_cache() {
-    volume_table_.clear();
+    volume_table_.clear();  // 保留 capacity，重建时不重新分配。
 }
 
 void XtHftMatchEngine::advance_clock(uint64_t tick_idx, int64_t event_now_ns,
@@ -175,7 +182,7 @@ uint64_t XtHftMatchEngine::submit(uint64_t order_id,
         }
         d.close_offset = close_offset;
         d.is_resubmit = is_resubmit;
-        d.lookup_event_ns = query_event_ts_();
+        d.lookup_event_ns = query_event_ts_();  // 原始 lookup 时刻；flush 时采样用它
         const uint32_t target = (wheel_cursor_ + order_delay_ticks_) % delay_wheel_.size();
         delay_wheel_[target].push_back(d);
         return order_id;
@@ -183,7 +190,8 @@ uint64_t XtHftMatchEngine::submit(uint64_t order_id,
     const int64_t sample_ts = query_event_ts_();
     const uint32_t ack_delay_ms  = sample_ack_delay_ms();
     const uint32_t fill_latency_ms = sample_fill_latency_ms(sample_ts);
-
+    // response 与 entry 相邻配对采样存单（paired CDF 单槽在相邻调用间无交错窗口）；
+    // fill 时刻再采样会在多在途单交错序下错配 percentile。-1 = 无模型。
     const int64_t response_ns = latency_model_ ? sample_response_latency_ns(sample_ts) : -1;
 
     const uint64_t id = order_manager_.submit(order_id,
@@ -208,7 +216,10 @@ uint64_t XtHftMatchEngine::submit(uint64_t order_id,
 }
 
 bool XtHftMatchEngine::cancel(uint64_t id) {
-
+    // 先扫 delay wheel：上行在途（尚未到达 venue）的单可撤，命中即移除并
+    // 合成 Canceled 终态（gateway 已冻结 margin/注册 slot，销账靠终态；
+    // 旧行为 cancel 恕不到 wheel 单 → 策略永远撤不掉它）。简化：撤单请求
+    // 视为在同一上行链路追上并拦截了 deferred submit。
     if (order_delay_ticks_ > 0) {
         for (auto& slot : delay_wheel_) {
             for (auto it = slot.begin(); it != slot.end(); ++it) {
@@ -277,7 +288,8 @@ void XtHftMatchEngine::collect_in_transit_order_ids(std::vector<uint64_t>& out) 
 }
 
 std::size_t XtHftMatchEngine::discard_in_transit_orders() noexcept {
-
+    // EOF 后不会再推进 wheel，尚未提交到 OrderManager 的订单视为 in-transit
+    // lost；逐单合成 Canceled 终态（销账链靠终态，旧行为零终态 → frozen 永泄）。
     if (order_delay_ticks_ == 0) return 0;
     const std::size_t before = delay_wheel_pending_count();
     if (before == 0) return 0;
@@ -297,30 +309,35 @@ void XtHftMatchEngine::discard_eof_live_orders() {
     order_manager_.discard_eof_live_orders();
 }
 
+// ── Private Helpers ────────────────────────────────────────────────────
+
 double XtHftMatchEngine::next_rand01() {
     return uniform_dist_(rng_);
 }
 
 double XtHftMatchEngine::calc_max_fill_qty(const XtTick& tick) {
-
+    // total_volume 差分更稳定；同时存在 tick volume 时取两者较小值。
+    // 返回语义与 XtOrderBook::match_tick 对齐：<0 不限制，0 = 本 tick 零成交量。
     const double total_volume = xt_tick_convert::qty_from_fp(tick.total_volume_fp);
     const double volume = xt_tick_convert::qty_from_fp(tick.volume_fp);
     if (total_volume > 0.0) {
         double& last = find_or_insert_volume(tick.code);
-
+        // 首观测只建 baseline：此时 total 是开盘以来全量累计而非本 tick 增量，
+        // 当 cap 用会一次性放行全天成交量（系统性乐观）；带 per-tick volume
+        // 的数据源不受影响（下方 volume>0 分支接管）。
         const bool first_obs = (last <= 0.0);
         double diff = first_obs ? 0.0 : (total_volume - last);
-        if (diff < 0.0) diff = total_volume;
+        if (diff < 0.0) diff = total_volume;  // 累计量归零后的保守 fallback。
         last = total_volume;
         if (volume > 0.0) {
             return (diff > 0.0) ? std::min(diff, volume) : volume;
         }
-        return diff;
+        return diff;  // diff==0 → 零成交量 tick，禁止 fill。
     }
     if (volume > 0.0) {
         return volume;
     }
-    return -1.0;
+    return -1.0;  // 数据源不带成交量信息 → 维持 fail-open 不限制。
 }
 
 uint32_t XtHftMatchEngine::sample_ack_delay_ms() {
@@ -330,6 +347,7 @@ uint32_t XtHftMatchEngine::sample_ack_delay_ms() {
         return static_cast<uint32_t>((ack_delay_us_ + 999ULL) / 1000ULL);
     }
 
+    // ACK 抖动按 N(mean, stddev^2) 采样；5x mean 是尾部保护上限。
     const double mean_us  = static_cast<double>(ack_delay_us_);
     const double stddev_us = static_cast<double>(ack_delay_stddev_us_);
     const double sample_us = mean_us + stddev_us * latency_dist_(rng_);
@@ -338,7 +356,10 @@ uint32_t XtHftMatchEngine::sample_ack_delay_ms() {
 }
 
 uint32_t XtHftMatchEngine::sample_fill_latency_ms(int64_t event_ts_ns) {
-
+    // fill 资格延迟（submit→可撮合 fill-eligibility）使用 entry latency，对齐
+    // ILatencyModel 契约（entry = submit→match 排队）；fill 可见性（成交→策略可见）
+    // 由 gateway 用随单存的 response stamp 设。paired CDF 下 entry 在此抽的 percentile
+    // 由紧随的相邻 response 采样复用，保持上行/回程延迟相关。ACK 延迟由 sample_ack_delay_ms 处理。
     if (!latency_model_) return 0;
     const int64_t ns = xt_latency::validate_latency_ns(
         latency_model_->entry_latency_ns(event_ts_ns), "entry");
@@ -347,18 +368,20 @@ uint32_t XtHftMatchEngine::sample_fill_latency_ms(int64_t event_ts_ns) {
 }
 
 uint32_t XtHftMatchEngine::sample_cancel_delay_ms(int64_t event_ts_ns) {
-
+    // cancel 请求与 submit 走同一条上行链路（hftbacktest 同口径），用 entry latency 采样。
     if (!cancel_latency_enabled_ || !latency_model_) return 0;
     const int64_t ns = xt_latency::validate_latency_ns(
         latency_model_->entry_latency_ns(event_ts_ns), "cancel_entry");
-
+    // paired CDF 的 entry 采样必须由相邻 response 采样消费掉 percentile 槽；
+    // Canceled 回报沿用 order-update 本 tick 即可见语义（与 Accepted 对称），弃值。
     (void)latency_model_->response_latency_ns(event_ts_ns);
     if (ns <= 0) return 0;
     return static_cast<uint32_t>((ns + 999'999LL) / 1'000'000LL);
 }
 
 double& XtHftMatchEngine::find_or_insert_volume(const char* code) {
-
+    // warm path 线性扫描，无 hash/rehash；新 symbol 仅首见时 append（冷路径分配）。
+    // 槽一经建立身份不变：任何 symbol 的累计量状态不被其它 symbol 覆写。
     for (auto& e : volume_table_) {
         if (std::strncmp(e.code, code, sizeof(e.code)) == 0) return e.volume;
     }
@@ -367,6 +390,8 @@ double& XtHftMatchEngine::find_or_insert_volume(const char* code) {
     volume_table_.push_back(entry);
     return volume_table_.back().volume;
 }
+
+// ── Order Delay Wheel ────────────────────────────────────────────────────
 
 void XtHftMatchEngine::advance_wheel_and_flush_() {
     if (order_delay_ticks_ == 0) return;
@@ -399,10 +424,13 @@ void XtHftMatchEngine::match_orders_on_tick_depth_(const XtTick& tick,
                                          tick.ask_qty_fp,
                                          XtTick::DEPTH);
 
+    // limit-lock：off 恒传 0 → 下游（冻结/erosion 免疫）全 bypass，结构性等价。
+    // tick 与 depth snapshot 同源同刻，无 skew。
     order_manager_.set_price_limits_fp(
         price_limit_enabled_ ? tick.upper_limit_fp : 0,
         price_limit_enabled_ ? tick.lower_limit_fp : 0);
 
+    // volume_limit 关闭走 <0 不限制 sentinel（0 = 零可成交量，见 calc_max_fill_qty）。
     double max_fill_qty = volume_limit_ ? calc_max_fill_qty(tick) : -1.0;
 
     constexpr int64_t kDepthQtyInflation = 1'000'000;
@@ -468,7 +496,7 @@ void XtHftMatchEngine::split_new_fills_(size_t first_new_trade,
         int64_t sum_fp = 0;
         for (int64_t part_fp : parts_buf_) sum_fp += part_fp;
         if (sum_fp != trades[i].qty_fp) {
-
+            // 守恒兜底：按构造不可达；触发即放弃拆分保留原始成交，绝不丢量。
             std::fprintf(stderr,
                          "[XtHftMatchEngine] split conservation mismatch "
                          "qty_fp=%lld sum_fp=%lld parts=%zu, fill kept unsplit\n",
@@ -489,10 +517,11 @@ void XtHftMatchEngine::split_new_fills_(size_t first_new_trade,
 }
 
 uint64_t XtHftMatchEngine::submit_immediate_(const DeferredOrder& d) {
-
+    // 采样用入队时的原始 lookup 时刻（时变模型按 submit 时刻查样本）；
+    // 而 deadline base 在 OrderManager 内取 flush 时 event——两段严格串联。
     const uint32_t ack_delay_ms = sample_ack_delay_ms();
     const uint32_t fill_latency_ms = sample_fill_latency_ms(d.lookup_event_ns);
-
+    // 同 submit 主路径：response 与 entry 相邻配对采样存单。
     const int64_t response_ns = latency_model_ ? sample_response_latency_ns(d.lookup_event_ns) : -1;
     const uint64_t id = order_manager_.submit(d.order_id, d.code, d.is_buy,
                                               d.price_fp, d.qty_fp, d.tif,
@@ -514,7 +543,7 @@ XtHftMatchEngine::Config parse_match_engine_config(const YAML::Node& node) {
     XtHftMatchEngine::Config cfg;
     if (node && node["queue_cancel_ratio"]) cfg.queue_cancel_ratio = node["queue_cancel_ratio"].as<double>();
     if (node && node["ack_delay_ticks"])    cfg.ack_delay_ticks    = node["ack_delay_ticks"].as<uint64_t>();
-
+    // yaml 兼容字段仍叫 order_timeout_ticks，DTO/manager 内部统一为 ttl_ticks。
     if (node && node["order_timeout_ticks"]) cfg.ttl_ticks         = node["order_timeout_ticks"].as<uint64_t>();
     if (node && node["ack_delay_us"])       cfg.ack_delay_us       = node["ack_delay_us"].as<uint64_t>();
     if (node && node["ttl_us"])             cfg.ttl_us             = node["ttl_us"].as<uint64_t>();
@@ -542,4 +571,4 @@ XtHftMatchEngine::Config parse_match_engine_config(const YAML::Node& node) {
     return cfg;
 }
 
-}
+} // namespace engine_config

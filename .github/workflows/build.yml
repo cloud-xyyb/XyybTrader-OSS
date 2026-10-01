@@ -3,7 +3,7 @@ name: build
 
 on:
   push:
-    branches: [main, master]
+    branches: [dev, master]
   pull_request:
 
 jobs:
@@ -25,18 +25,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y -V libarrow-dev libparquet-dev
 
-      - name: Build
-        run: |
-          # -DXT_BUILD_CONTROL_GRPC=OFF 为双保险：快照已删 grpc 块，若残留默认 ON 会拉取外网 grpc
-          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DXT_BUILD_CONTROL_GRPC=OFF
-          cmake --build build -j"$(nproc)"
+      - name: Build public targets and strategy plugins
+        run: bash scripts/build_dev.sh
 
-      - name: Build strategy plugin
-        run: |
-          cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy -G Ninja -DXT_SRC_ROOT="$(pwd)/src"
-          cmake --build build-strategy -j"$(nproc)"
-          mkdir -p var/plugins/strategies
-          cp build-strategy/libhft_tick_revert_strategy.so var/plugins/strategies/
-
-      - name: Regression (byte-identical gate)
-        run: bash scripts/regression_test.sh
+      - name: Tests and byte-identical regression
+        run: python3 scripts/validate_dev.py

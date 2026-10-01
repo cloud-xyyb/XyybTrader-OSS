@@ -19,5 +19,13 @@ class ISTPChecker {
 public:
     virtual ~ISTPChecker() = default;
 
+    /**
+     * @brief 检查该订单是否会与本账户已有挂单发生自成交。
+     *
+     * @param req 即将提交的委托请求。
+     * @return true = 存在自成交风险，应拒绝该单。
+     *
+     * @note 实现应为 O(1) 或 O(log n) 级别，不得阻塞热路径。
+     */
     [[nodiscard]] virtual bool would_self_trade(const xt_core::XtOrder& req) const = 0;
 };

@@ -24,10 +24,11 @@ namespace xt_runtime::market {
 /// operator[] 按逻辑时间顺序访问，i=0 为最旧、i=size()-1 为最新。
 /// init() 之后的追加和查询路径不再主动分配堆内存。
 struct CircularBarBuffer {
-    std::vector<XtBar> data;
-    size_t head = 0;
-    size_t sz = 0;
+    std::vector<XtBar> data;  ///< init() 一次性分配的固定容量存储。
+    size_t head = 0;          ///< 最旧元素的物理索引。
+    size_t sz = 0;            ///< 当前有效元素数量。
 
+    /// @brief 按 capacity 初始化存储；capacity=0 按 1 处理。
     void init(size_t capacity) {
         if (capacity == 0) capacity = 1;
         data.assign(capacity, XtBar{});
@@ -39,6 +40,7 @@ struct CircularBarBuffer {
     size_t size()     const noexcept { return sz; }
     bool   empty()    const noexcept { return sz == 0; }
 
+    /// @brief 追加 bar；容量已满时覆盖最旧元素。
     void push_back(const XtBar& bar) {
         if (data.empty()) return;
         if (sz < data.size()) {
@@ -62,21 +64,29 @@ struct CircularBarBuffer {
 /// 默认按 tick 增量聚合 bar，CTA 外部 aggregator 可直接注入完成 bar。
 class XtRuntimeBarSeriesView {
 public:
-
+    /// @brief 设置默认 bar 历史容量；cap=0 时恢复为 512。
+    ///
+    /// 已创建的 series 不受影响，调用方应在首次订阅/查询前配置。
     void set_history_cap(size_t cap) {
         bar_history_cap_ = cap > 0 ? cap : 512;
     }
 
+    /// @brief 写入 raw tick；内部先转换为 core tick。
     void on_tick(const XtRawTick& tick) {
         on_tick(xt_tick_convert::to_core(tick));
     }
 
+    /// @brief 写入一笔 tick，并推进已订阅周期的 in-progress bar。
     void on_tick(const XtTick& tick) {
         if (!tick.code[0]) return;
         detail::slot_for(last_core_ticks_, tick.code) = tick;
         update_bar_series(tick);
     }
 
+    /// @brief 直接注入一根完成 bar，不走 tick 聚合。
+    ///
+    /// 若该 series 已有 tick 聚合中的 in-progress bar，先写入历史再注入。
+    /// 这是 CTA tick/bar 模式切换时的防御性处理，正常路径不应混用同一 series。
     void inject_completed_bar(const char* code, const char* period, const XtBar& bar) {
         if (!code || code[0] == '\0' || !period || period[0] == '\0') return;
         const std::string key = bar_key(code, period);
@@ -96,6 +106,9 @@ public:
         s.bars.push_back(bar);
     }
 
+    /// @brief 设置指定品种+周期的 bar 历史容量。
+    ///
+    /// 仅在 series 尚未创建时生效；已存在 series 不重新分配。
     void set_series_capacity(const char* code, const char* period, size_t cap) {
         if (!code || code[0] == '\0' || !period || period[0] == '\0' || cap == 0) return;
         const std::string key = bar_key(code, period);
@@ -109,6 +122,11 @@ public:
         }
     }
 
+    /// @brief 拷贝最近 bar 到调用方缓冲区。
+    ///
+    /// 首次查询一个合法 `(code, period)` 会创建对应 series；若已有最新 tick，
+    /// 会立即生成当前 in-progress bar，使查询端不必等待下一笔 tick。
+    /// @return 实际写入 out 的 bar 数量，最多 max。
     size_t get_bars(const char* code, const char* period, XtBar* out, size_t max) {
         if (!code || code[0] == '\0' || !period || period[0] == '\0' || !out || max == 0) return 0;
         const std::string key = bar_key(code, period);
@@ -127,7 +145,7 @@ public:
 
 private:
     struct BarSeries {
-        uint32_t period_ms = 0;
+        uint32_t period_ms = 0;   ///< 聚合周期，单位 ms。
         uint32_t last_date = 0;
         uint64_t last_bucket = 0;
         bool has_bar = false;
@@ -140,6 +158,7 @@ private:
         if (!period || period[0] == '\0') return false;
         std::string s(period);
 
+        // 兼容 WonderTrader 风格周期：既接受 "5m"，也接受 "m5"。
         size_t i = 0;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
 
@@ -183,6 +202,11 @@ private:
         return ((hh * 60 + mm) * 60 + ss) * 1000 + ms;
     }
 
+    // 内部 tick 聚合按 (trading_date, ms_of_day / period_ms) 分桶，并在
+    // trading_date 翻转时强制切 bar；这样可覆盖 ms/s 周期。CTA/SEL 的完成
+    // bar 由外部聚合器经 inject_completed_bar 注入，不走本路径。
+    // @note >6h 周期在夜盘 21:00 处会按 trading_date 切分；启用大周期前须
+    //       先与 xt_bar_slot 的 action_date 分桶语义统一。
     void update_bar_series(const XtTick& tick) {
         auto it_keys = bar_keys_by_code_.find(tick.code);
         if (it_keys == bar_keys_by_code_.end()) return;
@@ -261,9 +285,10 @@ private:
         return idx;
     }
 
+    /// @brief 返回 `<code>@<period>` 拼接 key，by-value 让 caller 持 ownership。
     static std::string bar_key(const char* code, const char* period) {
         std::string k;
-        k.reserve(32);
+        k.reserve(32);  // 覆盖典型 `<code>@<period>` 长度。
         if (code) k.append(code);
         k.push_back('@');
         if (period) k.append(period);
@@ -271,7 +296,7 @@ private:
     }
 
     size_t bar_history_cap_ = 512;
-
+    // 透明 hash 避免查询路径为 const char* key 构造临时 string。
     xt_core::sync::TransparentStringMap<BarSeries> bar_series_;
     xt_core::sync::TransparentStringMap<std::vector<std::string>> bar_keys_by_code_;
     xt_core::sync::TransparentStringMap<double> last_total_volume_;
@@ -279,4 +304,4 @@ private:
     xt_core::sync::TransparentStringMap<XtTick> last_core_ticks_;
 };
 
-}
+}  // namespace xt_runtime::market

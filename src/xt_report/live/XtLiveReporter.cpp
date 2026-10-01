@@ -25,10 +25,14 @@ void XtLiveReporter::on_fill(const XtFillRow& fill,
 
 void XtLiveReporter::on_equity(double equity) {
     if (!std::isfinite(equity)) return;
-
+    // 显式 baseline 模式：只更新 last_equity。start_equity 由 set_baseline_equity 设置。
+    // 未 baseline 时保留 last_equity (作为 auto-latch 兜底 + flush_run_summary 末尾兜底).
     last_equity_ = equity;
     if (equity_initialized_) return;
-
+    // 兜底 auto-latch：要求权益 > 1 元（排除账户未初始化的 transient 小值 / 0）
+    // AND 与上一次 auto-latch candidate 稳定（连续两次同值才 latch）
+    // 单次非零判定会被账户初始化期 0 值 + 后续巨额跃升组合触发假阳 baseline
+    // （量级可达千万），故要求连续两次稳定才 latch。
     if (equity > 1.0) {
         if (auto_latch_pending_ && std::fabs(auto_latch_candidate_ - equity) < 1.0) {
             start_equity_ = equity;
@@ -65,7 +69,7 @@ void XtLiveReporter::flush_account_truth(int64_t ts_sec, const XtAccountTruthRow
 
 void XtLiveReporter::set_baseline_equity(double equity) {
     if (!std::isfinite(equity)) return;
-    if (equity_initialized_) return;
+    if (equity_initialized_) return;  // 幂等：baseline 已初始化，后续调用保持原值
     start_equity_       = equity;
     last_equity_        = equity;
     equity_initialized_ = true;
@@ -97,7 +101,8 @@ void XtLiveReporter::write_kpi(int64_t now_ms,
                                    const LatencyStats& latency,
                                    bool kill_switch_active) {
     const double pnl_net   = session_pnl_net();
-
+    // pnl_gross = equity 口径 pnl_net 加回 per-fill 累加的 fee/slippage：两者来源
+    // 不同源（equity 含结算全部成本 / fee 为本地逐笔），仅作展示列非风控输入。
     const double pnl_gross = pnl_net + cumulative_fee_ + cumulative_slippage_;
     const double uptime    = now_ms >= start_ms_
                                  ? static_cast<double>(now_ms - start_ms_) / 1000.0
@@ -115,7 +120,8 @@ void XtLiveReporter::write_kpi(int64_t now_ms,
 }
 
 void XtLiveReporter::flush_run_summary() {
-
+    // session-end 持久化 + equity baseline 兜底（从未收到可 latch 权益时以最后
+    // 观测值为起点，保 session_pnl_net 读路径有定义）。
     if (!equity_initialized_) {
         start_equity_ = last_equity_;
         equity_initialized_ = true;
@@ -127,4 +133,4 @@ void XtLiveReporter::flush_run_summary() {
     }
 }
 
-}
+} // namespace xt_report

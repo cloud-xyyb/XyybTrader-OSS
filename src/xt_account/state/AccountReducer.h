@@ -9,4 +9,6 @@
 #include "state/AccountState.h"
 #include "state/AccountEvent.h"
 
+/// @brief 将一个 reducer-private 事件应用到 AccountState。
+/// @warning 无同步原语；调用方必须保证同一 AccountState 只有一个 writer。
 void apply_event(AccountState& account, const XtAccountEvent& ev);

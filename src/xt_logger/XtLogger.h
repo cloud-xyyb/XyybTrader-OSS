@@ -19,6 +19,11 @@ class XtLogger {
 public:
     using Config = XtLoggerCfg;
 
+    // ── 初始化与配置 ──────────────────────────────────────────────
+    /// @brief 初始化进程级 async logger。
+    ///
+    /// 配置完成后原子发布 logger snapshot。`queue_size` 和 `thread_count` 传给 spdlog
+    /// 全局 async thread pool；队列满时丢弃最旧排队日志。
     static void init_fast(const char* logfile,
                           LogLevel level = LogLevel::Info,
                           size_t max_size = 50 * 1024 * 1024,
@@ -26,17 +31,19 @@ public:
                           size_t queue_size = 8192,
                           size_t thread_count = 1,
                           bool console = false);
-
+    /// @brief 使用配置对象初始化 logger，并随后应用 module filter 与 throttle 配置。
     static void init(const Config& cfg);
 
+    /// @brief 调整进程级最低日志级别；logger 尚未初始化时为 no-op。
     static void set_level(LogLevel level);
-
+    /// @brief 设置 module filter；未显式配置的 module 默认启用。
     static void set_module_enabled(const std::string& module, bool enabled);
-
+    /// @brief 设置 throttle key 对应的窗口毫秒数；`ms <= 0` 表示不节流。
     static void set_throttle_ms(const std::string& key, int ms);
-
+    /// @brief 读取 throttle key 的窗口毫秒数；未知 key 返回 0。
     static int throttle_ms(const std::string& key);
 
+    // ── 通用日志接口 ──────────────────────────────────────────────
     template <typename... Args>
     static void trace(const char* fmt, const Args&... args) {
         log_impl(LogLevel::Trace, fmt, args...);
@@ -67,6 +74,7 @@ public:
         log_impl(LogLevel::Critical, fmt, args...);
     }
 
+    // ── 分模块日志接口 ──────────────────────────────────────────────
     template <typename... Args>
     static void trace_m(const char* module, const char* fmt, const Args&... args) {
         log_impl_mod(LogLevel::Trace, module, fmt, args...);
@@ -92,6 +100,7 @@ public:
         log_impl_mod(LogLevel::Error, module, fmt, args...);
     }
 
+    // ── 节流日志接口 ──────────────────────────────────────────────
     template <typename... Args>
     static void info_mt(const char* module, const char* key, const char* fmt, const Args&... args) {
         log_impl_mod_throttle(LogLevel::Info, module, key, fmt, args...);
@@ -107,24 +116,29 @@ public:
         log_impl_mod_throttle(LogLevel::Error, module, key, fmt, args...);
     }
 
+    // ── 全局关闭 ──────────────────────────────────────────────
+    /// @brief flush 当前 logger，关闭 spdlog，并重置进程级 logger snapshot。
     static void shutdown();
 
 private:
-
-    static std::shared_ptr<spdlog::logger> logger();
-
+    // ── 内部状态与工具函数 ──────────────────────────────────────────────
+    /** @brief 获取/创建全局 logger 实例。 */
+    static std::shared_ptr<spdlog::logger> logger();  // 返回原子快照副本（防与 shutdown reset 竞争）
+    /** @brief 将项目日志级别映射到 spdlog 级别。 */
     static int to_spd_level(LogLevel level);
-
+    /** @brief 判断模块日志是否启用。 */
     static bool module_enabled(const std::string& module);
-
+    /** @brief 判断 key 是否应被节流。 */
     static bool should_throttle(const std::string& key, int ms);
 
+    // ── 内部日志实现模板 ──────────────────────────────────────────────
     template <typename... Args>
     static void log_impl(LogLevel level, const char* fmt, const Args&... args) {
-        auto lg = logger();
+        auto lg = logger();  // 本地副本：!lg 检查与 lg->log 用同一快照，消除 TOCTOU
         if (!lg)
             return;
-
+        // spdlog 1.12+ 的 logger::log() variadic 重载要求 format_string_t 在编译期校验;
+        // XtLogger 的 fmt 是运行时 const char*, 必须用 SPDLOG_FMT_RUNTIME 旁路 consteval check.
         lg->log(static_cast<spdlog::level::level_enum>(to_spd_level(level)),
                 SPDLOG_FMT_RUNTIME(fmt), args...);
     }
@@ -137,7 +151,7 @@ private:
         }
         if (!module_enabled(module))
             return;
-        auto lg = logger();
+        auto lg = logger();  // 本地副本：!lg 检查与 lg->log 用同一快照，消除 TOCTOU
         if (!lg)
             return;
         std::string f = std::string("[") + module + "] " + fmt;

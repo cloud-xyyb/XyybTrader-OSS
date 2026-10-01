@@ -12,6 +12,8 @@ std::atomic<uint64_t>& exec_delivery_terminal_evicted_total() {
 XtExecDeliveryLedger::XtExecDeliveryLedger(std::size_t terminal_cap)
     : terminal_cap_(terminal_cap == 0 ? 1 : terminal_cap) {}
 
+// ── 登记 ────────────────────────────────────────────────────────
+
 void XtExecDeliveryLedger::register_order(uint64_t local_id, OrderIdentity identity) {
     if (local_id == 0) {
         invalid_input_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -20,7 +22,8 @@ void XtExecDeliveryLedger::register_order(uint64_t local_id, OrderIdentity ident
     std::lock_guard<std::mutex> guard(mu_);
     auto it = records_.find(local_id);
     if (it != records_.end()) {
-
+        // 同 id 重复注册按整体替换：旧记录连同其 fill key / venue 键出账；
+        // 终态域 FIFO 里的残留条目由淘汰时的 has_terminal 检查跳过。
         erase_record_unlocked_(it);
     }
     ExecOrderRecord rec;
@@ -46,6 +49,8 @@ void XtExecDeliveryLedger::rollback_register(uint64_t local_id) {
     erase_record_unlocked_(it);
 }
 
+// ── fill 记账 ────────────────────────────────────────────────────
+
 bool XtExecDeliveryLedger::record_fill(uint64_t local_id, FillArgs fill) {
     if (fill.fill_key.empty()) {
         invalid_input_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -58,7 +63,8 @@ bool XtExecDeliveryLedger::record_fill(uint64_t local_id, FillArgs fill) {
     }
     auto it = (local_id != 0) ? records_.find(local_id) : records_.end();
     if (it == records_.end()) {
-
+        // 无归属 fill：key 记入 orderless 域，保住全局 exactly-once 判据
+        // （同笔 foreign fill / 淘汰后重放不会二次放行判新）。
         fill_record_miss_.fetch_add(1, std::memory_order_relaxed);
         fill_key_index_.insert(fill.fill_key);
         orderless_fifo_.push_back(std::move(fill.fill_key));
@@ -90,6 +96,8 @@ int64_t XtExecDeliveryLedger::cum_filled_fp(uint64_t local_id) const {
     return (it == records_.end()) ? 0 : it->second.cum_filled_fp;
 }
 
+// ── 终态 payload ────────────────────────────────────────────────
+
 bool XtExecDeliveryLedger::record_terminal(uint64_t local_id, const TerminalRecord& terminal) {
     if (local_id == 0) {
         invalid_input_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -98,7 +106,8 @@ bool XtExecDeliveryLedger::record_terminal(uint64_t local_id, const TerminalReco
     std::lock_guard<std::mutex> guard(mu_);
     auto it = records_.find(local_id);
     if (it == records_.end()) {
-
+        // 未登记 id 的终态也承载（骨架记录）：payload 保留供合成重发查询，
+        // retention 与正常终态记录同域。
         terminal_record_miss_.fetch_add(1, std::memory_order_relaxed);
         ExecOrderRecord rec;
         rec.local_id = local_id;
@@ -125,6 +134,8 @@ bool XtExecDeliveryLedger::terminal_record(uint64_t local_id, TerminalRecord& ou
     return true;
 }
 
+// ── 撤单证据 ────────────────────────────────────────────────────
+
 void XtExecDeliveryLedger::record_cancel_attempt(uint64_t local_id, uint64_t ts_ms,
                                                  CancelOutcome outcome) {
     std::lock_guard<std::mutex> guard(mu_);
@@ -138,6 +149,8 @@ void XtExecDeliveryLedger::record_cancel_attempt(uint64_t local_id, uint64_t ts_
         CancelAttempt{ts_ms, outcome};
     ++rec.cancel_attempt_total;
 }
+
+// ── venue 键反向索引 ────────────────────────────────────────────
 
 void XtExecDeliveryLedger::set_venue_key(uint64_t local_id, const std::string& venue_key) {
     if (venue_key.empty()) return;
@@ -167,6 +180,8 @@ std::optional<uint64_t> XtExecDeliveryLedger::local_for_venue_key(
     if (it == venue_key_to_local_.end()) return std::nullopt;
     return it->second;
 }
+
+// ── 遍历 / 观测 ────────────────────────────────────────────────
 
 std::vector<uint64_t> XtExecDeliveryLedger::open_ids() const {
     std::vector<uint64_t> out;
@@ -230,11 +245,13 @@ XtExecDeliveryLedger::Stats XtExecDeliveryLedger::stats() const {
     return s;
 }
 
+// ── 内部维护 ────────────────────────────────────────────────────
+
 void XtExecDeliveryLedger::bind_venue_key_unlocked_(uint64_t local_id,
                                                     const std::string& venue_key) {
     auto [vit, inserted] = venue_key_to_local_.try_emplace(venue_key, local_id);
     if (!inserted && vit->second != local_id) {
-
+        // venue 键在 venue 侧唯一；撞键按后写归属并计数（观测面暴露异常）。
         venue_key_collision_.fetch_add(1, std::memory_order_relaxed);
         vit->second = local_id;
     }
@@ -260,7 +277,8 @@ void XtExecDeliveryLedger::enforce_terminal_cap_unlocked_() {
         const uint64_t old_id = terminal_fifo_.front();
         terminal_fifo_.pop_front();
         auto it = records_.find(old_id);
-
+        // 同 id 重注册会把记录翻回未终态；FIFO 残留条目此处跳过，
+        // 该记录再次终态时会得到新条目。
         if (it == records_.end() || !it->second.has_terminal) continue;
         erase_record_unlocked_(it);
         evicted_terminal_records_.fetch_add(1, std::memory_order_relaxed);
@@ -276,4 +294,4 @@ void XtExecDeliveryLedger::enforce_orderless_cap_unlocked_() {
     }
 }
 
-}
+}  // namespace xt_live::gateway

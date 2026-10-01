@@ -18,27 +18,32 @@
 /// tick 量（分片粒度即驻留上界）。
 class XtRawShardTickReader : public IMarketDataReader {
 public:
-
+    /// @brief 构造并接管分片路径列表；读取顺序与 `shard_paths` 一致。
     explicit XtRawShardTickReader(std::vector<std::string> shard_paths);
 
+    /// @return true 表示路径列表非空；不在此打开或校验分片。
     bool init() override;
-
+    /// @brief 回到首片并释放当前分片缓存与 sticky I/O 状态。
     void reset() override;
-
+    /// @return true 表示 `out` 已写入下一条 tick；false 表示分片耗尽或校验失败。
+    /// @note 校验失败与正常 EOF 用 has_io_error() 区分：前者必须让上层判定 run 失败，
+    ///       否则损坏分片会被当成提前 EOF 静默截断出假结果。
     bool next_tick(XtRawTick& out) override;
 
+    /// @brief 校验失败的分片路径；无失败时为空串（诊断/告警用）。
     const std::string& failed_shard() const { return failed_shard_; }
-
+    /// @brief 校验失败的原因码；未失败时为 `Ok`。
     xt_raw_shard::XtRawShardStatus failure_status() const { return failure_status_; }
 
 private:
-
+    /// @brief 载入下一个可用分片到 `records_`。
+    /// @return false 表示路径耗尽，或某片校验失败（后者已置 io_error_）。
     bool load_next_shard();
 
-    std::vector<std::string> shard_paths_;
-    std::vector<XtRawTick> records_;
-    size_t path_idx_ = 0;
-    size_t rec_idx_ = 0;
-    std::string failed_shard_;
+    std::vector<std::string> shard_paths_;  ///< 待读取分片；不排序、不去重。
+    std::vector<XtRawTick> records_;        ///< 当前分片的全部记录（校验通过后才填充）。
+    size_t path_idx_ = 0;                   ///< 下一次 load_next_shard() 的路径下标。
+    size_t rec_idx_ = 0;                    ///< records_ 的交付游标。
+    std::string failed_shard_;              ///< 见 failed_shard()。
     xt_raw_shard::XtRawShardStatus failure_status_ = xt_raw_shard::XtRawShardStatus::Ok;
 };

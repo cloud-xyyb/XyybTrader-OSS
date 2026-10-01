@@ -26,20 +26,31 @@ struct XtPositionMarkInput {
     int64_t short_qty = 0;
     int64_t short_avg_price = 0;
     int64_t mark_price = 0;
-    int64_t vol_scale_fp = xt_fp::kScale;
+    int64_t vol_scale_fp = xt_fp::kScale;  ///< 合约乘数；默认 1.0 fp。
 };
 
+/// @brief 计算单合约未实现盈亏（fixed-point）。
+///
+/// 公式：unrealized = (mark - long_avg) * long_qty * vol_scale
+///                  + (short_avg - mark) * short_qty * vol_scale
 inline int64_t position_unrealized(const XtPositionMarkInput& in) {
     const int64_t long_leg_raw  = xt_fp::mul(in.mark_price - in.long_avg_price, in.long_qty);
     const int64_t short_leg_raw = xt_fp::mul(in.short_avg_price - in.mark_price, in.short_qty);
     return xt_fp::mul(long_leg_raw + short_leg_raw, in.vol_scale_fp);
 }
 
+/// @brief 计算单合约市值（净仓 * mark * vol_scale，fixed-point）。
+///
+/// 股票和现货权益使用 cash + market_value；期货权益使用 cash + unrealized。
+/// 市值函数仍套用 `vol_scale_fp`，让同一个输入在两种 equity 分支下保持单位一致。
 inline int64_t position_market_value(const XtPositionMarkInput& in) {
     return xt_fp::mul(xt_fp::mul(in.mark_price, in.long_qty - in.short_qty),
                       in.vol_scale_fp);
 }
 
+/// @brief 聚合账户权益（fixed-point）。
+///
+/// 期货模式取 cash + total_unrealized；股票和现货模式取 cash + total_market_value。
 inline int64_t equity(int64_t cash,
                       int64_t total_unrealized,
                       int64_t total_market_value,
@@ -47,4 +58,4 @@ inline int64_t equity(int64_t cash,
     return futures_mode ? (cash + total_unrealized) : (cash + total_market_value);
 }
 
-}
+} // namespace xt_account

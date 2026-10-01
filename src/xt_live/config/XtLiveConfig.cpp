@@ -1,9 +1,10 @@
 #include "XtLiveConfig.h"
 #include "xt_cost/XtTradeCostConfigParser.h"
-#include "LiveConfigSchemaRules.h"
-#include "LiveConfigParsers.h"
-#include "xt_config/yaml/ConfigYamlUtil.h"
-#include "LiveConfigValidators.h"
+#include "LiveConfigSchemaRules.h"     // build_live_schema_rules()
+#include "LiveConfigParsers.h"         // parse_* leaf functions
+#include "xt_config/yaml/ConfigYamlUtil.h"            // as_or / typed-read templates
+#include "LiveConfigValidators.h"      // validate_live_config + validate_strategy_or_strategies_cfg
+#include "DeclaredUniverse.h"          // collect_declared_universe（declared 收集单源）
 
 #include <algorithm>
 #include <cctype>
@@ -32,8 +33,13 @@ XtStrategyFactoryCfg parse_strategy_factory_config(const YAML::Node& node);
 
 namespace {
 
+// 本 TU 通过 namespace alias 保持 YAML typed-read 调用点简短。
 namespace YamlNodeUtil = ::XtConfigYamlUtil;
 
+// 解析 md.transport / md.shm_ring / md.stale_md_ms，填入 MdProviderCfg。
+// transport=shm 时 factory 改返 XtShmMdGateway（从 connector ring 读行情）；direct
+// 为默认现状路径。非法 transport 值 / shm 缺 shm_ring 记 validation_error。
+// 另：shm（多盘组合盘）还要求显式 runtime.instance_id（见函数尾部），故需 runtime_node。
 void parse_md_transport_cfg(const YAML::Node& md_node,
                             const YAML::Node& runtime_node,
                             gateway_factory::MdProviderCfg& out,
@@ -56,7 +62,11 @@ void parse_md_transport_cfg(const YAML::Node& md_node,
     if (out.transport == gateway_factory::MdTransport::Shm && out.shm_ring.empty()) {
         validation_errors.push_back("runtime.md.transport=shm 需要非空 runtime.md.shm_ring");
     }
-
+    // 多盘组合盘 (transport=shm) 必须显式声明 per-book runtime.instance_id。该单一身份派生
+    // safety / aggregator / baseline 三类 per-instance state 子目录；缺失会令同 venue 多 runner
+    // 静默回退共享 md_provider 派生路径，互覆写 kill_switch latch / peak_equity / today-PnL，
+    // 破坏 per-book 隔离。fail-closed：组合盘配置缺该键即记 validation_error，
+    // runner 启动期拒绝（见 RunnerBootCommon::load_live_config_or_report）。direct（单盘现状）不受影响。
     if (out.transport == gateway_factory::MdTransport::Shm) {
         const std::string instance_id =
             YamlNodeUtil::as_or<std::string>(runtime_node, "instance_id", std::string());
@@ -69,6 +79,7 @@ void parse_md_transport_cfg(const YAML::Node& md_node,
     }
 }
 
+// Strategy init cfg helpers：负责 strategies-vector 装配时的兼容字段注入/清理。
 XtStrategyInitConfig make_strategy_init_cfg(const YAML::Node& strategy_node) {
     XtStrategyInitConfig cfg;
     XtConfigYamlUtil::flatten_yaml_node_to_map(strategy_node, "", cfg.values, true);
@@ -139,28 +150,6 @@ void inject_strategy_single_entry_cfg(XtStrategyInitConfig& cfg,
     }
 }
 
-void add_unique_sub(std::vector<std::string>& out, const std::string& symbol) {
-    if (symbol.empty()) return;
-    if (std::find(out.begin(), out.end(), symbol) == out.end()) out.push_back(symbol);
-}
-
-void refresh_md_subscriptions_from_strategies(XtLiveConfig& out,
-                                              const std::string& global_symbol) {
-    out.parsed.md_cfg.subs.clear();
-    add_unique_sub(out.parsed.md_cfg.subs, global_symbol);
-    for (const auto& entry : out.parsed.strategies) {
-        add_unique_sub(out.parsed.md_cfg.subs, entry.init_cfg.get_string("symbol", ""));
-    }
-}
-
-void append_roll_symbols_to_md_subscriptions(XtLiveConfig& out) {
-    if (!out.bootstrap.has_roll_cfg) return;
-    XtRollEngine roll(out.bootstrap.roll_cfg);
-    for (const auto& code : roll.all_symbols()) {
-        add_unique_sub(out.parsed.md_cfg.subs, code);
-    }
-}
-
 void fill_strategy_pnl_emit_targets(XtLiveConfig& out) {
     out.runtime.control_cfg.strategy_pnl_emit_targets.clear();
     for (const auto& entry : out.parsed.strategies) {
@@ -176,6 +165,8 @@ void fill_strategy_pnl_emit_targets(XtLiveConfig& out) {
     }
 }
 
+// ── Param backend / latency cfg makers (简单 yaml field-mapping) ──────────────
+// 与 fill_misc_runtime_cfg 紧耦合 (one-shot 装配),没必要单独 export,留 anon-ns。
 XtLiveParamDomain::BackendConfig make_param_backend_cfg(const YAML::Node& runtime_node) {
     XtLiveParamDomain::BackendConfig cfg;
     const YAML::Node backend = runtime_node["params_backend"];
@@ -190,14 +181,14 @@ XtLiveLatencyTracker::Config make_latency_cfg(const YAML::Node& debug_node) {
     cfg.enabled = YamlNodeUtil::as_or<bool>(debug_node, "latency_enabled", true);
     const int64_t ttl_us = YamlNodeUtil::as_or<int64_t>(debug_node, "latency_stale_ttl_us", 60000000LL);
     cfg.stale_ttl_us = ttl_us > 0 ? static_cast<uint64_t>(ttl_us) : 60000000ULL;
-
+    // rolling window 秒数, 默认 600s (10 min). 0 退化累计.
     const int64_t win_s = YamlNodeUtil::as_or<int64_t>(debug_node, "latency_rolling_window_s", 600LL);
     cfg.rolling_window_s = win_s > 0 ? static_cast<uint64_t>(win_s) : 0;
     return cfg;
 }
 
 template <typename T, typename ParserFn>
-
+// 封装冷路径 parser 调用，把异常统一转换为 validation_errors。
 bool parse_typed_cfg(const YAML::Node& node,
                      const std::string& error_prefix,
                      T& out,
@@ -301,6 +292,7 @@ ParsedFlags parse_and_validate_base_cfg(const LiveConfigNodes& nodes,
         validation_errors,
         [](const YAML::Node& n) { return parse_trade_gateway_config(n); });
 
+    // Common cfg 先解析 provider-neutral 字段；此处补 provider-specific variant。
     const std::string md_provider_str =
         YamlNodeUtil::as_or<std::string>(nodes.md_node, "provider", std::string());
     const std::string td_provider_str =
@@ -312,7 +304,8 @@ ParsedFlags parse_and_validate_base_cfg(const LiveConfigNodes& nodes,
     } else if (md_provider_str == "ctp") {
         out.parsed.md_provider_cfg.extra = parse_ctp_md_cfg(nodes.md_node);
     }
-
+    // md.transport（direct 默认=现状 / shm=从 connector 广播 ring 读行情）。shm 时
+    // factory 忽略 venue extra 改返 XtShmMdGateway；venue 名仍驱动 venue_kind 推导。
     parse_md_transport_cfg(nodes.md_node, nodes.runtime_node, out.parsed.md_provider_cfg, validation_errors);
     if (td_provider_str == "binance_u") {
         out.parsed.td_provider_cfg.extra = parse_binance_td_cfg(nodes.td_node);
@@ -394,7 +387,7 @@ void parse_runtime_runner_cfg(const LiveConfigNodes& nodes,
     if (flags.td_cfg_ok) {
         out.parsed.td_cfg.recovery_enabled = YamlNodeUtil::as_or<bool>(nodes.td_node, "recovery", true);
     }
-
+    // runtime.td.reconcile.* → venue-neutral reconcile loop 配置（缺节走 struct 默认）。
     parse_typed_cfg(
         nodes.td_node,
         "runtime.td.reconcile 配置解析失败",
@@ -423,15 +416,23 @@ void parse_strategy_runtime_cfg(const LiveConfigNodes& nodes,
     }
 }
 
+// fill_misc_runtime_cfg helpers：每个 helper 只写 out 的一个子域。
+
+// 控制面只走 `runtime.control_grpc`；yaml 老 `runtime.control_panel` /
+// `runtime.control_cfg` block 由 validator fail-closed 拒启动。
+// fill_control_grpc_cfg 定义在本文件 anon namespace 之外（validator 共用，见 header）。
+
 void fill_safety_state_cfg(const YAML::Node& runtime_node,
                            const std::string& md_provider,
                            XtRunnerControlConfig& ctrl) {
-
+    // runtime.instance_id 是单一身份来源：safety / aggregator / baseline 三类 per-instance
+    // state 全部派生自它（空=回退 md_provider，再空=_default，见 resolved_instance_id）。
     ctrl.instance_id =
         YamlNodeUtil::as_or<std::string>(runtime_node, "instance_id", std::string());
-
+    // safety.bin 路径派生（非直接配置）：instance_state_dir/<id>/safety.bin。单盘 direct
+    // 无 instance_id → 回退 /state/<md_provider>/safety.bin（有意全迁移，无 compat）。
     ctrl.safety_state_path = instance_state_dir(md_provider, ctrl.instance_id) + "/safety.bin";
-
+    // save_interval 仍可调（默认 60s）。
     const YAML::Node ss_node =
         (runtime_node && !runtime_node.IsNull()) ? runtime_node["safety_state"] : YAML::Node();
     ctrl.safety_state_save_interval_ms =
@@ -439,7 +440,10 @@ void fill_safety_state_cfg(const YAML::Node& runtime_node,
 }
 
 void fill_metrics_cfg(const YAML::Node& runtime_node, XtRunnerControlConfig& ctrl) {
-
+    // metrics exposer port per-profile
+    // 默认 9101 保持现 CTP / Binance profile bit-exact; XTP 或多 runner 同 host
+    // 可在 yaml 设 `runtime.metrics.exposer_port: 9102` 避免 bind 冲突。
+    // 0 = 跳过 exposer 启动 (caller 依据 port==0 决定是否调 start_exposer)。
     const YAML::Node m_node =
         (runtime_node && !runtime_node.IsNull()) ? runtime_node["metrics"] : YAML::Node();
     ctrl.metrics_exposer_port =
@@ -454,6 +458,8 @@ void fill_portfolio_router_flag(const YAML::Node& runtime_node, XtLiveParsedConf
         runtime_node, "portfolio_router", true);
 }
 
+// ── selector.tasks[]（SEL live 调度任务）────────────────────────────────────
+
 bool parse_sel_task_period(const std::string& s, TaskPeriod& out) {
     if (s == "minute")  { out = TaskPeriod::Minute;  return true; }
     if (s == "daily")   { out = TaskPeriod::Daily;   return true; }
@@ -463,6 +469,8 @@ bool parse_sel_task_period(const std::string& s, TaskPeriod& out) {
     return false;
 }
 
+/// @brief 解析顶层 `selector.tasks[]`（字段对齐 BT `selector.task` 单数节）。
+/// 非法 entry 记 validation_error（runner 启动 fail-fast），不静默跳过。
 void fill_selector_tasks(const YAML::Node& root,
                          XtLiveParsedConfig& parsed,
                          std::vector<std::string>& validation_errors) {
@@ -516,15 +524,18 @@ void fill_selector_tasks(const YAML::Node& root,
 }
 
 void fill_strategies_vector(const LiveConfigNodes& nodes, XtLiveParsedConfig& parsed) {
-
+    // ── 装配 strategies vector（single/multi unified path） ────────────────────────
+    //
+    // `runtime.strategies: [{...}, {...}]` 是唯一策略入口；N 可为 1。
+    // strategy_cfg + strategy_init_cfg 镜像到 strategies[0]，供既有 runner 字段读取。
     parsed.strategies.clear();
     const YAML::Node strategies_node =
         (nodes.runtime_node && !nodes.runtime_node.IsNull()) ? nodes.runtime_node["strategies"] : YAML::Node();
     if (strategies_node && !strategies_node.IsNull() && strategies_node.IsSequence()) {
-
+        // 多策略：解析 N 个 entry
         for (size_t i = 0; i < strategies_node.size(); ++i) {
             const auto& e = strategies_node[i];
-            if (!e || !e.IsMap()) continue;
+            if (!e || !e.IsMap()) continue;  // validate 已在 validate_strategy_or_strategies_cfg 中拦截
             LiveStrategyEntry entry;
             entry.factory_cfg = parse_strategy_factory_config(e);
             entry.init_cfg    = make_strategy_init_cfg(e);
@@ -543,7 +554,7 @@ void fill_roll_engine_cfg(const YAML::Node& runtime_node,
                           const std::string& cfg_path,
                           XtLiveBootstrapPlan& bootstrap,
                           std::vector<std::string>& validation_errors) {
-
+    // 换月引擎配置（可选）——内联解析，避免链接 xt_bt_hft
     if (!runtime_node || !runtime_node["roll"]) return;
     const std::size_t errors_before = validation_errors.size();
     auto& rcfg = bootstrap.roll_cfg;
@@ -553,7 +564,7 @@ void fill_roll_engine_cfg(const YAML::Node& runtime_node,
     rcfg.window_before_days      = YamlNodeUtil::as_or<int>(roll_node, "window_before_days", 0);
     rcfg.window_after_days       = YamlNodeUtil::as_or<int>(roll_node, "window_after_days", 0);
     rcfg.dispatch_parallel_ticks = YamlNodeUtil::as_or<bool>(roll_node, "dispatch_parallel_ticks", false);
-
+    // roll path 文件解析（简化版，复用 XtTimeParse）
     if (roll_node["path"]) {
         const std::string raw_path = roll_node["path"].as<std::string>();
         const std::string roll_path = resolve_path_lexical_from_config(cfg_path, raw_path);
@@ -620,7 +631,8 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
     out.runtime.control_cfg =
         parse_runner_control_config(
             nodes.md_node, nodes.debug_node, nodes.strategy_node, nodes.instrument_node, account_node);
-
+    // md_provider 先于 fill_safety_state_cfg 解析：后者用它在 instance_id 缺省时派生 state 路径。
+    // 纯幂等读 nodes.md_node["provider"]，不依赖中间任何 fill_* 调用。
     out.parsed.md_provider = YamlNodeUtil::as_or<std::string>(nodes.md_node, "provider", std::string());
     out.parsed.td_provider = YamlNodeUtil::as_or<std::string>(nodes.td_node, "provider", std::string());
     fill_control_grpc_cfg(nodes.runtime_node, out.runtime.control_grpc_cfg);
@@ -635,8 +647,10 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
         YamlNodeUtil::as_or<int>(nodes.debug_node, "params_wait_timeout_ms", 1000));
     fill_portfolio_router_flag(nodes.runtime_node, out.parsed);
 
+    // venue_label 供 HftRunnerControl 1Hz account-level metric 使用。
     out.runtime.control_cfg.venue_label = out.parsed.md_provider;
 
+    // venue_kind 决定下单路径是否启用 A 股集合竞价限制。
     if (out.parsed.md_provider == "xtp") {
         out.bootstrap.order_gateway_cfg.venue_kind = xt_core::XtVenueKind::AShare;
     } else if (out.parsed.md_provider == "ctp") {
@@ -656,7 +670,6 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
         out.parsed.strategy_init_cfg, nodes.instrument_node, nodes.session_node, nodes.trading_node);
 
     fill_strategies_vector(nodes, out.parsed);
-    refresh_md_subscriptions_from_strategies(out, instrument_symbol);
     fill_strategy_pnl_emit_targets(out);
 
     out.bootstrap.recording_cfg = parse_recording_cfg(nodes.runtime_node);
@@ -664,8 +677,14 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
     out.bootstrap.risk_monitor_cfg = parse_risk_monitor_cfg(nodes.runtime_node);
 
     fill_roll_engine_cfg(nodes.runtime_node, out.parsed.cfg_path, out.bootstrap, validation_errors);
-    append_roll_symbols_to_md_subscriptions(out);
+    // DeclaredUniverse 一次成型：roll 派生合约是其构成之一，故装配点排在 roll
+    // 配置解析之后。规模超上限 → validation_error → runner 启动前 abort。
+    out.parsed.md_cfg.subs = xt_live::collect_declared_universe(out, instrument_symbol);
+    validate_declared_universe_size(out.parsed.md_cfg.subs, validation_errors);
 
+    // local_id 发号器 per-instance 域身份注入 —— resolved instance id
+    // 钉进 TD provider cfg（binance/XTP 用它派生 per-instance state file +
+    // 高位 instance tag，multibook 跨进程 id 唯一）。CTP 不用该发号器（OrderRef）。
     {
         const std::string inst = resolved_instance_id(
             out.parsed.md_provider, out.runtime.control_cfg.instance_id);
@@ -677,10 +696,10 @@ void fill_misc_runtime_cfg(const LiveConfigNodes& nodes,
     }
 }
 
-}
+} // namespace
 
 void fill_control_grpc_cfg(const YAML::Node& runtime_node, XtLiveControlGrpcConfig& cfg) {
-
+    // control plane 默认开启；dry-run / 单测 profile 需显式配置 enabled=false。
     const YAML::Node cg_node =
         (runtime_node && !runtime_node.IsNull()) ? runtime_node["control_grpc"] : YAML::Node();
     const YAML::Node tls_node = cg_node ? cg_node["tls"] : YAML::Node();
@@ -700,7 +719,10 @@ void fill_control_grpc_cfg(const YAML::Node& runtime_node, XtLiveControlGrpcConf
     cfg.audit_log_path =
         XtConfigYamlUtil::as_or<std::string>(cg_node, "audit_log_path", cfg.audit_log_path);
 #ifndef XT_HAVE_CONTROL_GRPC
-
+    // grpc-OFF build（开发/回测二进制）下，enabled 若只是 struct 默认而非 yaml
+    // 显式请求 → 降级 disabled（warn 不 fatal），否则任何无 control_grpc 节的
+    // live 配置在 runner 装配层启动即死；显式 enabled:true 仍由
+    // validate_control_grpc_node fail-closed 拒启动。
     if (cfg.enabled && !cfg.enabled_explicit) {
         std::fprintf(stderr,
                      "[CFG WARN] runtime.control_grpc.enabled 未显式配置且本 binary "
@@ -725,9 +747,15 @@ bool load_live_config(int argc,
         return false;
     }
 
+    // secrets.yaml 文件权限 0600 强制 fail-closed:含 CTP password / binance
+    // api_secret 明文,误 chmod 644 → 同机其他 user 可读 → secret 泄漏。
+    // load 前 stat() 验证 0600 / 0400 否则 fatal_error 退出, systemd
+    // OnFailure= 触发告警。检查放 load_live_config 入口而非 YAMLMergeUtil
+    // (live + backtest 共用,backtest 不读 secrets 影响面 0)。Windows dev
+    // 环境跳过 (_stat 不返回 unix 权限位)。
 #if defined(__unix__) || defined(__APPLE__)
     {
-
+        // secrets.yaml 与 profile 同目录（见 YAMLMergeUtil::load_profile_with_common_and_market）
         std::string secrets_path = out.parsed.cfg_path;
         const size_t pos = secrets_path.find_last_of("/\\");
         if (pos == std::string::npos) {
@@ -737,7 +765,7 @@ bool load_live_config(int argc,
         }
         struct ::stat st{};
         if (::stat(secrets_path.c_str(), &st) == 0) {
-
+            // secrets.yaml 只允许 owner 访问；group/other 任意权限位都拒绝。
             const mode_t bad_bits = st.st_mode & (S_IRWXG | S_IRWXO);
             if (bad_bits != 0) {
                 std::ostringstream oss;
@@ -749,7 +777,7 @@ bool load_live_config(int argc,
                 return false;
             }
         }
-
+        // 文件不存在 → 跳过（secrets.yaml optional,见 YAMLMergeUtil 注释）
     }
 #endif
 
@@ -757,7 +785,7 @@ bool load_live_config(int argc,
     std::string load_err;
     if (!XtConfigYamlUtil::load_profile_with_common_and_market(
             out.parsed.cfg_path, "common.yaml", "market.yaml", root, &load_err)) {
-
+        // 前缀匹配：loader 的 not-found 消息携带具体路径（"config not found: <path>"）。
         const bool cfg_not_found = load_err.rfind("config not found", 0) == 0;
         fatal_error = cfg_not_found ? load_err : "config parse failed";
         if (!load_err.empty() && !cfg_not_found) fatal_error += ": " + load_err;
@@ -773,7 +801,7 @@ bool load_live_config(int argc,
     fill_misc_runtime_cfg(nodes, out, validation_errors);
     fill_selector_tasks(root, out.parsed, validation_errors);
     resolve_runtime_output_paths(out);
-
+    // STP 自成交防护安全门 fail-closed：关闭须显式给理由，否则 validation_error → runner abort。
     {
         const auto& gw = out.bootstrap.order_gateway_cfg;
         if (!gw.stp_enabled && gw.stp_disabled_reason.empty()) {
@@ -782,7 +810,10 @@ bool load_live_config(int argc,
                 "(self-trade prevention is a safety gate; explicit opt-out reason is mandatory)");
         }
     }
-
+    // multibook identity 前置自证：merge 后（含 per-dir secrets overlay 的
+    // runtime.td[.ctp].user）生效 TD 账号与 expected_investor_id 不一致 = 凭证/部署
+    // 错配，连接之前拒绝启动。空值任一侧 = 不校验（第二道权威校验在
+    // TraderCTP::OnRspUserLogin 用登录回包 UserID 兜底）。
     {
         const auto& td = out.parsed.td_cfg;
         if (!td.expected_investor_id.empty() && !td.user.empty() &&

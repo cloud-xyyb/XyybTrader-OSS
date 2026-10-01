@@ -21,7 +21,7 @@ void on_signal(int sig) {
     }
 }
 
-}
+}  // namespace
 
 void XtProcessUtil::install_shutdown_signal_handlers(std::atomic<bool>& shutdown_flag,
                                                      std::atomic<int>& shutdown_sig) {
@@ -31,12 +31,12 @@ void XtProcessUtil::install_shutdown_signal_handlers(std::atomic<bool>& shutdown
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
-
+    // SA_RESTART 避免慢系统调用在信号后直接返回 EINTR。
     sa.sa_flags = SA_RESTART;
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGQUIT, &sa, nullptr);
-
+    // SIGHUP 在 runner 中按优雅退出处理；log rotation 由外层进程管理。
     sigaction(SIGHUP,  &sa, nullptr);
 #else
     std::signal(SIGINT,  on_signal);

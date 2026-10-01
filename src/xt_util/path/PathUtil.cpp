@@ -133,8 +133,17 @@ std::string filesystem_error_message(const char* action, const std::error_code& 
     return std::string(action) + ": " + ec.message();
 }
 
-void fsync_parent_dir(const std::string& target);
+void fsync_parent_dir(const std::string& target);  // 定义见 write_atomic 节；两处共用。
 
+/// @brief 逐级创建 `dir` 缺失的祖先目录；每级新建成功后 fsync 其父目录，
+///        落盘新增目录项（defense-in-depth：崩溃/断电时未 fsync 的目录项可能
+///        消失，依赖目录存在性做 claim/state 判定的调用方——如
+///        `xt_core::local_id::PerVenueLocalIdGenerator`——据此可能误判槽位可
+///        重抢）。
+/// @note  best-effort：`fsync_parent_dir` 内 open/fsync 失败被吞（不传播、不阻断建目录），
+///        仅弱化 crash 后新目录项的持久强度，不影响建目录本身成功语义。
+/// @note  并发创建时仅实际建成该目录的赢者 fsync；本进程发现目录已存在（race loser）时
+///        跳过 fsync，由赢者负责其父目录项耐久。
 bool create_directories_with_parent_fsync(const std::filesystem::path& dir,
                                           std::string* err) {
     std::vector<std::filesystem::path> missing;
@@ -143,7 +152,7 @@ bool create_directories_with_parent_fsync(const std::filesystem::path& dir,
     while (!cur.empty() && !std::filesystem::exists(cur, ec) && !ec) {
         missing.push_back(cur);
         const auto parent = cur.parent_path();
-        if (parent == cur) break;
+        if (parent == cur) break;  // 到达根，防死循环。
         cur = parent;
     }
     if (ec) {
@@ -158,12 +167,12 @@ bool create_directories_with_parent_fsync(const std::filesystem::path& dir,
             set_path_error(err, filesystem_error_message("create directory failed", ec));
             return false;
         }
-
+        // ec 为空但返回 false：该层已被并发创建者建好，无新目录项，不 fsync。
     }
     return true;
 }
 
-}
+}  // namespace
 
 bool ensure_directory(const std::string& dir, std::string* err) {
     if (err) err->clear();
@@ -228,16 +237,17 @@ bool ensure_writable_directory(const std::string& dir,
 
 namespace {
 
+/// prefix-with-separator 比较，避免 `/foo/bar` 误命中 `/foo/bar2`。
 bool path_under_root_strict(const std::string& canonical, const std::string& root_canonical) {
     if (root_canonical.empty()) return false;
     if (canonical.size() < root_canonical.size()) return false;
     if (canonical.compare(0, root_canonical.size(), root_canonical) != 0) return false;
-    if (canonical.size() == root_canonical.size()) return true;
+    if (canonical.size() == root_canonical.size()) return true;  // 等于 root 本身
     const char sep = canonical[root_canonical.size()];
     return sep == '/' || sep == '\\';
 }
 
-}
+}  // namespace
 
 std::optional<std::string> resolve_under_root(const std::string& root,
                                               const std::string& rel_or_abs) {
@@ -262,7 +272,8 @@ std::atomic<uint64_t> g_atomic_write_counter{0};
 std::string make_tmp_path(const std::string& target) {
     const pid_t pid = ::getpid();
     const uint64_t cnt = g_atomic_write_counter.fetch_add(1, std::memory_order_relaxed);
-
+    // thread_local：避免 static rng 在并发 write_atomic/AtomicOfstream 下的 data race（UB，
+    // TSAN 会报）；路径唯一性本就由 atomic g_atomic_write_counter + pid 保证，rng 仅作额外熵。
     thread_local std::random_device rd;
     thread_local std::mt19937_64 rng(rd());
     const uint64_t r = rng();
@@ -278,7 +289,8 @@ void fsync_parent_dir(const std::string& target) {
     if (target.empty()) return;
     std::string parent = parent_dir(target);
     if (parent.empty()) {
-
+        // parent_dir 对两类路径返回空串，其真实父目录仍需 fsync 才能落盘新增目录项：
+        //   绝对路径根子目录（"/a"）→ 父为根 "/"；相对路径首级（"foo"）→ 父为当前工作目录 "."。
         parent = (target.front() == '/') ? "/" : ".";
     }
     int oflags = O_RDONLY;
@@ -395,6 +407,8 @@ bool AtomicOfstream::commit() {
         return false;
     }
 
+    // rename 已成功时不回滚 target；父目录 fsync 失败只降低 crash 后 rename entry 的持久强度，
+    // 不影响已 fsync 的文件内容完整性，故不作为失败传播（与 SafetyStateStore::save 同口径）。
     fsync_parent_dir(target_);
     return true;
 }
@@ -406,4 +420,4 @@ void AtomicOfstream::abort() {
     ::unlink(tmp_.c_str());
 }
 
-}
+}  // namespace PathUtil

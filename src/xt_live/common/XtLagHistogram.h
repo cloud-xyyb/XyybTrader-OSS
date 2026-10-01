@@ -18,7 +18,7 @@ public:
     static constexpr size_t kBuckets = 64;
 
     struct Stats {
-        uint64_t count  = 0;
+        uint64_t count  = 0;  ///< 窗口样本数；0 时分位字段无意义（保持 0）。
         uint64_t p50_us = 0;
         uint64_t p99_us = 0;
     };
@@ -27,6 +27,7 @@ public:
         buckets_[bucket_index(lag_us)].fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// @brief 读取并清零窗口计数，返回窗口分位。
     Stats drain() noexcept {
         std::array<uint64_t, kBuckets> snap{};
         uint64_t total = 0;
@@ -42,16 +43,19 @@ public:
         return s;
     }
 
+    /// @brief lag → 桶号：桶 0 收 lag=0；桶 i (i>=1) 收 [2^(i-1), 2^i) µs；越界并顶桶。
     static constexpr size_t bucket_index(uint64_t lag_us) noexcept {
         if (lag_us == 0) return 0;
         const size_t idx = static_cast<size_t>(64 - __builtin_clzll(lag_us));
         return idx < kBuckets ? idx : kBuckets - 1;
     }
 
+    /// @brief 桶 i 的报告值（桶上界 2^i µs，桶 0 → 1µs；顶桶饱和）。
     static constexpr uint64_t bucket_upper_us(size_t i) noexcept {
         return i >= kBuckets - 1 ? (1ULL << (kBuckets - 1)) : (1ULL << i);
     }
 
+    /// @brief 桶计数 → 分位（rank = ceil(total*pct/100)，返回命中桶上界）。纯函数供单测。
     static uint64_t percentile_from_counts(const uint64_t* counts, size_t n,
                                            uint64_t total, unsigned pct) noexcept {
         if (total == 0 || n == 0) return 0;
@@ -68,4 +72,4 @@ private:
     std::array<std::atomic<uint64_t>, kBuckets> buckets_{};
 };
 
-}
+}  // namespace xt_live

@@ -22,6 +22,11 @@
 
 namespace xyybtrader::recovery {
 
+/// @brief 发出一批恢复到的在途单：记 metric、打日志，然后调 handler。
+/// @param orders         恢复到的 alive in-flight orders（move 给 handler）
+/// @param is_cold_start  true=进程冷启动；false=运行中重连
+/// @param venue          metric label（"binance_u" / "ctp" / "xtp"）
+/// @param handler        可为 nullptr（此时只记 metric 和日志）
 inline void emit_reverse_sync_batch_with_metric(
     std::vector<AliveInflightOrder> orders,
     bool is_cold_start,
@@ -46,4 +51,4 @@ inline void emit_reverse_sync_batch_with_metric(
     }
 }
 
-}
+}  // namespace xyybtrader::recovery

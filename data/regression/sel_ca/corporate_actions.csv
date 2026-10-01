@@ -1,0 +1,4 @@
+code,record_date,ex_date,pay_date,cash_per_share,bonus_transfer_per_share,rights_per_share,rights_price,is_delist
+600000.SH,20260107,20260108,20260113,0.50,0.000,0.0,0.0,0
+000001.SZ,20260108,20260109,,0.00,0.500,0.0,0.0,0
+600519.SH,20260112,20260113,,0.00,0.000,0.3,30.0,0

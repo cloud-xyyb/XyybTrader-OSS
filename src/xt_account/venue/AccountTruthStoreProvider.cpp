@@ -17,7 +17,7 @@ uint64_t wall_clock_now_ns() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-}
+}  // namespace
 
 namespace xt_account {
 
@@ -32,16 +32,21 @@ AccountTruth read_store_account_truth(const AccountStateStore& account_store,
     truth.unrealized_pnl_fp = account.unrealized_pnl;
     truth.fees_today_fp = account.fees;
 
-    int64_t position_value_fp = 0;
+    // 账户级持仓市值直接取同一 AccountSnapshot 的聚合值：与 unrealized 同源同帧，
+    // 且含有 mark id 的 quarantined 仓（tracked_codes 只覆盖 slot 持有者，按它求和
+    // 会漏计）。per-symbol 行仍按 tracked 枚举（展示镜像，非账户级真值）。
+    const int64_t position_value_fp = account.market_value;
     const auto tracked_codes = account_store.snapshot_tracked_codes();
     truth.runtime_per_symbol_marks_fp.reserve(tracked_codes.size());
     for (const auto& code : tracked_codes) {
         if (code.empty()) continue;
         const auto pos = account_store.snapshot_position(code);
-        position_value_fp += xt_fp::mul(pos.qty, pos.mark_price);
-
+        // per-symbol 展示镜像保留逐 code 循环；账户级 position_value_fp 已改取聚合值。
+        // account_store mark 与 venue truth mark 分开上报，避免 mark_cache 置零时
+        // 只能看到聚合权益漂移。
         truth.runtime_per_symbol_marks_fp.emplace_back(code, pos.mark_price);
-
+        // CTP/XTP 等无 REST venue per-symbol truth 的路径可用 account_store 活值
+        // 填展示镜像；该镜像不是 broker truth，不参与 store-vs-broker 背离比对。
         if (fill_store_per_symbol && (pos.qty != 0 || pos.unrealized_pnl != 0)) {
             PerSymbolTruth row{};
             row.symbol = code;
@@ -71,4 +76,4 @@ AccountTruth read_store_account_truth(const AccountStateStore& account_store,
     return truth;
 }
 
-}
+}  // namespace xt_account

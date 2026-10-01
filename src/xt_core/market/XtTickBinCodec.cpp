@@ -8,8 +8,11 @@
 
 namespace {
 
+// Header 记录 magic/version 和两种 tick 结构大小；layout 或版本不匹配时拒绝读取 cache。
+// v4：盘口深度 DEPTH 10→20（raw/core 512→832B，layout 变更 → 旧 cache 按
+// header 尺寸校验 + manifest 签名双路失效重建）。
 constexpr std::array<char, 8> kTickBinMagic = {'C', 'T', 'T', 'K', 'V', '4', '\0', '\0'};
-constexpr uint16_t kTickBinVersion = xt_tick_bin::kTickBinCodecVersion;
+constexpr uint16_t kTickBinVersion = xt_tick_bin::kTickBinCodecVersion;  // SSOT 见 header
 
 #pragma pack(push, 1)
 struct XtTickBinHeaderV2 {
@@ -30,6 +33,9 @@ struct XtTickBinRecordV2 {
 };
 #pragma pack(pop)
 
+// ── On-disk layout tripwire ──────────────────────────────────────────────
+// DualV2 是 cache-only 格式，但 record 仍是 XtRawTick + XtTick 的裸 memcpy。
+// header 尺寸校验负责拒绝不兼容 cache；static_assert 把 layout 漂移提前到编译期。
 static_assert(std::is_trivially_copyable_v<XtRawTick>,
               "XtRawTick must stay trivially_copyable for memcpy codec");
 static_assert(std::is_trivially_copyable_v<XtTick>,
@@ -38,7 +44,8 @@ static_assert(sizeof(XtRawTick) == 832,
               "XtRawTick layout changed — only bump this if intentionally changing cache format");
 static_assert(sizeof(XtTick) == 832,
               "XtTick layout changed — only bump this if intentionally changing cache format");
-
+// record 无内部填充（pack(1) + 两个成员各自 8 字节对齐尺寸）：read_next_tick 的
+// 逐成员 memcpy 偏移依赖这一点。
 static_assert(sizeof(XtTickBinRecordV2) == sizeof(XtRawTick) + sizeof(XtTick),
               "DualV2 record must stay padding-free for the byte-buffer read path");
 static_assert(offsetof(XtTickBinRecordV2, raw) == 0,
@@ -65,13 +72,13 @@ bool is_valid_v2_header(const XtTickBinHeaderV2& h) {
            h.core_size == sizeof(XtTick);
 }
 
-}
+}  // namespace
 
 namespace xt_tick_bin {
 
 bool detect_stream_format(std::istream& in, XtTickBinFormat& fmt) {
     auto reject = [&]() {
-
+        // 失败不消费 stream，调用方可在同一 stream 上选择 fallback 或按损坏 cache 处理。
         in.clear();
         in.seekg(0, std::ios::beg);
         return false;
@@ -111,7 +118,7 @@ bool prepare_append_stream(const std::string& path, std::ofstream& out, XtTickBi
         fmt = XtTickBinFormat::DualV2;
         return write_v2_header(out);
     }
-
+    // append-only 输出流不保证可读；既有文件必须通过独立输入流先完成 header 校验。
     if (!detect_file_format(path, fmt)) return false;
     return true;
 }
@@ -133,7 +140,11 @@ bool read_next_tick(std::istream& in,
                     XtRawTick& raw_out,
                     XtTick* core_out) {
     if (fmt != XtTickBinFormat::DualV2) return false;
-
+    // 读进未初始化字节缓冲，而非 `XtTickBinRecordV2 rec{}`：XtRawTick / XtTick 都带
+    // 默认成员初始化器，值初始化与默认初始化都会先把整条 1664B record 清零，随后被
+    // in.read 整段覆盖——装载热路径上每条 tick 白付一次清零。两者都 trivially_copyable，
+    // memcpy 与成员赋值等价（上方 offsetof/size static_assert 钉住偏移）。
+    // 失败语义不变：短读 / EOF 时 raw_out 与 core_out 均不被触碰。
     unsigned char buf[sizeof(XtTickBinRecordV2)];
     if (!in.read(reinterpret_cast<char*>(buf), sizeof(buf))) {
         return false;
@@ -145,4 +156,4 @@ bool read_next_tick(std::istream& in,
     return true;
 }
 
-}
+}  // namespace xt_tick_bin

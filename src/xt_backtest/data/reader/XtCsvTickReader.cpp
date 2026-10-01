@@ -42,6 +42,8 @@ void XtCsvTickReader::reset() {
     io_error_ = false;
 }
 
+// 每个文件跨越的交易日只有个位数，且行基本按日递增 —— 尾部相等即命中的快路径覆盖绝大
+// 多数 tick，剩下的走一次有序插入，保持集合升序去重。
 void XtCsvTickReader::note_source_day_(size_t path_idx, uint32_t trading_date) {
     if (path_idx >= src_days_.size()) return;
     auto& days = src_days_[path_idx];
@@ -51,6 +53,8 @@ void XtCsvTickReader::note_source_day_(size_t path_idx, uint32_t trading_date) {
     days.insert(it, trading_date);
 }
 
+// 乱序只加可见性不改序：stream 路径透传、memory 路径 stable_sort 的现状分叉
+// 保持不变，收敛与否等实际数据证据（首次 + 每 10000 次限频 warn）。
 void XtCsvTickReader::note_key_regression_(const char* path_hint,
                                            uint64_t prev_key, uint64_t key) {
     ++out_of_order_count_;
@@ -62,7 +66,7 @@ void XtCsvTickReader::note_key_regression_(const char* path_hint,
 }
 
 bool XtCsvTickReader::next_tick(XtRawTick& out) {
-
+    // 延迟 init 允许调用方直接拉取；失败语义与显式 init() 保持一致。
     if (!init_done_) {
         if (!init()) return false;
     }
@@ -97,7 +101,7 @@ bool XtCsvTickReader::next_multi(XtRawTick& out) {
     if (node.reader_idx >= readers_.size()) return false;
     Reader& r = readers_[node.reader_idx];
     out = r.tick;
-
+    // 记在交付点而非预读点：预读到、但调用方提前收手没取走的那条不算这个文件的贡献。
     note_source_day_(r.path_idx, out.trading_date);
     if (read_next_tick(r)) {
         Node next;
@@ -111,7 +115,7 @@ bool XtCsvTickReader::next_multi(XtRawTick& out) {
 
 bool XtCsvTickReader::init_readers() {
     if (!readers_.empty() || opts_.paths.empty()) return !readers_.empty();
-
+    // 为每个文件创建独立 reader；只有成功预读首条 tick 的 reader 才入 heap。
     for (size_t i = 0; i < opts_.paths.size(); ++i) {
         const std::string& path = opts_.paths[i];
         Reader r;
@@ -138,7 +142,7 @@ bool XtCsvTickReader::read_next_tick(Reader& reader) {
     if (!reader.in || !reader.in->is_open()) return false;
     uint64_t key = 0;
     if (read_next_parsed_line(*reader.in, reader.spec, reader.tick, key)) {
-
+        // 多文件 heap merge 以每个文件内部有序为前提；文件内 key 回退破坏归并正确性。
         if (reader.key != 0 && key < reader.key)
             note_key_regression_("multi", reader.key, key);
         reader.key = key;
@@ -156,7 +160,7 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         if (line[0] == '#') continue;
-
+        // 首次非注释行优先尝试作为表头解析；成功后跳过表头继续读数据。
         if (!spec.inited) {
             XtTickCsvSpec hdr;
             if (build_tick_spec_from_header(line, hdr)) {
@@ -164,7 +168,11 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
                 spec.inited = true;
                 continue;
             }
-
+            // 无表头时按列数推断格式。
+            //   30 列 = CTP 标准格式（code,TradingDay,UpdateTimeMs,Turnover,Volume,
+            //           LastPrice,OpenInterest,UpperLimit,LowerLimit,EpochUs,
+            //           BidPrice1..5,AskPrice1..5,BidVolume1..5,AskVolume1..5）
+            //   其他 = simple 两列格式（code,price）
             {
                 size_t ncols = 1;
                 for (char c : line) { if (c == ',') ++ncols; }
@@ -172,7 +180,8 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
                     spec.idx_instrument     = 0;
                     spec.idx_trading_day    = 1;
                     spec.idx_update_time_ms = 2;
-
+                    // parse 只读 idx_update_time；UpdateTimeMs（HHMMSSmmm）同步
+                    // remap（同 build_tick_spec_from_header 的 fallback 口径）。
                     spec.idx_update_time    = 2;
                     spec.idx_turnover       = 3;
                     spec.idx_volume         = 4;
@@ -199,7 +208,7 @@ bool XtCsvTickReader::read_next_parsed_line(std::ifstream& in,
             }
             spec.inited = true;
         }
-
+        // 数据行准入统计：header/空行/注释在上方 continue，不计入 lines_read。
         ++read_stats_.lines_read;
         TickParseDrop reason = TickParseDrop::None;
         if (parse_tick_csv_line(line, spec, out, key, opts_.symbol_filter,

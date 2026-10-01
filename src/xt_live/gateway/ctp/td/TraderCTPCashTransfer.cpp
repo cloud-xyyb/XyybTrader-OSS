@@ -12,9 +12,11 @@
 
 #include <cmath>
 
+// ── 银期转账事件 emit ───────────────────────────
+
 void TraderCTP::emit_cash_transfer_event(const CThostFtdcRspTransferField* pRspTransfer,
                                          bool bank_to_future) {
-
+    // CTP 异常情况下可能给空回报；该事件不可恢复，记录后丢弃。
     if (!pRspTransfer) {
         XtLogger::warn_m("TD",
                          "event=td_cash_transfer_rtn_null direction={}",
@@ -22,7 +24,7 @@ void TraderCTP::emit_cash_transfer_event(const CThostFtdcRspTransferField* pRspT
         return;
     }
     if (!callbacks_.on_cash_transfer) return;
-
+    // ErrorID 非 0 表示转账未成功，不进入账户 reducer，避免把失败回报当 cash delta。
     if (pRspTransfer->ErrorID != 0) {
         XtLogger::warn_m("TD",
                          "ignore cash transfer rtn with error trade_code={} error_id={} error_msg={}",
@@ -32,7 +34,7 @@ void TraderCTP::emit_cash_transfer_event(const CThostFtdcRspTransferField* pRspT
     }
     double amount = pRspTransfer->TradeAmount;
     if (!std::isfinite(amount) || amount == 0.0) return;
-
+    // reducer 统一消费 signed delta：入金为正，出金为负。
     if (!bank_to_future) amount = -amount;
 
     CashTransferDelta ev;

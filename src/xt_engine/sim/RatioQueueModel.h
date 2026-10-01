@@ -11,7 +11,8 @@
 /// 调用方负责传入非负可见档位数量。
 class RatioQueueModel final : public IQueueModel {
 public:
-
+    /// @param ratio 普通新单 queue_ahead 比例，负数按 0 处理。
+    /// @param cancel_resubmit_ratio 撤单重入队 queue_ahead 比例，负数按 0 处理。
     RatioQueueModel(double ratio, double cancel_resubmit_ratio = 1.0) noexcept
         : ratio_(std::max(0.0, ratio)),
           cancel_resubmit_ratio_(std::max(0.0, cancel_resubmit_ratio)) {}

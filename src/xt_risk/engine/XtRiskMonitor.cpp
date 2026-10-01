@@ -14,7 +14,7 @@ void XtRiskMonitor::set_account_store(xt_account::AccountStateStore* store) noex
 
 void XtRiskMonitor::on_session_begin(uint32_t trading_date, int64_t current_equity_fp,
                                      int64_t current_cashflow_fp) {
-
+    // 同一 trading_date 只执行一次 reset；trading_date=0 用 first-call sentinel。
     if (trading_date != 0) {
         if (trading_date == last_session_date_) return;
         last_session_date_ = trading_date;
@@ -24,7 +24,7 @@ void XtRiskMonitor::on_session_begin(uint32_t trading_date, int64_t current_equi
     }
 
     peak_equity_fp_ = current_equity_fp;
-
+    // 冻结 session 起点外部出入金；on_frame 只从 IDD 中扣除 session 内增量。
     session_open_cashflow_fp_ = current_cashflow_fp;
     if (broadcast_) {
         broadcast_->peak_equity_fp.store(current_equity_fp, std::memory_order_release);
@@ -35,7 +35,9 @@ void XtRiskMonitor::on_session_begin(uint32_t trading_date, int64_t current_equi
         broadcast_->volume_scale_fp.store(kVolumeScaleUnit, std::memory_order_release);
         broadcast_->current_drawdown_bp.store(0, std::memory_order_release);
         broadcast_->version.fetch_add(1, std::memory_order_release);
-
+        // 新 session 日内亏损预算重置 → 清 DailyLoss-source auto-liquidation latch + 连带 kill，
+        // 策略次日可再交易。KillSwitch-source latch 不动（operator 显式清）。dedup 已在函数顶部，
+        // 每 session 切换只跑一次，与 PerSidLiquidator::step 同 control 线程。
         const std::size_t cleared = broadcast_->per_strategy.reset_daily_loss_latches();
         if (cleared > 0) {
             XtLogger::info_m("risk",
@@ -44,6 +46,7 @@ void XtRiskMonitor::on_session_begin(uint32_t trading_date, int64_t current_equi
         }
     }
 
+    // starting_balance 与 peak reset 同步冻结；account_store_ 缺省时跳过对应规则。
     if (account_store_) {
         account_store_->on_session_begin_hook(current_equity_fp);
     }
@@ -52,7 +55,7 @@ void XtRiskMonitor::on_session_begin(uint32_t trading_date, int64_t current_equi
 void XtRiskMonitor::restore_latches(bool open_halted, int64_t halt_trigger_ms,
                                     int64_t peak_equity_fp) {
     if (!broadcast_) return;
-
+    // 恢复只允许把 latch 推到 true；运行期清除必须走 on_session_begin()。
     if (open_halted) {
         broadcast_->open_halted.store(true, std::memory_order_release);
         broadcast_->open_halt_trigger_ms.store(static_cast<uint32_t>(halt_trigger_ms),
@@ -74,7 +77,7 @@ void XtRiskMonitor::restore_latches(bool open_halted, int64_t halt_trigger_ms,
 void XtRiskMonitor::on_frame(int64_t equity_fp, uint32_t last_md_tick_ms, uint32_t now_ms,
                              int64_t current_cashflow_fp) {
     if (!cfg_.enabled || !broadcast_) return;
-
+    // cashflow-immune IDD：只度量交易盈亏；未提供 cashflow 时 risk_equity 等于 equity。
     const int64_t risk_equity_fp =
         equity_fp - (current_cashflow_fp - session_open_cashflow_fp_);
     update_drawdown(risk_equity_fp, now_ms);
@@ -93,6 +96,10 @@ void XtRiskMonitor::update_drawdown(int64_t equity_fp, uint32_t now_ms) {
     const int64_t drawdown_bp = (drawdown_fp * 10000) / peak_equity_fp_;
     broadcast_->current_drawdown_bp.store(drawdown_bp, std::memory_order_release);
 
+    // halt 优先于 scale；达到 halt 后不再下调 volume scale。
+    // 单写者（control frame loop；restore_latches 仅 bootstrap）：先写归因字段、
+    // 后 release 发布 open_halted —— acquire reader 见 halted=true 必见 reason/trigger，
+    // 消除 halted+None 短窗；已 latch 时跳过，保留首次触发归因。
     bool changed = false;
     if (drawdown_bp >= cfg_.idd_halt_threshold_bp) {
         if (!broadcast_->open_halted.load(std::memory_order_relaxed)) {
@@ -102,7 +109,7 @@ void XtRiskMonitor::update_drawdown(int64_t equity_fp, uint32_t now_ms) {
             broadcast_->open_halt_trigger_ms.store(now_ms, std::memory_order_relaxed);
             broadcast_->open_halted.store(true, std::memory_order_release);
             changed = true;
-
+            // 在 latch 建立点记录原因，避免 reader 侧反推触发源。
             XtLogger::warn_m("RISK",
                 "open_halted latched: IddDrawdown drawdown_bp={} now_ms={}", drawdown_bp, now_ms);
         }
@@ -122,12 +129,12 @@ void XtRiskMonitor::update_drawdown(int64_t equity_fp, uint32_t now_ms) {
 
 bool XtRiskMonitor::sanity_check_per_sid_state(std::size_t expected_size) const noexcept {
     if (!broadcast_) return true;
-
+    // sid_registry 未初始化或单策略路径没有 per-sid 容量约束。
     if (expected_size == 0) return true;
     const auto& per = broadcast_->per_strategy;
     const std::size_t actual = per.size();
     if (actual == expected_size) return true;
-
+    // 只记录一致性错误，不在 frame loop 中 abort。
     XtLogger::error_m("RISK",
         "integrity drift: per_strategy.size={} != sid_registry.sid_slot_count={} "
         "(per-sid vector 跟 sid count 不一致; ops 排查 init 时序)",
@@ -138,12 +145,14 @@ bool XtRiskMonitor::sanity_check_per_sid_state(std::size_t expected_size) const 
 void XtRiskMonitor::update_stale_quote(uint32_t last_md_tick_ms, uint32_t now_ms) {
     if (cfg_.stale_quote_ms == 0) return;
     if (last_md_tick_ms == 0) return;
-
+    // 乱序/回拨防御：无符号减回卷会得巨大 elapsed 误触发 halt（与
+    // guard_before_submit 的 now < last 检查同型，此前不对称）。
     if (now_ms < last_md_tick_ms) return;
 
     const uint32_t elapsed = now_ms - last_md_tick_ms;
     if (elapsed <= cfg_.stale_quote_ms) return;
 
+    // 同 update_drawdown：单写者下先写归因、后 release 发布，已 latch 跳过。
     if (!broadcast_->open_halted.load(std::memory_order_relaxed)) {
         broadcast_->open_halt_reason.store(
             static_cast<uint8_t>(XtOpenHaltReason::StaleQuote),
@@ -151,10 +160,10 @@ void XtRiskMonitor::update_stale_quote(uint32_t last_md_tick_ms, uint32_t now_ms
         broadcast_->open_halt_trigger_ms.store(now_ms, std::memory_order_relaxed);
         broadcast_->open_halted.store(true, std::memory_order_release);
         broadcast_->version.fetch_add(1, std::memory_order_release);
-
+        // 在 latch 建立点记录原因，避免 reader 侧反推触发源。
         XtLogger::warn_m("RISK",
             "open_halted latched: StaleQuote elapsed_ms={} now_ms={}", elapsed, now_ms);
     }
 }
 
-}
+}  // namespace xt_risk

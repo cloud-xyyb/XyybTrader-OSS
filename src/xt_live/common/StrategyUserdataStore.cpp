@@ -16,6 +16,8 @@ namespace {
 
 constexpr int kSchemaVersion = 1;
 
+/// path-component 校验：拒空 / "." / ".." / 含 '/' '\\' / 控制字符。
+/// 镜像 LocalFsEventStore::is_path_component_safe，防 sid 路径注入穿越 state_dir。
 bool is_path_component_safe(const std::string& s) {
     if (s.empty() || s == "." || s == "..") return false;
     for (const unsigned char c : s) {
@@ -30,7 +32,7 @@ int64_t now_unix_sec() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-}
+}  // namespace
 
 std::string strategy_userdata_path(const std::string& state_dir, const std::string& sid) {
     namespace fs = std::filesystem;
@@ -41,16 +43,17 @@ std::string derive_userdata_state_dir(const std::string& recording_file_path,
                                       const std::string& cfg_path) {
     namespace fs = std::filesystem;
     if (!recording_file_path.empty()) {
-
+        // .../live_runs/<profile>/recordings/live.jsonl → .../live_runs/<profile>/state
         const fs::path rec(recording_file_path);
-        const fs::path recordings_dir = rec.parent_path();
-        const fs::path profile_dir    = recordings_dir.parent_path();
-
+        const fs::path recordings_dir = rec.parent_path();       // .../recordings
+        const fs::path profile_dir    = recordings_dir.parent_path();  // .../<profile>
+        // profile 必须是真实路径组件：相对浅路径推出空，绝对浅路径（如 "/live.jsonl"）
+        // 推出纯根目录（若放行会落盘 "/state"），两者对称走 config 回退。
         if (!profile_dir.empty() && profile_dir != profile_dir.root_path()) {
             return (profile_dir / "state").string();
         }
     }
-
+    // recording 禁用：回退 config 同级 var/strategy_state（镜像 CTA reconcile 默认根）。
     const fs::path base = fs::path(cfg_path).parent_path();
     return (base / "var" / "strategy_state").string();
 }
@@ -70,13 +73,13 @@ bool write_strategy_userdata(const std::string& state_dir,
     root["strategy_id"]       = sid;
     root["generated_at_unix"] = now_unix_sec();
     root["trading_date"]      = trading_date;
-    root["userdata"]          = kv;
+    root["userdata"]          = kv;  // nlohmann 负责对任意字符串值做 JSON 转义。
 
     const std::string path = strategy_userdata_path(state_dir, sid);
     const std::string tmp  = path + ".tmp";
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-
+    // create_directories 对已存在目录返 ec 为空且返回 false，非错误；仅当无法创建时下方写失败暴露。
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out.good()) {
@@ -93,7 +96,7 @@ bool write_strategy_userdata(const std::string& state_dir,
     if (ec) {
         err = "rename failed: " + ec.message();
         std::error_code rm_ec;
-        std::filesystem::remove(tmp, rm_ec);
+        std::filesystem::remove(tmp, rm_ec);  // best-effort 清理，避免 tmp 残留。
         return false;
     }
     return true;
@@ -112,7 +115,7 @@ bool read_strategy_userdata(const std::string& state_dir,
 
     std::ifstream in(path, std::ios::binary);
     if (!in.good()) {
-
+        // 文件不存在 = clean start：err 留空，调用方静默空启动。
         return false;
     }
 
@@ -139,7 +142,7 @@ bool read_strategy_userdata(const std::string& state_dir,
         if (root.contains("userdata")) {
             parsed = root["userdata"].get<std::unordered_map<std::string, std::string>>();
         }
-
+        // 快照年龄暴露给 ops：策略自负 stale KV 语义，SDK/runner 不做新鲜度 gate。
         const int64_t gen_unix = root.value("generated_at_unix", int64_t{0});
         const uint32_t td       = root.value("trading_date", uint32_t{0});
         const int64_t age_sec   = gen_unix > 0 ? (now_unix_sec() - gen_unix) : -1;
@@ -154,4 +157,4 @@ bool read_strategy_userdata(const std::string& state_dir,
     }
 }
 
-}
+}  // namespace xt_live::common

@@ -1,10 +1,32 @@
 #pragma once
+// -----------------------------------------------------------------------------
+// HftMarketVerifyStrategy — 一次性市价单实盘验收策略（market_order_support Stage 4）
+// -----------------------------------------------------------------------------
+// [用途]
+//   触发 **一笔** 市价单（buy_fp/sell_fp 传 price_fp==0），验证 XtStrategyContext 把
+//   市价意图解析为激进限价 IOC（CTP 用 tick 涨跌停价 / binance 用 best-opposite±1%
+//   = kMarketSlippageBps），下游走现成限价 codec 真成交。成交后立刻发一笔反向市价单
+//   平回，避免留仓。**仅用于受控时段的 demo 验收，非生产策略。**
+//
+// [参数]（init from YAML，runtime.strategies[].<key>）
+//   symbol       下单合约（SHFE 用 ag2606/ag2612 / binance 用 BTCUSDT）
+//   qty          手数/张数（binance 0.002 BTC ≈ $120+ 过 min_notional；CTP 1 手）
+//   verify_buy   1 = 开多（买市价），0 = 开空（卖市价）。默认 1。
+//   warmup_ms    首次发单前的预热毫秒数（等 td_ready / 账户快照到位）。默认 3000。
+//   max_attempts 发单被拒时的最大重试次数（每 tick 一次）。默认 50。
+//
+// [td-ready 竞态处理] runner 在 td 就绪前也可能派发 on_tick；若此时发单会被拒。故
+//   预热一段 wall-clock（get_time_ms()）再发；发单返回 0（被拒）则后续 tick 重试，
+//   直到受理或 max_attempts。warmup_ticks 是 clock 不可用时的死锁兜底。
+//
+// [ABI] 与 hft_tick_revert 同：XtStrategyBase 子类 + XT_STRATEGY_ABI_EXPORTS（见 .cpp）。
+// -----------------------------------------------------------------------------
 
 #include "xt_strategy_engine/XtStrategyBase.h"
 #include "xt_strategy_engine/XtStrategyInitConfig.h"
 #include "api/IStrategyContext.h"
 #include "xt_core/market/XtTick.h"
-#include "xt_core/order/XtOrderTypes.h"
+#include "xt_core/order/XtOrderTypes.h"   // XtTimeInForce / XtOffset / order_exec_to_fp
 #include "xt_core/order/XtFillEvent.h"
 
 #include <cstdint>
@@ -37,10 +59,10 @@ public:
         const int64_t now_ms = packed_hms_to_ms(ctx->get_time_ms());
         if (first_ms_ < 0) first_ms_ = now_ms;
         const int64_t elapsed = now_ms - first_ms_;
-
+        // 预热：让 td 就绪（账户快照）再发单；clock 不可用时按 tick 数兜底。
         const bool warmed = (elapsed >= warmup_ms_) || (tick_count_ >= warmup_ticks_);
         if (!warmed) return;
-
+        // 仅当解析一定成功时才发：buy 需 ask 或涨停价；sell 需 bid 或跌停价。
         const bool resolvable = is_buy_
             ? (tk.ask_price_fp[0] > 0 || tk.upper_limit_fp > 0)
             : (tk.bid_price_fp[0] > 0 || tk.lower_limit_fp > 0);
@@ -53,9 +75,9 @@ public:
         ++attempts_;
         const int64_t qty_fp = order_exec_to_fp(qty_);
         open_id_ = is_buy_
-            ? ctx->buy_fp (symbol_.c_str(),  0, qty_fp,
+            ? ctx->buy_fp (symbol_.c_str(), /*price_fp=*/0, qty_fp,
                            XtTimeInForce::GTC, "mkt_verify", XtOffset::Open)
-            : ctx->sell_fp(symbol_.c_str(),  0, qty_fp,
+            : ctx->sell_fp(symbol_.c_str(), /*price_fp=*/0, qty_fp,
                            XtTimeInForce::GTC, "mkt_verify", XtOffset::Open);
         char buf[288];
         std::snprintf(buf, sizeof(buf),
@@ -68,7 +90,7 @@ public:
             (long long)ctx->get_cash_fp());
         ctx->log_info(buf);
         if (open_id_ != 0) {
-            open_latched_ = true;
+            open_latched_ = true;   // 受理 → 停止再发
         } else {
             ctx->log_warn("mkt_verify OPEN rejected (id==0) — guard/risk/price<=0/notional/margin/td-not-ready; will retry next tick");
         }
@@ -80,14 +102,14 @@ public:
             "mkt_verify FILL side=%s exec_price=%.8f qty=%.8f",
             f.is_buy ? "BUY" : "SELL", f.exec_price(), f.qty());
         ctx->log_info(buf);
-        if (sent_close_) return;
+        if (sent_close_) return;   // 已平回（或这是平回单自己的成交）→ 不再反向
         sent_close_ = true;
-
+        // 反向市价单平回（同样 price==0 → 解析为激进限价 IOC），Close offset。
         const int64_t qty_fp = order_exec_to_fp(qty_);
         close_id_ = is_buy_
-            ? ctx->sell_fp(symbol_.c_str(),  0, qty_fp,
+            ? ctx->sell_fp(symbol_.c_str(), /*price_fp=*/0, qty_fp,
                            XtTimeInForce::GTC, "mkt_verify_close", XtOffset::Close)
-            : ctx->buy_fp (symbol_.c_str(),  0, qty_fp,
+            : ctx->buy_fp (symbol_.c_str(), /*price_fp=*/0, qty_fp,
                            XtTimeInForce::GTC, "mkt_verify_close", XtOffset::Close);
         std::snprintf(buf, sizeof(buf),
             "mkt_verify CLOSE id=%llu %s symbol=%s qty=%.6f price_fp=0(market) — flatten",
@@ -96,7 +118,7 @@ public:
     }
 
 private:
-
+    // get_time_ms() 返回 HHMMSSmmm 打包十进制 → 当日绝对毫秒（用于 wall-clock 预热）。
     static int64_t packed_hms_to_ms(uint32_t t) {
         const int hh  = static_cast<int>(t / 10000000);
         const int mm  = static_cast<int>((t / 100000) % 100);

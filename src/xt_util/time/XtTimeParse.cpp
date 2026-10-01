@@ -63,7 +63,7 @@ bool valid_time_parts(int hh, int mm, int ss) {
            ss >= 0 && ss <= 59;
 }
 
-}
+}  // namespace
 
 namespace XtTimeParse {
 
@@ -73,7 +73,7 @@ bool parse_yymm(const std::string& s, int& yy, int& mm) {
     int val = 0;
     if (!parse_int_token(v, val)) return false;
     if (v.size() == 6) {
-
+        // YYYYMM 只保留后两位年份，对齐 tick 文件名 YYMM 惯例。
         yy = (val / 100) % 100;
         mm = val % 100;
     } else if (v.size() == 4) {
@@ -132,7 +132,7 @@ bool month_in_list(const std::vector<std::string>& list, const std::string& yymm
 bool parse_datetime(const std::string& s, uint32_t& date, uint32_t& time_ms) {
     const std::string v = XtStringUtil::trim(s);
     if (v.size() < 8) return false;
-
+    // "YYYY-MM-DD HH:MM:SS"（datetime format）
     if (v.size() == 19 && v[4] == '-' && v[7] == '-' &&
         v[10] == ' ' && v[13] == ':' && v[16] == ':') {
         int y = 0, m = 0, d = 0, hh = 0, mm = 0, ss = 0;
@@ -149,7 +149,7 @@ bool parse_datetime(const std::string& s, uint32_t& date, uint32_t& time_ms) {
         time_ms = static_cast<uint32_t>((hh * 10000 + mm * 100 + ss) * 1000);
         return true;
     }
-
+    // "YYYY/M/D"（date format）
     if (v.find('/') != std::string::npos) {
         auto parts = split_tokens(v, '/');
         if (parts.size() == 3) {
@@ -171,7 +171,7 @@ bool parse_datetime(const std::string& s, uint32_t& date, uint32_t& time_ms) {
 bool parse_time_hms(const std::string& s, uint32_t& time_ms) {
     const std::string v = XtStringUtil::trim(s);
     if (v.size() < 7) return false;
-
+    // "HH:MM:SS"
     if (v.find(':') == std::string::npos) return false;
     auto parts = split_tokens(v, ':');
     if (parts.size() < 2 || parts.size() > 3) return false;
@@ -190,7 +190,7 @@ uint32_t parse_date_only(const std::string& s) {
     const std::string v = XtStringUtil::trim(s);
     if (v.empty()) return 0;
     if (v.find('-') != std::string::npos) {
-
+        // "YYYY-MM-DD"（date format）
         if (v.size() != 10 || v[4] != '-' || v[7] != '-') return 0;
         int y = 0, m = 0, d = 0;
         if (!parse_int_token(v.substr(0, 4), y) ||
@@ -201,7 +201,7 @@ uint32_t parse_date_only(const std::string& s) {
         }
         return static_cast<uint32_t>(y * 10000 + m * 100 + d);
     }
-
+    // "YYYYMMDD"（date format）
     if (v.size() == 8) {
         int ymd = 0;
         if (!parse_int_token(v, ymd)) return 0;
@@ -230,4 +230,4 @@ uint32_t add_ms(uint32_t time_ms, int delta_ms) {
     return static_cast<uint32_t>((nh * 10000 + nm * 100 + ns) * 1000 + nms);
 }
 
-}
+}  // namespace XtTimeParse

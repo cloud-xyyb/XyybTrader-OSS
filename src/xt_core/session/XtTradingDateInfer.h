@@ -18,6 +18,9 @@ class XtTradingDateInfer {
 public:
     using NextTradingDayFn = std::function<uint32_t(uint32_t)>;
 
+    /// @param session_offset_minutes 夜盘偏移（分钟），如 300 = 中国期货
+    /// @param next_td_fn 日历回调：给定日期返回下一交易日（跳假期 + 周末）
+    /// @note next_td_fn 必须非空。空回调会 assert（fail-fast）。
     void init(int session_offset_minutes, NextTradingDayFn next_td_fn) {
         assert(next_td_fn && "XtTradingDateInfer: next_trading_day callback is required "
                               "(inject XtBacktestTradingCalendar::next_trading_day or equivalent)");
@@ -32,6 +35,7 @@ public:
 
     bool enabled() const { return offset_hhmm_ > 0; }
 
+    /// @brief 推断交易所交易日。
     uint32_t infer(uint32_t action_date, uint32_t action_time) const {
         if (offset_hhmm_ == 0) return action_date;
         const uint32_t hhmm = xt_time::action_time_to_hhmm(action_time);
@@ -42,6 +46,15 @@ public:
         return action_date;
     }
 
+    /// @brief 上一工作日（跳过周六日；不处理节假日）。
+    ///
+    /// 从 CTP exchange TradingDay 反推夜盘 tick 的真实 calendar day：
+    /// 周一夜盘 TD=Tue → calendar = prev_weekday(Tue) = Mon；
+    /// 周一 TD（节后开盘日）夜盘 → prev = 上周五。
+    ///
+    /// @note 此 helper 用于 CSV 解析侧（TickCsvUtil 的 td_is_exchange=true 路径）
+    ///       从已知 TradingDay 反推 calendar，不参与 td_infer 的正向推断逻辑。
+    ///       不跳假期，跨假期数据需上游脚本预处理，或后续接入 calendar 反向接口。
     static uint32_t prev_weekday(uint32_t date_yyyymmdd) {
         uint32_t y = date_yyyymmdd / 10000;
         uint32_t m = (date_yyyymmdd / 100) % 100;
@@ -50,10 +63,10 @@ public:
         uint32_t yy = y;
         if (m < 3) yy -= 1;
         int dow = static_cast<int>((yy + yy/4 - yy/100 + yy/400 + t[m-1] + d) % 7);
-
+        // dow: 0=Sunday, 1=Monday, ..., 5=Friday, 6=Saturday。
         int skip = 1;
-        if (dow == 1) skip = 3;
-        else if (dow == 0) skip = 2;
+        if (dow == 1) skip = 3;       // Monday → Friday
+        else if (dow == 0) skip = 2;  // Sunday → Friday (罕见，数据异常)
         static const uint32_t days_in_month[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
         if (d > static_cast<uint32_t>(skip)) {
             d -= static_cast<uint32_t>(skip);

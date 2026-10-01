@@ -1,3 +1,5 @@
+> dev 的 SEL 示例见 [SEL_BACKTEST.md](docs/SEL_BACKTEST.md)。
+
 # 快速上手：从编译到第一份回测报告
 
 本文带你从零跑通一次完整回测：**编译引擎 → 启动 Backtest Viewer → 入库数据 → 生成配置 → 跑 → 读报告**。
@@ -45,32 +47,19 @@ sudo apt-get install -y libarrow-dev libparquet-dev
 在仓库根目录：
 
 ```bash
-cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)"
+bash scripts/build_dev.sh
 ```
 
-产物两个：
+主要产物：
 
 | 路径 | 用途 |
 |---|---|
-| `build/XtBackTestRunner` | **回测器** —— viewer 调用的就是它，§3 要填的路径 |
-| `build/xt_live/hft/XtRunner` | 实盘 runner（CTP / Binance），本文不涉及 |
+| `$HOME/builds/xyybtrader-oss-dev-jammy/XtBackTestRunner` | **回测器** —— viewer 调用的就是它，§3 要填的路径 |
+| `$HOME/builds/xyybtrader-oss-dev-jammy/xt_live/hft/XtRunner` | 实盘 runner（CTP / Binance），本文不涉及 |
 
-### 1.3 构建策略插件
+### 1.3 策略插件
 
-策略是独立编译的 `.so`，仓里带五个可直接参考的 HFT 插件；先编最小的那个：
-
-```bash
-cmake -S src/xt_strategy_plugin/hft_tick_revert -B build-strategy \
-    -G Ninja -DXT_SRC_ROOT="$(pwd)/src"
-cmake --build build-strategy -j"$(nproc)"
-
-mkdir -p var/plugins/strategies
-cp build-strategy/libhft_tick_revert_strategy.so var/plugins/strategies/
-# 完整性 sidecar：loader 默认 strict signing，缺失或不匹配都拒载，重编插件后要重新生成
-(cd var/plugins/strategies && sha256sum libhft_tick_revert_strategy.so | awk '{print $1}' \
-    > libhft_tick_revert_strategy.so.sha256)
-```
+统一构建入口已生成 hft_tick_revert、sel_weights_csv 两个插件和 SHA-256 sidecar。其它 HFT 示例插件可按各自 CMakeLists.txt 独立构建。
 
 ### 1.4 自检：跑一次回归
 
@@ -80,10 +69,10 @@ cp build-strategy/libhft_tick_revert_strategy.so var/plugins/strategies/
 bash scripts/regression_test.sh
 ```
 
-判据是 **6/6 BIT-EXACT**——六个场景产出的 `fills.csv` 与仓内 golden 逐字节一致。
+判据为 HFT 六场景与 SEL 三组的 **10 次输出比较全部 BIT-EXACT**。另运行 `python3 scripts/validate_dev.py`，核对全部 289 项测试且零 skip。
 到这里引擎侧就通了。
 
-**记下 `build/XtBackTestRunner` 的绝对路径**，§3 要用。
+**记下 `$HOME/builds/xyybtrader-oss-dev-jammy/XtBackTestRunner` 的绝对路径**，§3 要用。
 
 > 引擎的几个运行约定（`--config` 必须显式传、插件 allowlist、`market.yaml`、单合约要关换月、
 > report_dir 时间戳后缀等）集中在 [docs/data_format.md](./docs/data_format.md) 的「运行须知」。

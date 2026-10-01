@@ -6,6 +6,8 @@
 
 namespace xt_strategy_engine {
 
+// ── Market 查询 ─────────────────────────────────────────────────────────
+
 const XtTick* XtRuntimeView::last_tick(const char* code) const {
     return market_->last_tick(code);
 }
@@ -40,9 +42,11 @@ void XtRuntimeView::set_bar_capacity(const char* code, const char* period, size_
     if (market_) market_->set_bar_capacity(code, period, max);
 }
 
+// ── Order 查询 ──────────────────────────────────────────────────────────
+
 size_t XtRuntimeView::open_orders(XtOrderExecUpdate* out, size_t max,
                                   uint32_t sid_filter) const {
-
+    // 单一权威订单 store：直读 order book（同线程派生查询）。
     return order_book_ ? order_book_->collect_open_orders(out, max, nullptr, sid_filter) : 0;
 }
 
@@ -60,6 +64,8 @@ int64_t XtRuntimeView::signed_inflight_fp(StrategySid sid, const char* code) con
     return order_book_ ? order_book_->signed_inflight_fp(sid, code) : 0;
 }
 
+// ── Account 查询 ────────────────────────────────────────────────────────
+
 int64_t XtRuntimeView::pos_qty_fp(const char* code) const {
     return account_->pos_qty_fp(code);
 }
@@ -74,7 +80,7 @@ int64_t XtRuntimeView::pos_unrealized_fp(const char* code) const {
 
 bool XtRuntimeView::pos_detail(const char* code, XtStraPositionDetail& out) const {
     if (!account_->pos_detail(code, out)) return false;
-
+    // 补充在途未成交量（order_book 未注入时保持 0）
     if (order_book_) {
         out.long_side.open_no_trade  = order_exec_from_fp(order_book_->open_no_trade_qty_fp(code, true));
         out.short_side.open_no_trade = order_exec_from_fp(order_book_->open_no_trade_qty_fp(code, false));
@@ -90,4 +96,4 @@ int64_t XtRuntimeView::equity_fp() const {
     return account_->equity_fp();
 }
 
-}
+} // namespace xt_strategy_engine

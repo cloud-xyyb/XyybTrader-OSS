@@ -18,13 +18,16 @@ namespace xt_live::gateway {
 
 namespace {
 
+// singleton key 为 "<venue>/<region>"；adapter attach 后缓存引用，热路径不查表。
 constexpr std::size_t kOffsetUpdateSampleInterval = 128;
 
 std::mutex g_singleton_mu;
 std::unordered_map<std::string, std::unique_ptr<XtClockSkewEstimator>>
     g_singletons;
 
-}
+}  // namespace
+
+// ── Singleton ──────────────────────────────────────────────────────────
 
 XtClockSkewEstimator& XtClockSkewEstimator::shared(std::string_view venue,
                                                 std::string_view region) {
@@ -46,19 +49,23 @@ XtClockSkewEstimator& XtClockSkewEstimator::shared(std::string_view venue,
     return *it->second;
 }
 
+// ── Lifecycle ──────────────────────────────────────────────────────────
+
 XtClockSkewEstimator::XtClockSkewEstimator(std::string venue,
                                          std::string region,
                                          ClockSkewConfig cfg)
     : venue_(std::move(venue)),
       region_(std::move(region)),
       cfg_(cfg) {
-
-    try_bootstrap( false);
+    // 当前 bootstrap 为 best-effort；失败时进入 WARMING，用 live 样本恢复 offset。
+    try_bootstrap(/*preserve_nan_on_failure=*/false);
 }
+
+// ── Hot path: record_sample ────────────────────────────────────────────
 
 void XtClockSkewEstimator::record_sample(uint64_t recv_mono_us,
                                         uint64_t server_event_us) {
-
+    // 热路径只短暂持有 window_mu_ 做 append/evict；排序重算按样本间隔节流。
     Sample s{
         .mono_us = recv_mono_us,
         .offset_sample_us = static_cast<int64_t>(server_event_us)
@@ -67,7 +74,7 @@ void XtClockSkewEstimator::record_sample(uint64_t recv_mono_us,
     {
         std::lock_guard<std::mutex> lk(window_mu_);
         window_.push_back(s);
-
+        // 使用 monotonic 时间淘汰窗口，避免 wall clock step 影响窗口年龄。
         const uint64_t window_us =
             static_cast<uint64_t>(cfg_.window_duration.count()) * 1'000'000ULL;
         while (!window_.empty()
@@ -84,21 +91,23 @@ void XtClockSkewEstimator::record_sample(uint64_t recv_mono_us,
     maybe_promote_to_locked();
 }
 
+// ── Reset / transitions ────────────────────────────────────────────────
+
 void XtClockSkewEstimator::on_ws_reconnect(std::string_view channel) {
-    reset_window( true);
+    reset_window(/*preserve_bootstrap=*/true);
     state_.store(ClockSkewState::Warming, std::memory_order_release);
     ct::metrics::XtMetricRegistry::instance().inc_md_ws_reconnect(channel);
     publish_state(channel);
 }
 
 void XtClockSkewEstimator::on_clock_step_detected(std::string_view channel) {
-    reset_window( false);
+    reset_window(/*preserve_bootstrap=*/false);
     state_.store(ClockSkewState::Stepped, std::memory_order_release);
     offset_us_.store(std::nan(""), std::memory_order_release);
     ct::metrics::XtMetricRegistry::instance().inc_md_clock_step(channel);
     publish_state(channel);
-
-    try_bootstrap( true);
+    // REST bootstrap 不可用时保留 NaN 发布，但允许 live 样本继续恢复窗口。
+    try_bootstrap(/*preserve_nan_on_failure=*/true);
 }
 
 void XtClockSkewEstimator::reset_window(bool preserve_bootstrap) {
@@ -114,8 +123,11 @@ void XtClockSkewEstimator::reset_window(bool preserve_bootstrap) {
     }
 }
 
-bool XtClockSkewEstimator::try_bootstrap(bool preserve_nan_on_failure) {
+// ── Bootstrap ──────────────────────────────────────────────────────────
 
+bool XtClockSkewEstimator::try_bootstrap(bool preserve_nan_on_failure) {
+    // REST bootstrap 尚未接入。cold start 使用 offset=0 进入 WARMING；STEPPED 后
+    // 保持 NaN，直到 live 样本重新形成 offset，避免发布看似可信的 0 offset。
     std::lock_guard<std::mutex> lk(bootstrap_mu_);
     bootstrap_done_ = false;
     bootstrap_offset_us_ = 0.0;
@@ -128,11 +140,15 @@ bool XtClockSkewEstimator::try_bootstrap(bool preserve_nan_on_failure) {
     return false;
 }
 
+// ── Offset estimation ──────────────────────────────────────────────────
+
 void XtClockSkewEstimator::update_offset_from_window() {
     if (state_.load(std::memory_order_acquire) == ClockSkewState::Stepped) {
         return;
     }
 
+    // 单样本 diff = clock_offset - network_latency；最大值最接近真实 offset。
+    // 先裁掉最高尾部样本，再取最大值，降低异常样本影响。
     std::vector<int64_t> diffs;
     {
         std::lock_guard<std::mutex> lk(window_mu_);
@@ -150,6 +166,7 @@ void XtClockSkewEstimator::update_offset_from_window() {
         last_idx);
     const double trimmed_max = static_cast<double>(diffs[last_idx - trim_count]);
 
+    // 直接发布 trimmed maximum，避免平滑把 offset 压低并制造负 corrected latency。
     offset_us_.store(trimmed_max, std::memory_order_release);
 }
 
@@ -162,6 +179,8 @@ void XtClockSkewEstimator::maybe_promote_to_locked() {
         state_.store(ClockSkewState::Locked, std::memory_order_release);
     }
 }
+
+// ── Accessors ──────────────────────────────────────────────────────────
 
 double XtClockSkewEstimator::offset_us() const noexcept {
     return offset_us_.load(std::memory_order_acquire);
@@ -179,11 +198,13 @@ std::size_t XtClockSkewEstimator::window_samples() const noexcept {
 double XtClockSkewEstimator::window_min_age_seconds() const noexcept {
     std::lock_guard<std::mutex> lk(window_mu_);
     if (window_.empty()) return 0.0;
-
+    // 最老样本的 monotonic 时间与当前 monotonic 时间差。
     const auto now = XtSteadyClock::steady_now_us();
     const int64_t age_us = now - static_cast<int64_t>(window_.front().mono_us);
     return static_cast<double>(age_us) / 1'000'000.0;
 }
+
+// ── Publish to XtMetricRegistry ────────────────────────────────────────
 
 void XtClockSkewEstimator::publish_state(std::string_view channel) {
     auto& reg = ct::metrics::XtMetricRegistry::instance();
@@ -195,4 +216,4 @@ void XtClockSkewEstimator::publish_state(std::string_view channel) {
         channel, window_min_age_seconds());
 }
 
-}
+}  // namespace xt_live::gateway

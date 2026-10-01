@@ -1,0 +1,105 @@
+# SEL corporate-action regression case (sel_ca)。
+#
+# 覆盖面（每条 CA 都会真改钱或持仓，故都能在 golden 上被检出）：
+#   ① 现金分红 + pay-date 应收窗口：600000.SH ex 20260108 / pay 20260113，
+#      0.50 元/股、股息税 10% → ex 日进应收，20260113 转现金；
+#   ② 送转 + 新股到账滞后（CSV 未给 shares_list_date → 缺省取 ex+1 交易日）：
+#      000001.SZ ex 20260109 十送五 → 在途至 20260112；
+#      **20260109 当天还有一次 rebalance** —— sizing 的 pre_qty 必须含在途新股
+#      （与含在途市值的权益口径同源），这条覆盖 B6 的 in-flight sizing 路径；
+#   ③ 配股认购（rights_policy=subscribe）：600519.SH ex 20260113，10 配 3 @30 元
+#      → ex 日缴款扣现金，新股在途至 20260114。
+# close_prices 的 ex 日跳价按交易所除权参考价公式给（(prev−d+r·p_r)/(1+b+r)），
+# 与引擎的参考价修正同点抵消 —— 这样 CA 施加对不对，直接反映在成交量上。
+#
+# 输入路径按仓库根相对给（与既有 SEL 用例同惯例）：run_sel_ca 把 config 复制到
+# /tmp 再跑，cfg 目录解析落空后回退 cwd=仓库根 —— 两处都能找到同一份数据。
+# report.output_dir 由 regression_test.sh 的 run_sel_ca 改写到临时目录。
+
+selector:
+  trading_dates_csv: data/regression/sel_ca/trading_dates.csv
+  close_prices_csv: data/regression/sel_ca/close_prices.csv
+  corporate_actions_csv: data/regression/sel_ca/corporate_actions.csv
+  rights_policy: subscribe
+  date_from: 20260105
+  date_to: 20260116
+  task:
+    strategy_id: sel_ca
+    period: daily
+    day: 0
+    time: 1500
+    strict_time: true
+    trdtpl: CHINA
+    session: default
+  strategy:
+    so: var/plugins/strategies/libsel_weights_csv_strategy.so
+    id: sel_ca
+    params:
+      weights_path: data/regression/sel_ca/weights.csv
+      normalize: false
+
+account:
+  initial_cash: 1000000.0
+
+commodities:
+  '600000.SH':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+  '000001.SZ':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+  '600519.SH':
+    vol_scale: 1.0
+    price_tick: 0.01
+    margin_rate: 0.0
+    has_open_interest: false
+    has_settle_price: false
+    is_t_plus_1: true
+    min_lot: 100
+    allow_short: false
+
+fees:
+  '600000.SH':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    min_commission: 5.0
+  '000001.SZ':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.0
+    min_commission: 5.0
+  '600519.SH':
+    open: 0.00025
+    close: 0.00025
+    stamp_duty_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    min_commission: 5.0
+  dividend_tax_rate: 0.1
+
+risk:
+  max_order_qty: 1000000.0
+  max_pos_qty: 10000000.0
+  enforce_long_t_plus_1: true
+  allow_short: false
+  delist_haircut_pct: 0.0
+
+trade_cost:
+  slippage: 0.0
+
+report:
+  output_dir: ../reports/sel_ca

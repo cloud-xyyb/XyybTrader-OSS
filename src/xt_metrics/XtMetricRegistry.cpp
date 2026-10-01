@@ -14,12 +14,15 @@
 #include <prometheus/histogram.h>
 #include <prometheus/registry.h>
 
+// Metric contract 由 metrics.yaml 生成；本文件只消费 name/help/labels/buckets。
 #include "xt_metrics/_generated/zero_init.h"
 
 namespace ct::metrics {
 
 namespace {
 
+// generated bucket table 是 fixed-size array；prometheus-cpp Add() 需要 vector。
+// 这里按 family 懒构造一次，避免每个 observe 调用重复分配 bucket vector。
 const std::vector<double>& bucket_family_vector(std::string_view family_name) {
     static std::vector<std::vector<double>> caches;
     static std::once_flag init_flag;
@@ -38,7 +41,7 @@ const std::vector<double>& bucket_family_vector(std::string_view family_name) {
             return caches[i];
         }
     }
-
+    // 未声明 bucket family 时返回空 bucket；prometheus 会把样本落入 +Inf。
     static const std::vector<double> kEmpty;
     return kEmpty;
 }
@@ -51,6 +54,7 @@ const std::vector<double>& rpc_us_buckets() {
     return bucket_family_vector("rpc_us");
 }
 
+// prometheus-cpp Add(labels) 需要 owning std::map；label value 进入库内后由其持有。
 prometheus::Labels make_labels_5(std::string_view k1, std::string_view v1,
                                   std::string_view k2, std::string_view v2,
                                   std::string_view k3, std::string_view v3,
@@ -95,7 +99,11 @@ prometheus::Labels make_labels_3(std::string_view k1, std::string_view v1,
     };
 }
 
-}
+}  // namespace
+
+// ----------------------------------------------------------------------------
+// Impl
+// ----------------------------------------------------------------------------
 
 struct XtMetricRegistry::Impl {
     std::shared_ptr<prometheus::Registry> registry;
@@ -103,6 +111,7 @@ struct XtMetricRegistry::Impl {
     std::mutex mu;
     std::atomic<bool> running{false};
 
+    // Counter families.
     prometheus::Family<prometheus::Counter>* fam_submits_total          = nullptr;
     prometheus::Family<prometheus::Counter>* fam_md_ticks_total          = nullptr;
     prometheus::Family<prometheus::Counter>* fam_order_rtns_total       = nullptr;
@@ -119,13 +128,16 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_trade_route_status_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_strategy_ledger_fills_total = nullptr;
 
+    // Histogram families.
     prometheus::Family<prometheus::Histogram>* fam_submit_to_ack_us     = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_submit_to_fill_us    = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_control_rpc_us       = nullptr;
-
+    // Stage histograms 只由 XtLiveLatencyTracker 聚合线程 observe；
+    // strategy/adapter hot path 通过 SPSC ring 传递样本。
     prometheus::Family<prometheus::Histogram>* fam_strategy_us          = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_local_submit_us      = nullptr;
 
+    // Binance MD single-trip latency + clock skew，使用 md_us bucket family。
     prometheus::Family<prometheus::Histogram>* fam_md_event_to_recv_us    = nullptr;
     prometheus::Family<prometheus::Histogram>* fam_md_internal_queue_us   = nullptr;
     prometheus::Family<prometheus::Gauge>*     fam_md_clock_offset_us     = nullptr;
@@ -138,6 +150,7 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>*   fam_md_aggtrade_gap_total  = nullptr;
     prometheus::Family<prometheus::Counter>*   fam_md_aggtrade_backfill_total = nullptr;
 
+    // Gauge families.
     prometheus::Family<prometheus::Gauge>*   fam_pnl_net                = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_position_qty_fp        = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_kill_switch_active     = nullptr;
@@ -146,7 +159,7 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Gauge>*   fam_trading_ready          = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_enabled       = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_custom_metric = nullptr;
-
+    // Baseline-aware per-strategy today PnL + fills.
     prometheus::Family<prometheus::Gauge>*   fam_today_pnl_net_v2       = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_today_fills_total_v2   = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_ledger_today_fills_total = nullptr;
@@ -155,7 +168,7 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_strategy_baseline_new_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_baseline_rotated_total      = nullptr;
     prometheus::Family<prometheus::Counter>* fam_strategy_baseline_load_failed_total = nullptr;
-
+    // Per-strategy auto-liquidation observability.
     prometheus::Family<prometheus::Gauge>*   fam_strategy_auto_liquidating = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_auto_liquidation_trigger_pnl_fp = nullptr;
     prometheus::Family<prometheus::Counter>* fam_strategy_auto_liquidation_breach_total = nullptr;
@@ -163,12 +176,14 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_strategy_auto_liquidation_deferred_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_strategy_auto_liquidation_1to1_violation_total = nullptr;
 
+    // Engine-hosted conditional stop orders.
     prometheus::Family<prometheus::Counter>* fam_stop_order_total = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_stop_order_armed = nullptr;
 
+    // Account truth direct emit.
     prometheus::Family<prometheus::Gauge>* fam_account_truth_wallet_balance          = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_account_truth_equity                  = nullptr;
-    prometheus::Family<prometheus::Gauge>* fam_account_equity_derived               = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_account_equity_derived               = nullptr;  ///< dual-emit rename target of xt_account_truth_equity
     prometheus::Family<prometheus::Gauge>* fam_venue_equity_raw                       = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_venue_cash_reanchor_divergence       = nullptr;
     prometheus::Family<prometheus::Counter>* fam_venue_cash_reanchor_correction_total = nullptr;
@@ -177,11 +192,12 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Gauge>* fam_account_truth_fees_today              = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_account_truth_external_cashflow_today = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_account_truth_trading_day_id          = nullptr;
-
+    // State-divergence telemetry.
     prometheus::Family<prometheus::Gauge>*   fam_state_divergence                = nullptr;
     prometheus::Family<prometheus::Counter>* fam_state_divergence_emit_heartbeat = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_reconcile_snapshot_age_ms       = nullptr;
 
+    // Maker/taker counters + risk limit gauges.
     prometheus::Family<prometheus::Counter>* fam_maker_fills_total                    = nullptr;
     prometheus::Family<prometheus::Counter>* fam_taker_fills_total                    = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_limit_max_order_qty         = nullptr;
@@ -191,12 +207,17 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Gauge>*   fam_strategy_limit_max_orders_per_min    = nullptr;
     prometheus::Family<prometheus::Gauge>*   fam_strategy_limit_allow_short           = nullptr;
 
+
+    // Control plane gRPC counter.
     prometheus::Family<prometheus::Counter>* fam_control_rpc_total      = nullptr;
 
+    // Gateway connection observability.
     prometheus::Family<prometheus::Counter>* fam_gateway_disconnect_total = nullptr;
 
+    // Risk close path 双源取严 disagreement.
     prometheus::Family<prometheus::Counter>* fam_close_quota_disagreement_total = nullptr;
 
+    // Recovery reverse-sync alive in-flight rebuild.
     prometheus::Family<prometheus::Counter>* fam_recovery_rebuild_alive_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_recovery_rebuild_alive_skipped_foreign_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_recovery_orphan_reaped_total = nullptr;
@@ -206,31 +227,50 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Counter>* fam_hft_worker_guard_fail_total = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_open_orders = nullptr;
 
+    // shm MD reader attach observability (T1.141①).
     prometheus::Family<prometheus::Gauge>* fam_shm_md_attach_failing = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_shm_md_attach_fail_count = nullptr;
 
+    // STP 已注册品种数 (T1.159).
     prometheus::Family<prometheus::Gauge>* fam_stp_registered_symbols = nullptr;
 
+    // Account store health (F02 P6)。
+    prometheus::Family<prometheus::Gauge>* fam_position_slots_used = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_position_slots_capacity = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_account_position_slot_overflow_total = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_account_publish_post_failed_total = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_account_frame_age_ms = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_account_session_begin_deferred_total = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_instrument_registry_intern_overflow_total = nullptr;
+    prometheus::Family<prometheus::Gauge>* fam_account_last_publish_ts_seconds = nullptr;
+    prometheus::Family<prometheus::Counter>* fam_account_slot_reservation_rejected_total = nullptr;
+
+    // XtOrderRuntimeBook drop counters.
     prometheus::Family<prometheus::Counter>* fam_runtime_book_drop_total = nullptr;
 
+    // Multi-strategy unmatched drop + engine recovery counters.
     prometheus::Family<prometheus::Counter>* fam_dropped_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_engine_recovery_total = nullptr;
 
+    // XtRuntimeMarketCache drop counters.
     prometheus::Family<prometheus::Counter>* fam_runtime_market_drop_total = nullptr;
 
+    // Latency tracker meta miss.
     prometheus::Family<prometheus::Counter>* fam_latency_meta_miss_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_latency_eligible_total = nullptr;
     prometheus::Family<prometheus::Counter>* fam_latency_tap_dropped_total = nullptr;
-
+    // CTP broker_frozen staleness.
     prometheus::Family<prometheus::Counter>* fam_broker_frozen_stale_total = nullptr;
 
+    // PositionAggregator implausible-jump observability.
     prometheus::Family<prometheus::Counter>* fam_position_aggregator_jump_total = nullptr;
 
+    // Per-symbol venue truth gauges.
     prometheus::Family<prometheus::Gauge>* fam_position_avg_price_fp       = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_position_mark_price_fp      = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_position_unrealized_pnl_fp  = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_position_margin_fp          = nullptr;
-
+    // account_store mark_cache_ marks，用于 divergence diagnostics。
     prometheus::Family<prometheus::Gauge>* fam_account_store_mark_price_fp = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_broker_position_qty_fp       = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_broker_position_avg_price_fp = nullptr;
@@ -241,15 +281,19 @@ struct XtMetricRegistry::Impl {
     prometheus::Family<prometheus::Gauge>* fam_strategy_position_avg_price_fp = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_strategy_position_unrealized_pnl_fp = nullptr;
 
+    // Account truth gap gauges.
     prometheus::Family<prometheus::Gauge>* fam_account_available_balance   = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_account_maint_margin        = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_account_margin_ratio        = nullptr;
 
+    // Paired ack histogram: submit→ack 两路均到后取 min。
     prometheus::Family<prometheus::Histogram>* fam_submit_to_ack_paired_us = nullptr;
 
+    // Contract meta gauges；start_exposer() 发布一次，用于检测 manifest drift。
     prometheus::Family<prometheus::Gauge>* fam_runner_contract_version_info = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_runner_bucket_schema_info    = nullptr;
 
+    // Runtime KPI gauges from the 1Hz non-latency snapshot.
     prometheus::Family<prometheus::Gauge>* fam_md_gap_ms_p99 = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_md_gap_ms_peak = nullptr;
     prometheus::Family<prometheus::Gauge>* fam_md_age_ms = nullptr;
@@ -260,11 +304,12 @@ struct XtMetricRegistry::Impl {
     Impl() {
         registry = std::make_shared<prometheus::Registry>();
 
+        // Counters
         fam_submits_total = &prometheus::BuildCounter()
             .Name("xt_submits_total")
             .Help("Total order submits emitted by runner")
             .Register(*registry);
-
+        // Cross-engine 行情 tick counter (panel 只读 xt_md_ticks_total).
         fam_md_ticks_total = &prometheus::BuildCounter()
             .Name("xt_md_ticks_total")
             .Help("Market data tick events received per (venue, symbol). "
@@ -324,6 +369,7 @@ struct XtMetricRegistry::Impl {
             .Help("Routed normalized ledger fills (labels: strategy, book, venue, symbol, side)")
             .Register(*registry);
 
+        // Histograms
         fam_submit_to_ack_us = &prometheus::BuildHistogram()
             .Name("xt_submit_to_ack_us")
             .Help("Submit→Ack latency in microseconds")
@@ -333,6 +379,7 @@ struct XtMetricRegistry::Impl {
             .Help("Submit→Fill latency in microseconds")
             .Register(*registry);
 
+        // Stage histogram bucket 在 Add() 时绑定，和 submit_to_{ack,fill}_us 保持一致。
         fam_strategy_us = &prometheus::BuildHistogram()
             .Name("xt_strategy_us")
             .Help("Strategy callback duration (tick→submit decision)")
@@ -342,6 +389,7 @@ struct XtMetricRegistry::Impl {
             .Help("Local submit path (strategy decision → userspace write complete)")
             .Register(*registry);
 
+        // Binance MD single-trip latency + clock skew families.
         fam_md_event_to_recv_us = &prometheus::BuildHistogram()
             .Name("xt_md_event_to_recv_us")
             .Help("Binance WS event_time→local recv single-trip latency (μs), clock-offset corrected")
@@ -387,6 +435,8 @@ struct XtMetricRegistry::Impl {
             .Help("aggTrade gap backfill outcome (labels: result=replayed|failed|truncated)")
             .Register(*registry);
 
+        // Gauges
+        // cumulative session pnl_net, derive today_pnl_net via recording rule
         fam_pnl_net = &prometheus::BuildGauge()
             .Name("xt_pnl_net")
             .Help("Cumulative session-pnl_net (= last_equity - session_baseline_equity); "
@@ -413,6 +463,7 @@ struct XtMetricRegistry::Impl {
             .Help("Trading readiness gate from XtRunnerSignals (1 = MD+TD ready, 0 = gated)")
             .Register(*registry);
 
+        // Baseline-aware per-strategy today PNL/fills.
         fam_today_pnl_net_v2 = &prometheus::BuildGauge()
             .Name("xt_today_pnl_net_v2")
             .Help("Today's realized PNL net per (strategy, book, venue, symbol), "
@@ -472,6 +523,7 @@ struct XtMetricRegistry::Impl {
             .Help("Per-sid auto-liquidation skipped: declared_symbols != 1 (warn-once per sid).")
             .Register(*registry);
 
+        // Engine-hosted conditional stop orders；event 有限枚举防 cardinality。
         fam_stop_order_total = &prometheus::BuildCounter()
             .Name("xt_stop_order_total")
             .Help("Engine-hosted stop-order lifecycle events (labels: event="
@@ -486,6 +538,7 @@ struct XtMetricRegistry::Impl {
                   "day-order 语义, 进程重启即失效。")
             .Register(*registry);
 
+        // Account truth direct emit gauges.
         fam_account_truth_wallet_balance = &prometheus::BuildGauge()
             .Name("xt_account_truth_wallet_balance")
             .Help("Account wallet balance: account_store cash (reconciled to venue wallet, "
@@ -496,7 +549,8 @@ struct XtMetricRegistry::Impl {
             .Help("Account equity = account_store cash + unrealized_pnl (account_store-derived, "
                   "NOT real venue/broker equity; runtime-emitted 1Hz).")
             .Register(*registry);
-
+        // T2.TRUTH-2 P4 rename（2026-07-08）：xt_account_truth_equity 名不副实（值是
+        // derived 非 venue 真值），dual-emit 新名直到 consumer 全部切换后删旧名。
         fam_account_equity_derived = &prometheus::BuildGauge()
             .Name("xt_account_equity_derived")
             .Help("Account equity = account_store cash + unrealized_pnl (account_store-derived, "
@@ -546,6 +600,7 @@ struct XtMetricRegistry::Impl {
             .Help("Current trading day ID (yyyymmdd integer in double, runtime-emitted 1Hz).")
             .Register(*registry);
 
+        // State-divergence telemetry：venue/host 由 prometheus-agent external_labels 补齐。
         fam_state_divergence = &prometheus::BuildGauge()
             .Name("xt_state_divergence")
             .Help("Account-state divergence |account_store.field − broker_snapshot.field| "
@@ -563,6 +618,7 @@ struct XtMetricRegistry::Impl {
                   "fetch failures (loop fail-closed, silently skipping compare cycles)")
             .Register(*registry);
 
+        // Maker/taker fills counters；on_fill_maker_taker() 二选一路由。
         fam_maker_fills_total = &prometheus::BuildCounter()
             .Name("xt_maker_fills_total")
             .Help("Total maker-side fills (passive — order resting on book before match). "
@@ -574,6 +630,7 @@ struct XtMetricRegistry::Impl {
                   "Cross-engine HFT/CTA/SEL emit.")
             .Register(*registry);
 
+        // Risk limit gauges 由 runner 1Hz cold path emit。
         fam_strategy_limit_max_order_qty = &prometheus::BuildGauge()
             .Name("xt_strategy_limit_max_order_qty")
             .Help("Strategy max order qty risk limit (gauge, 1Hz emit from XtLiveParamDomain).")
@@ -609,6 +666,8 @@ struct XtMetricRegistry::Impl {
                   "HFT main context only, 1Hz control-loop emit.")
             .Register(*registry);
 
+
+        // Control plane per-RPC observability.
         fam_control_rpc_us = &prometheus::BuildHistogram()
             .Name("xt_control_rpc_us")
             .Help("Control plane gRPC RPC latency in microseconds (server-side, "
@@ -619,12 +678,14 @@ struct XtMetricRegistry::Impl {
             .Help("Total control plane gRPC RPC calls (labels: action, actor, result)")
             .Register(*registry);
 
+        // Gateway connection observability.
         fam_gateway_disconnect_total = &prometheus::BuildCounter()
             .Name("xt_gateway_disconnect_total")
             .Help("Total gateway disconnect events (labels: venue, role, reason). "
                   "reason is finite enum: front_disconnect|ws_close|uds_close|stale_timeout|auth_fail|unknown")
             .Register(*registry);
 
+        // Risk close path 双源取严：local_outstanding vs broker_frozen。
         fam_close_quota_disagreement_total = &prometheus::BuildCounter()
             .Name("xt_risk_close_quota_disagreement_total")
             .Help("Risk close path 双源 disagreement events: |local_outstanding - "
@@ -632,6 +693,8 @@ struct XtMetricRegistry::Impl {
                   "default 0 让 max() 退化为 local single-source).")
             .Register(*registry);
 
+        // Recovery reverse-sync：warm reconnect / cold-start 拉取 venue 活跃在途单，
+        // 反解 local_id 后灌回 XtOrderRuntimeBook。
         fam_recovery_rebuild_alive_total = &prometheus::BuildCounter()
             .Name("xt_recovery_rebuild_alive_total")
             .Help("Recovery reverse-sync alive in-flight rebuild calls "
@@ -688,6 +751,8 @@ struct XtMetricRegistry::Impl {
                   "(labels: venue)")
             .Register(*registry);
 
+        // shm MD reader attach 可观测（T1.141①）：runner frame-tail 每 1Hz set，故 gauge
+        // 序列非惰性、免 series-birth 盲区。ring label = shm 段名（/xt_md_ctp、/xt_md_binance）。
         fam_shm_md_attach_failing = &prometheus::BuildGauge()
             .Name("xt_shm_md_attach_failing")
             .Help("shm MD reader attach state (1=most recent attach attempt failed "
@@ -701,6 +766,7 @@ struct XtMetricRegistry::Impl {
                   "xt_shm_md_attach_failing.")
             .Register(*registry);
 
+        // STP 已注册品种数 (T1.159)：runner 装配期 set，0 = 自成交防护未上膛=旁路。
         fam_stp_registered_symbols = &prometheus::BuildGauge()
             .Name("xt_stp_registered_symbols")
             .Help("Number of symbols armed in the STP self-trade guard "
@@ -708,6 +774,73 @@ struct XtMetricRegistry::Impl {
                   "bypassed. Set once at runner assembly after pre_warm_risk.")
             .Register(*registry);
 
+        // Account store health (F02 P6)：三 runner 共享的 advance_risk_frame 帧尾
+        // 1Hz emit；counter 类由进程内单调 atomic 经 delta-increment 导出。
+        // birth 语义：启动前（装配/recovery 期）增量在首样本即非零，increase()
+        // 不可见——expected-zero 类 alert 一律 `> 0` latch；启动后增量无盲区。
+        fam_position_slots_used = &prometheus::BuildGauge()
+            .Name("xt_position_slots_used")
+            .Help("Position slots consumed (labels: venue). Union of the three "
+                  "slot-creation sources: recovery admission / worker fill+set_position "
+                  "/ submit reservation. 60% warning, 80% critical (RUNBOOK: restart "
+                  "after close), 100% = new-open fail-closed.")
+            .Register(*registry);
+        fam_position_slots_capacity = &prometheus::BuildGauge()
+            .Name("xt_position_slots_capacity")
+            .Help("Position slot capacity (kMaxPositionSlots; labels: venue). Alert "
+                  "thresholds are used/capacity ratios; capacity change requires a "
+                  "spec revision (F02 D3).")
+            .Register(*registry);
+        fam_account_position_slot_overflow_total = &prometheus::BuildCounter()
+            .Name("xt_account_position_slot_overflow_total")
+            .Help("Events whose symbol could not obtain a position slot (slot table "
+                  "or mark intern exhausted; labels: venue). Money stays in "
+                  "account-level aggregation but the position is invisible per-symbol "
+                  "and has no close channel. Expected constant 0.")
+            .Register(*registry);
+        fam_account_publish_post_failed_total = &prometheus::BuildCounter()
+            .Name("xt_account_publish_post_failed_total")
+            .Help("Control-thread failures to post the publish-request closure to the "
+                  "account worker (queue full; labels: venue). Request is re-posted "
+                  "next frame; >0 = worker queue saturated, frame freshness degrading.")
+            .Register(*registry);
+        fam_account_last_publish_ts_seconds = &prometheus::BuildGauge()
+            .Name("xt_account_last_publish_ts_seconds")
+            .Help("Wall-clock unix timestamp (seconds) of the latest successfully "
+                  "published account frame, derived at emit time from the steady "
+                  "publish stamp (labels: venue). Freshness alert uses time() - this "
+                  "> 5s: it keeps firing when the emitting control loop itself "
+                  "freezes, unlike the diagnostic xt_account_frame_age_ms whose "
+                  "value freezes with the emitter.")
+            .Register(*registry);
+        fam_account_frame_age_ms = &prometheus::BuildGauge()
+            .Name("xt_account_frame_age_ms")
+            .Help("Age of the latest successfully published account frame in ms "
+                  "(labels: venue). DIAGNOSTIC ONLY: the value freezes if the "
+                  "emitting control loop freezes; the freshness alert reads "
+                  "time() - xt_account_last_publish_ts_seconds instead.")
+            .Register(*registry);
+        fam_account_session_begin_deferred_total = &prometheus::BuildCounter()
+            .Name("xt_account_session_begin_deferred_total")
+            .Help("Frames whose session-begin block was deferred because the account "
+                  "frame did not refresh within the bounded wait (labels: venue). "
+                  "Sustained growth = intraday/annual latches staying un-armed "
+                  "(fail-open direction).")
+            .Register(*registry);
+        fam_instrument_registry_intern_overflow_total = &prometheus::BuildCounter()
+            .Name("xt_instrument_registry_intern_overflow_total")
+            .Help("register_or_get calls rejected because the instrument intern table "
+                  "(kMaxInstruments) was exhausted; process-wide across registry "
+                  "instances (labels: venue). Expected constant 0.")
+            .Register(*registry);
+        fam_account_slot_reservation_rejected_total = &prometheus::BuildCounter()
+            .Name("xt_account_slot_reservation_rejected_total")
+            .Help("Submit rejections because position slot reservation failed "
+                  "(capacity or intern exhausted; labels: venue). Fail-closed "
+                  "new-open face of the same capacity incident counted by "
+                  "xt_account_position_slot_overflow_total. Expected constant 0.")
+            .Register(*registry);
+        // XtOrderRuntimeBook drop reason 必须是有限枚举，避免 cardinality 爆。
         fam_runtime_book_drop_total = &prometheus::BuildCounter()
             .Name("xt_runtime_book_drop_total")
             .Help("XtOrderRuntimeBook drop events (labels: reason="
@@ -725,6 +858,7 @@ struct XtMetricRegistry::Impl {
                   "close_outstanding_drift > 0 表示 close 在途额度与 slot 派生量分歧被自愈。")
             .Register(*registry);
 
+        // unmatched exec-event drop：kind/reason 都是有限枚举，防 cardinality 爆。
         fam_dropped_total = &prometheus::BuildCounter()
             .Name("xt_dropped_total")
             .Help("Multi-strategy unmatched exec-event drops (labels: kind=fill|order_rtn, "
@@ -733,6 +867,7 @@ struct XtMetricRegistry::Impl {
                   "超 unmatched_budget 预算会 trip kill_switch。")
             .Register(*registry);
 
+        // engine 自愈动作：kind 有限枚举。
         fam_engine_recovery_total = &prometheus::BuildCounter()
             .Name("xt_engine_recovery_total")
             .Help("Engine self-heal recovery actions (labels: kind=sid_fallback|"
@@ -740,6 +875,7 @@ struct XtMetricRegistry::Impl {
                   "lost_terminal = venue 已终态但本地 book 仍 open 的订单被合成终态修复。")
             .Register(*registry);
 
+        // XtRuntimeMarketCache drop reason 同 book：有限枚举防 cardinality 爆。
         fam_runtime_market_drop_total = &prometheus::BuildCounter()
             .Name("xt_runtime_market_drop_total")
             .Help("XtRuntimeMarketCache drop events (labels: reason="
@@ -748,12 +884,15 @@ struct XtMetricRegistry::Impl {
                   "被 fail-closed 拦截,off-worker 应走 snapshot_last_tick。期望恒 0。")
             .Register(*registry);
 
+        // miss 每订单至多一次；rate > 0 表示 latency histogram 覆盖率丢失。
         fam_latency_meta_miss_total = &prometheus::BuildCounter()
             .Name("xt_latency_meta_miss_total")
             .Help("Latency tracker emit skipped: order strategy/code meta unresolved "
                   "even via order-book fallback (labels: venue; once per order).")
             .Register(*registry);
 
+        // submit_to_ack coverage 分母：gateway submit 成功处计（每单一次）。label 集
+        // 与 histogram 一致 {strategy,book,symbol} 供 PromQL vector matching。
         fam_latency_eligible_total = &prometheus::BuildCounter()
             .Name("xt_latency_eligible_total")
             .Help("Latency sample eligibility (denominator for latency coverage). "
@@ -761,6 +900,7 @@ struct XtMetricRegistry::Impl {
                   "successful gateway submit with known strategy/symbol.")
             .Register(*registry);
 
+        // producer→assembler 传输面物理满 / 容器驱逐（有限枚举 reason 防 cardinality）。
         fam_latency_tap_dropped_total = &prometheus::BuildCounter()
             .Name("xt_latency_tap_dropped_total")
             .Help("Latency tracker tap dropped events (labels: reason="
@@ -769,12 +909,14 @@ struct XtMetricRegistry::Impl {
                   "背压 / 容器驱逐，样本覆盖率有损。")
             .Register(*registry);
 
+        // 仅 CTP 推送 broker_frozen；超过 staleness 阈值后 risk path 降级 local-only。
         fam_broker_frozen_stale_total = &prometheus::BuildCounter()
             .Name("xt_risk_broker_frozen_stale_total")
             .Help("CTP broker_frozen 推送停滞 > 30s,risk path 降级 local-only "
                   "(labels: venue). binance/XTP 不推 broker_frozen,不触发。")
             .Register(*registry);
 
+        // PositionAggregator jump hook 只上报异常大 delta；正常 position update 不触发。
         fam_position_aggregator_jump_total = &prometheus::BuildCounter()
             .Name("xt_position_aggregator_jump_total")
             .Help("PositionAggregator on_update saw an implausibly-large jump "
@@ -784,6 +926,7 @@ struct XtMetricRegistry::Impl {
                   "build asserts.")
             .Register(*registry);
 
+        // Per-symbol venue truth gauges：无 strategy attribution。
         fam_position_avg_price_fp = &prometheus::BuildGauge()
             .Name("xt_position_avg_price_fp")
             .Help("Per-position avg entry price ×1e6 (venue truth, binance /fapi/v2/account)")
@@ -792,7 +935,7 @@ struct XtMetricRegistry::Impl {
             .Name("xt_position_mark_price_fp")
             .Help("Per-position mark price ×1e6 (venue truth, binance /fapi/v2/positionRisk)")
             .Register(*registry);
-
+        // account_store mark cache 用于和 venue truth mark price 对比。
         fam_account_store_mark_price_fp = &prometheus::BuildGauge()
             .Name("xt_account_store_mark_price_fp")
             .Help("Account_store mark_cache_ internal mark per tracked code ×1e6 fp "
@@ -839,6 +982,7 @@ struct XtMetricRegistry::Impl {
             .Help("Strategy/book position unrealized PnL ×1e6")
             .Register(*registry);
 
+        // Account truth gap gauges.
         fam_account_available_balance = &prometheus::BuildGauge()
             .Name("xt_account_available_balance")
             .Help("Account available balance (availableBalance binance / balance CTP), "
@@ -855,12 +999,14 @@ struct XtMetricRegistry::Impl {
                   "[0,∞); 0 if denom=0. runtime-emitted 1Hz. labels: {venue, account, source}")
             .Register(*registry);
 
+        // Paired ack histogram 是 SLA query 源；1Hz snapshot 仅用于 ops correlation。
         fam_submit_to_ack_paired_us = &prometheus::BuildHistogram()
             .Name("xt_submit_to_ack_paired_us")
             .Help("Submit→Ack paired latency in microseconds (min of UDS + REST ack when both arrive). "
                   "SLA truth source; 1Hz CSV Snapshot::submit_to_ack_paired is ops-correlation-only.")
             .Register(*registry);
 
+        // Contract meta gauges 是 info-style metric，value 恒为 1。
         fam_runner_contract_version_info = &prometheus::BuildGauge()
             .Name("xt_runner_contract_version_info")
             .Help("Runner contract manifest version. Value=1; version label "
@@ -902,6 +1048,10 @@ struct XtMetricRegistry::Impl {
     }
 };
 
+// ----------------------------------------------------------------------------
+// Public API
+// ----------------------------------------------------------------------------
+
 XtMetricRegistry& XtMetricRegistry::instance() {
     static XtMetricRegistry inst;
     return inst;
@@ -923,7 +1073,9 @@ bool XtMetricRegistry::start_exposer(uint16_t port, std::string_view bind_addr) 
         impl_->exposer = std::make_unique<prometheus::Exposer>(endpoint);
         impl_->exposer->RegisterCollectable(impl_->registry);
         impl_->running.store(true, std::memory_order_release);
-
+        // Publish contract meta gauges so the first /metrics
+        // scrape exposes manifest_version + bucket schema fingerprints. Gate 1
+        // cross-checks the runner-emitted hashes against yaml-derived values.
         emit_contract_meta();
         return true;
     } catch (const std::exception&) {
@@ -948,6 +1100,8 @@ std::vector<prometheus::MetricFamily> XtMetricRegistry::collect_metric_families_
     return impl_->registry->Collect();
 }
 
+// ── Event Emitters ────────────────────────────────────────────────────────
+
 void XtMetricRegistry::on_order_submit(std::string_view strategy,
                                        std::string_view book,
                                        std::string_view venue,
@@ -960,10 +1114,11 @@ void XtMetricRegistry::on_order_submit(std::string_view strategy,
 
 void XtMetricRegistry::on_md_tick(std::string_view venue,
                                   std::string_view symbol) {
-
+    // Cross-venue tick counter (在 XtLiveRecorder::emit_md_tick 内调).
     impl_->fam_md_ticks_total->Add(make_labels_2(
         "venue", venue, "symbol", symbol)).Increment();
 }
+
 
 void XtMetricRegistry::on_order_rtn(std::string_view strategy,
                                     std::string_view book,
@@ -1003,7 +1158,8 @@ void XtMetricRegistry::on_trade(std::string_view strategy,
     } else if (realized_pnl_fp < 0) {
         impl_->fam_realized_loss_sum->Add(labels).Increment(static_cast<double>(-realized_pnl_fp));
     }
-
+    // Cross-engine maker/taker 计数复用 recorder drain path。
+    // Event schema 不保留 tr_code，symbol 可能为空；这是跨引擎统一 emit 的 label 兼容约束。
     auto fills_labels = make_labels_4(
         "strategy", strategy, "book", book, "venue", venue, "symbol", symbol);
     if (is_maker) {
@@ -1012,6 +1168,7 @@ void XtMetricRegistry::on_trade(std::string_view strategy,
         impl_->fam_taker_fills_total->Add(fills_labels).Increment();
     }
 
+    // qty_fp 不参与 metric value；保留参数以匹配成交事件接口。
     (void)qty_fp;
 }
 
@@ -1022,7 +1179,7 @@ void XtMetricRegistry::on_normalized_trade(std::string_view strategy,
                                            std::string_view side,
                                            std::string_view route_status,
                                            bool strategy_accounted) {
-
+    // route triage 漏斗包含未归因成交；today gauge 由 frame-loop 单源 emit。
     impl_->fam_trade_route_status_total->Add(
         make_labels_3("venue", venue, "symbol", symbol, "route_status", route_status)
     ).Increment();
@@ -1040,7 +1197,7 @@ void XtMetricRegistry::set_strategy_ledger_today(std::string_view strategy,
                                                  int64_t today_realized_pnl_fp,
                                                  int64_t today_fees_fp,
                                                  uint64_t today_fills) {
-
+    // 名称和 label 与 ledger today gauge 兼容，panel query 不需要区分数据来源。
     const auto labels = make_labels_4(
         "strategy", strategy, "book", book, "venue", venue, "symbol", symbol);
     impl_->fam_strategy_ledger_today_fills_total->Add(labels)
@@ -1063,7 +1220,12 @@ void XtMetricRegistry::on_risk_reject(std::string_view strategy,
 
 void XtMetricRegistry::inc_risk_rejects_total(std::string_view venue,
                                               uint64_t delta) {
-
+    // label 集与 metrics.yaml 声明 [strategy,symbol,reason] 一致（venue 系
+    // native 附加，同 inc_md_ticks_total 模式）；不带 book——runner 级聚合
+    // 恒 "_runtime" 无信息量，且避免抬 cardinality 预算。
+    // 每帧调用即 Add 取引用：首帧 eager 创建 0 值 series，保 rate() 有基线——
+    // 惰性（delta==0 early-return）会让 series 到首 reject 才出生，Prometheus 把
+    // 首见值当基线、首窗 burst 逃出 rate()。仅 delta>0 时才 Increment。
     auto& counter = impl_->fam_risk_rejects_total->Add(make_labels_4(
         "strategy", "_runtime", "venue", venue,
         "symbol", "_all", "reason", "_all"));
@@ -1072,10 +1234,15 @@ void XtMetricRegistry::inc_risk_rejects_total(std::string_view venue,
 
 void XtMetricRegistry::on_order_reject(std::string_view venue,
                                        std::string_view err_code) {
-
+    // err_code 是有限集合 label；err_msg/free-form 文本只能进日志，不能进 metric。
     impl_->fam_order_rejects_total->Add(make_labels_2(
         "venue", venue, "err_code", err_code)).Increment();
 }
+
+// ── Binance MD single-trip latency + clock skew ────────────────────────
+//
+// MD 发布接口只带 channel label；venue 由 prom-agent external_labels 补齐。
+// XtClockSkewEstimator 在 binance gateway 内维护状态，本组接口只负责发布。
 
 void XtMetricRegistry::observe_md_event_to_recv_us(std::string_view channel,
                                                     uint64_t latency_us) {
@@ -1095,7 +1262,7 @@ void XtMetricRegistry::observe_md_internal_queue_us(std::string_view channel,
 
 void XtMetricRegistry::set_md_clock_offset_us(std::string_view channel,
                                                double offset_us) {
-
+    // NaN 是状态信号：STEPPED 等不可信 offset 不应被 dashboard 当成 0。
     impl_->fam_md_clock_offset_us->Add(
         {{"channel", std::string(channel)}}
     ).Set(offset_us);
@@ -1175,10 +1342,13 @@ void XtMetricRegistry::on_kill_switch(std::string_view venue,
     }).Increment();
 }
 
+// ── gauge setters ─────────────────────────────────────────────────────────
+
 void XtMetricRegistry::set_pnl_net(std::string_view venue,
                                    std::string_view account,
                                    double pnl_net) {
-
+    // account-level cumulative session pnl_net.
+    // Account-level cumulative session pnl_net.
     impl_->fam_pnl_net->Add(
         make_labels_2("venue", venue, "account", account)
     ).Set(pnl_net);
@@ -1267,11 +1437,13 @@ void XtMetricRegistry::set_strategy_enabled(std::string_view strategy,
 void XtMetricRegistry::set_strategy_custom_metric(std::string_view strategy,
                                                   std::string_view name,
                                                   double value) {
-
+    // venue 由 external_labels 注入；此处只发 metrics.yaml 声明的 {strategy, name}。
     impl_->fam_strategy_custom_metric->Add(make_labels_2(
         "strategy", strategy, "name", name)
     ).Set(value);
 }
+
+// ── Baseline-aware setters ────────────────────────────────────────────────
 
 void XtMetricRegistry::set_today_pnl_net_v2(std::string_view strategy,
                                             std::string_view book,
@@ -1343,6 +1515,8 @@ void XtMetricRegistry::inc_strategy_auto_liquidation_1to1_violation_total(std::s
         .Increment();
 }
 
+// ── Engine-hosted conditional stop orders ─────────────────────────────────
+
 void XtMetricRegistry::inc_stop_order_total(std::string_view event, uint64_t delta) {
     if (delta == 0) return;
     impl_->fam_stop_order_total->Add({{"event", std::string(event)}})
@@ -1354,17 +1528,19 @@ void XtMetricRegistry::set_stop_order_armed(std::string_view strategy, uint32_t 
         .Set(static_cast<double>(count));
 }
 
+// ── Account truth direct emit setter ──────────────────────────────────────
+
 void XtMetricRegistry::set_account_truth_snapshot(std::string_view venue,
                                                    std::string_view account,
                                                    const AccountTruthSample& sample,
                                                    std::string_view source) {
-
+    // 一次调用 emit 10 个 account truth/gap gauge，降低 scrape cross-field skew。
     auto labels = make_labels_3("venue", venue,
                                  "account", account,
                                  "source", source);
     impl_->fam_account_truth_wallet_balance->Add(labels).Set(sample.wallet_balance);
     impl_->fam_account_truth_equity->Add(labels).Set(sample.equity);
-    impl_->fam_account_equity_derived->Add(labels).Set(sample.equity);
+    impl_->fam_account_equity_derived->Add(labels).Set(sample.equity);  // dual-emit，见注册处注释
     impl_->fam_account_truth_position_value->Add(labels).Set(sample.position_value);
     impl_->fam_account_truth_unrealized_pnl->Add(labels).Set(sample.unrealized_pnl);
     impl_->fam_account_truth_fees_today->Add(labels).Set(sample.fees_today);
@@ -1392,6 +1568,8 @@ void XtMetricRegistry::observe_cash_reanchor(std::string_view venue,
         .Increment(std::abs(divergence));
 }
 
+// ── State-divergence telemetry setters ───────────────────────────────────
+
 void XtMetricRegistry::set_state_divergence(std::string_view field,
                                             std::string_view symbol,
                                             double value) {
@@ -1401,15 +1579,17 @@ void XtMetricRegistry::set_state_divergence(std::string_view field,
 }
 
 void XtMetricRegistry::inc_state_divergence_emit_heartbeat() {
-
+    // 无 label；venue/host 由 prom-agent external_labels 补齐。
     impl_->fam_state_divergence_emit_heartbeat->Add(prometheus::Labels{})
         .Increment();
 }
 
 void XtMetricRegistry::set_reconcile_snapshot_age_ms(double age_ms) {
-
+    // 无 label；venue/host 由 prom-agent external_labels 补齐。
     impl_->fam_reconcile_snapshot_age_ms->Add(prometheus::Labels{}).Set(age_ms);
 }
+
+// ── Maker/taker fills counter setter ──────────────────────────────────────
 
 void XtMetricRegistry::on_fill_maker_taker(std::string_view strategy,
                                             std::string_view book,
@@ -1427,6 +1607,8 @@ void XtMetricRegistry::on_fill_maker_taker(std::string_view strategy,
     }
 }
 
+// ── Risk limits per-strategy gauge setter ─────────────────────────────────
+
 void XtMetricRegistry::set_strategy_limits(std::string_view strategy,
                                             std::string_view book,
                                             std::string_view venue,
@@ -1442,10 +1624,13 @@ void XtMetricRegistry::set_strategy_limits(std::string_view strategy,
     impl_->fam_strategy_limit_allow_short->Add(labels).Set(limits.allow_short ? 1.0 : 0.0);
 }
 
+
+// ── Control plane gRPC observability ──────────────────────────────────────
+
 void XtMetricRegistry::observe_control_rpc_us(std::string_view action,
                                                 std::string_view result,
                                                 uint64_t latency_us) {
-
+    // control RPC 使用独立 rpc_us bucket family，不与 order-path latency 共用分桶。
     impl_->fam_control_rpc_us->Add(
         make_labels_2("action", action, "result", result),
         rpc_us_buckets()
@@ -1460,6 +1645,8 @@ void XtMetricRegistry::inc_control_rpc_total(std::string_view action,
     ).Increment();
 }
 
+// ── Gateway connection observability ──────────────────────────────────────
+
 void XtMetricRegistry::inc_gateway_disconnect_total(std::string_view venue,
                                                      std::string_view role,
                                                      std::string_view reason) {
@@ -1468,11 +1655,15 @@ void XtMetricRegistry::inc_gateway_disconnect_total(std::string_view venue,
     ).Increment();
 }
 
+// ── Risk close path 双源取严 disagreement ─────────────────────────────────
+
 void XtMetricRegistry::inc_close_quota_disagreement_total(std::string_view venue) {
     impl_->fam_close_quota_disagreement_total->Add(
         prometheus::Labels{{"venue", std::string(venue)}}
     ).Increment();
 }
+
+// ── Recovery reverse-sync alive in-flight rebuild ─────────────────────────
 
 void XtMetricRegistry::inc_recovery_rebuild_alive_total(std::string_view venue,
                                                          std::string_view outcome) {
@@ -1535,6 +1726,8 @@ void XtMetricRegistry::set_open_orders(std::string_view venue, uint32_t count) {
     ).Set(static_cast<double>(count));
 }
 
+// ── shm MD reader attach observability (T1.141①) ──────────────────────────
+
 void XtMetricRegistry::set_shm_md_attach_failing(std::string_view ring, uint32_t failing) {
     impl_->fam_shm_md_attach_failing->Add(
         prometheus::Labels{{"ring", std::string(ring)}}
@@ -1553,11 +1746,49 @@ void XtMetricRegistry::set_stp_registered_symbols(std::string_view venue, uint32
     ).Set(static_cast<double>(count));
 }
 
+void XtMetricRegistry::set_account_store_health(std::string_view venue,
+                                                const AccountStoreHealthSample& sample) {
+    const auto labels = prometheus::Labels{{"venue", std::string(venue)}};
+    impl_->fam_position_slots_used->Add(labels)
+        .Set(static_cast<double>(sample.position_slots_used));
+    impl_->fam_position_slots_capacity->Add(labels)
+        .Set(static_cast<double>(sample.position_slots_capacity));
+    if (sample.frame_age_ms >= 0) {  // <0 = 尚未发布首帧，不 emit（避免假“新鲜”或巨龄）
+        impl_->fam_account_frame_age_ms->Add(labels)
+            .Set(static_cast<double>(sample.frame_age_ms));
+    }
+    if (sample.last_publish_unix_ts_seconds > 0) {
+        impl_->fam_account_last_publish_ts_seconds->Add(labels)
+            .Set(sample.last_publish_unix_ts_seconds);
+    }
+    // counter 从进程内单调 atomic 经 delta 导出：同一 label 的 emit 单线程（1Hz
+    // 控制帧），Value() 读-增无竞争；源 atomic 单调 ⇒ delta 恒 ≥ 0。
+    const auto bump = [](prometheus::Counter& c, uint64_t cum) {
+        const double delta = static_cast<double>(cum) - c.Value();
+        if (delta > 0) c.Increment(delta);
+    };
+    bump(impl_->fam_account_position_slot_overflow_total->Add(labels),
+         sample.position_slot_overflow_total);
+    bump(impl_->fam_account_publish_post_failed_total->Add(labels),
+         sample.publish_post_failed_total);
+    bump(impl_->fam_account_session_begin_deferred_total->Add(labels),
+         sample.session_begin_deferred_total);
+    bump(impl_->fam_instrument_registry_intern_overflow_total->Add(labels),
+         sample.intern_overflow_total);
+    bump(impl_->fam_account_slot_reservation_rejected_total->Add(labels),
+         sample.slot_reservation_rejected_total);
+}
+
+
+// ── XtOrderRuntimeBook drop counters ──────────────────────────────────────
+
 void XtMetricRegistry::inc_runtime_book_drop_total(std::string_view reason) {
     impl_->fam_runtime_book_drop_total->Add(
         prometheus::Labels{{"reason", std::string(reason)}}
     ).Increment();
 }
+
+// ── Multi-strategy unmatched drop + engine recovery ──────────────────────
 
 void XtMetricRegistry::inc_unmatched_drop_total(std::string_view kind,
                                                 std::string_view reason,
@@ -1575,11 +1806,15 @@ void XtMetricRegistry::inc_engine_recovery_total(std::string_view kind, uint64_t
     ).Increment(static_cast<double>(delta));
 }
 
+// ── XtRuntimeMarketCache drop counters ─────────────────────────────────────
+
 void XtMetricRegistry::inc_runtime_market_drop_total(std::string_view reason) {
     impl_->fam_runtime_market_drop_total->Add(
         prometheus::Labels{{"reason", std::string(reason)}}
     ).Increment();
 }
+
+// ── Latency tracker meta miss ─────────────────────────────────────────────
 
 void XtMetricRegistry::inc_latency_meta_miss_total(std::string_view venue) {
     impl_->fam_latency_meta_miss_total->Add(
@@ -1605,11 +1840,15 @@ void XtMetricRegistry::inc_latency_tap_dropped_total(std::string_view reason) {
     ).Increment();
 }
 
+// ── CTP broker_frozen staleness ───────────────────────────────────────────
+
 void XtMetricRegistry::inc_broker_frozen_stale_total(std::string_view venue) {
     impl_->fam_broker_frozen_stale_total->Add(
         prometheus::Labels{{"venue", std::string(venue)}}
     ).Increment();
 }
+
+// ── PositionAggregator implausible-jump observability ────────────────────
 
 void XtMetricRegistry::inc_position_aggregator_jump_total(std::string_view sid,
                                                           std::string_view code) {
@@ -1617,6 +1856,8 @@ void XtMetricRegistry::inc_position_aggregator_jump_total(std::string_view sid,
         make_labels_2("sid", sid, "code", code)
     ).Increment();
 }
+
+// ── per-symbol venue truth gauge setters ──────────────────────────────────
 
 void XtMetricRegistry::set_position_avg_price_fp(std::string_view venue,
                                                   std::string_view symbol,
@@ -1703,6 +1944,7 @@ void XtMetricRegistry::set_broker_position_margin_fp(std::string_view venue,
     ).Set(static_cast<double>(v));
 }
 
+// Contract meta gauges 通常由 start_exposer() 发布一次；重复调用会覆盖同一 gauge。
 void XtMetricRegistry::emit_contract_meta() {
     namespace contract = xt::metrics::contract;
     impl_->fam_runner_contract_version_info
@@ -1742,6 +1984,11 @@ void XtMetricRegistry::set_runtime_kpi_snapshot(std::string_view strategy,
     set_gauge(impl_->fam_queue_depth, sample.queue_depth_p99);
     set_gauge(impl_->fam_risk_block_count, sample.risk_block_count);
 }
+
+// ── Histogram ptr accessor ────────────────────────────────────────────────
+//
+// XtLiveLatencyTracker 在冷路径解析 label tuple 后缓存 Histogram*；
+// hot path 只走 cached Observe()，跳过 Family::Add() 的 mutex lookup。
 
 prometheus::Histogram* XtMetricRegistry::get_submit_to_ack_us_histogram(
     std::string_view strategy, std::string_view book,
@@ -1801,4 +2048,4 @@ prometheus::Counter* XtMetricRegistry::get_latency_eligible_counter(
     );
 }
 
-}
+}  // namespace ct::metrics

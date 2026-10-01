@@ -13,7 +13,7 @@
 
 #include "XtArrowReadUtil.h"
 
-using namespace xt_arrow;
+using namespace xt_arrow;  // parquet column access helpers
 
 namespace {
 
@@ -57,6 +57,9 @@ std::optional<int64_t> id_or_null(int64_t v) {
     return v < 0 ? std::optional<int64_t>{} : std::optional<int64_t>{v};
 }
 
+// 必需列存在性 + 物理类型校验：缺列/类型漂移时 *_at 的 fallback（0/-1/空串）
+// 会把整列静默变成垃圾值，必须 fail-fast 到 init 失败。只对非空表校验：
+// 0 行表无读取面，部分 producer 的空表可能不带完整 schema。
 bool require_typed_col(const std::shared_ptr<arrow::Table>& table,
                        const char* name, arrow::Type::type expected,
                        const std::string& path) {
@@ -130,7 +133,7 @@ void add_existing_pair(std::vector<std::tuple<std::string, std::string, std::str
     }
 }
 
-}
+} // namespace
 
 XtEventParquetReader::XtEventParquetReader(Options opts) : opts_(std::move(opts)) {}
 
@@ -174,7 +177,7 @@ bool XtEventParquetReader::next_tick(XtRawTick& out) {
 
     const TradeRow& trade = stream.trades[stream.trade_pos++];
     try {
-
+        // book rows 必须先推进到当前 trade timestamp，tick 才能携带成交时刻的 L5 快照。
         while (stream.book_pos < stream.book_rows &&
                int64_at(stream.book_ts, static_cast<int64_t>(stream.book_pos), 0) <= trade.exch_ts_ms) {
             const int64_t pos = static_cast<int64_t>(stream.book_pos++);
@@ -209,7 +212,7 @@ bool XtEventParquetReader::next_tick(XtRawTick& out) {
     if (opts_.volume_mode == XtTickVolumeMode::Incremental) {
         out.volume = trade.quantity;
     } else {
-
+        // canonical trades 只有单笔 quantity；cumulative 模式在 reader 内累加 total_volume。
         const bool has_prev_volume = stream.cum_volume > 0.0;
         stream.cum_volume += trade.quantity;
         out.total_volume = stream.cum_volume;
@@ -218,7 +221,7 @@ bool XtEventParquetReader::next_tick(XtRawTick& out) {
 
     const auto l5 = stream.replayer.l5_snapshot();
     for (int i = 0; i < 5; ++i) {
-
+        // XtRawTick 深度数组用 0 表示缺档；book replayer 内部用 NaN 表示缺失价位。
         out.bid_prices[i] = zero_if_nan(l5.bid_prices[i]);
         out.bid_qty[i] = zero_if_nan(l5.bid_qtys[i]);
         out.ask_prices[i] = zero_if_nan(l5.ask_prices[i]);
@@ -283,7 +286,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
                                            uint32_t trading_day,
                                            const std::string& trades_path,
                                            const std::string& book_path) {
-
+    // base 持共享资源（table + book 列数组）；每个 symbol bucket 拷贝它成独立 Stream，
+    // shared_ptr 浅共享底层 parquet 数据 —— 一对文件只读一次盘。
     Stream base;
     base.exchange = exchange;
     base.symbol = symbol;
@@ -293,6 +297,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
         return false;
     }
 
+    // 必需列验收（N05）：trade 侧 ts/price/qty，book 侧另含 side/event_type；
+    // update-id 三列经 id_or_null 容忍缺席，不强校。
     if (!require_typed_col(base.trades_table, "exch_ts_ms", arrow::Type::INT64, trades_path) ||
         !require_typed_col(base.trades_table, "price", arrow::Type::DOUBLE, trades_path) ||
         !require_typed_col(base.trades_table, "quantity", arrow::Type::DOUBLE, trades_path) ||
@@ -321,6 +327,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
     base.book_symbol = col_array(base.book_table, "symbol");
     base.book_rows = static_cast<std::size_t>(std::max<int64_t>(0, base.book_table->num_rows()));
 
+    // 按 symbol 分桶（N02）：`symbol` 非空 = 路径/filter 已限定单 symbol，退化单桶；
+    // 空 = 聚合文件，按 trade row symbol 建桶。桶序 = 首次出现顺序（确定性）。
     std::vector<std::pair<std::string, std::vector<TradeRow>>> buckets;
     auto rows_of = [&buckets](const std::string& key) -> std::vector<TradeRow>& {
         for (auto& b : buckets) {
@@ -344,7 +352,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
     }
 
     if (buckets.size() > 1) {
-
+        // 聚合文件里空 symbol trade 行只在「整文件都无 symbol」时可接受（单一匿名流）；
+        // 与具名 symbol 混排则无法归属 —— 静默丢单会扭曲回测 fill，fail-fast。
         for (const auto& b : buckets) {
             if (b.first.empty()) {
                 std::fprintf(stderr,
@@ -353,7 +362,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
                 return false;
             }
         }
-
+        // 多 symbol 拆流后 book 行按 stream.symbol skip 路由；book 缺 symbol 列或含空
+        // symbol 行会广播到所有 Stream（跨 symbol 污染 L5），fail-fast。
         if (!base.book_symbol) {
             std::fprintf(stderr,
                          "[XtEventParquetReader] aggregated book missing 'symbol' column with multi-symbol trades in %s\n",
@@ -371,7 +381,7 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
     }
 
     for (auto& bucket : buckets) {
-        Stream stream = base;
+        Stream stream = base;  // shared_ptr 浅共享 table/列数组，replayer 为 fresh 状态
         stream.symbol = bucket.first;
         stream.trades = std::move(bucket.second);
         std::stable_sort(stream.trades.begin(), stream.trades.end(),
@@ -379,7 +389,8 @@ bool XtEventParquetReader::load_one_stream(const std::string& exchange,
                              return a.exch_ts_ms < b.exch_ts_ms;
                          });
         if (stream.exchange.empty()) {
-
+            // 聚合文件路径不带 exchange；取本桶首个非空 trade exchange 作 fallback，
+            // 仅在 trade row 自身 exchange 为空时被 next_tick 消费。
             for (const auto& t : stream.trades) {
                 if (!t.exchange.empty()) {
                     stream.exchange = t.exchange;

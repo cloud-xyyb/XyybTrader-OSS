@@ -14,6 +14,10 @@
 
 namespace xt_live::control {
 
+// ----------------------------------------------------------------------------
+// XtKillSwitchState
+// ----------------------------------------------------------------------------
+
 void XtKillSwitchState::update(bool active, std::string actor, std::string reason,
                                 int64_t ts_unix_ns) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -50,8 +54,13 @@ bool XtKillSwitchState::is_active() const {
     return active_;
 }
 
+// ----------------------------------------------------------------------------
+// XtKillSwitchAuditLog
+// ----------------------------------------------------------------------------
+
 namespace {
 
+/// @brief Minimal JSON-string escaper (覆盖 control char + quote/backslash)。
 std::string json_escape(const std::string& s) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -79,27 +88,31 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
+/// @brief 按 UTC 日历日生成 audit 文件滚动 key（YYYYMMDD）。
+/// @note kill switch audit 按运维日历滚动；交易日边界由上层查询侧解释。
 std::string utc_yyyymmdd(int64_t ts_unix_ns) {
     const std::time_t t = static_cast<std::time_t>(ts_unix_ns / 1'000'000'000LL);
     std::tm tm{};
     gmtime_r(&t, &tm);
-
+    // 32-byte buffer 让 -Wformat-truncation 静默 (compiler 不知道 tm_year ∈
+    // [-1900, 9999-1900] 等小区间, 形式上是 int → 11 bytes 上界);实际 8 字节够。
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%04d%02d%02d",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
     return std::string(buf);
 }
 
-}
+}  // namespace
 
 XtKillSwitchAuditLog::XtKillSwitchAuditLog(std::string dir)
     : dir_(std::move(dir)) {}
 
 void XtKillSwitchAuditLog::append(const KillSwitchTripEvent& ev) {
-    if (dir_.empty()) return;
+    if (dir_.empty()) return;  // gtest noop path
 
     std::lock_guard<std::mutex> lk(mu_);
 
+    // 确保 dir 存在; 失败 silently noop (control path 不阻塞)
     std::error_code ec;
     std::filesystem::create_directories(dir_, ec);
     if (ec) return;
@@ -110,6 +123,7 @@ void XtKillSwitchAuditLog::append(const KillSwitchTripEvent& ev) {
     std::ofstream ofs(path, std::ios::binary | std::ios::app);
     if (!ofs) return;
 
+    // append-only JSON line
     std::ostringstream os;
     os << "{\"active\":"  << (ev.active ? "true" : "false")
        << ",\"actor\":\""  << json_escape(ev.actor)
@@ -117,7 +131,7 @@ void XtKillSwitchAuditLog::append(const KillSwitchTripEvent& ev) {
        << "\",\"ts_unix_ns\":" << ev.ts_unix_ns
        << "}\n";
     ofs << os.str();
-
+    // control path 不做 fsync；crash 时可能丢失 page cache 中尚未落盘的尾部 audit line。
 }
 
-}
+}  // namespace xt_live::control

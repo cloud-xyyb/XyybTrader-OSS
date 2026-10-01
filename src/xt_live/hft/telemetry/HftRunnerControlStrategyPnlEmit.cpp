@@ -19,10 +19,12 @@ struct EmitTarget {
     std::string code;
 };
 
+// Prometheus label 不写空 strategy；空 sid 统一落到 `_default`，保证 row 与 zero-heartbeat 同口径。
 std::string normalize_sid(const std::string& sid) {
     return sid.empty() ? std::string("_default") : sid;
 }
 
+// target 来源可能重叠；这里统一规范 sid 并按 (sid, code) 去重，避免同一 gauge label 重复写入。
 void add_target(std::vector<EmitTarget>& out, std::string sid, std::string code) {
     sid = normalize_sid(sid);
     if (sid.empty() || code.empty()) return;
@@ -32,6 +34,8 @@ void add_target(std::vector<EmitTarget>& out, std::string sid, std::string code)
     if (!exists) out.push_back({std::move(sid), std::move(code)});
 }
 
+// 计算 zero-heartbeat 覆盖面：先收显式 target；无显式 target 时用 unified 配置兜底，
+// 再补 declared symbols 与本轮真实 rows，确保无成交策略也能持续暴露 0 值。
 std::vector<EmitTarget> collect_emit_targets(
     const XtRunnerControlConfig& cfg,
     const xt_strategy_engine::XtDeclaredSymbolRegistry* declared_registry,
@@ -60,6 +64,8 @@ std::vector<EmitTarget> collect_emit_targets(
     return targets;
 }
 
+// trading-day rollover 时用当前 cumulative rows 作为新日初基准；baseline 缺失或同日直接跳过。
+// 本 helper 只在 control 线程调用，baseline state 目录沿用 runner 现有持久化约定。
 void rotate_baseline_if_needed(const XtRunnerControlConfig& cfg,
                                XtStrategyPnlBaseline* baseline,
                                const std::vector<XtStrategyPnlAggregator::Row>& rows,
@@ -82,7 +88,7 @@ void rotate_baseline_if_needed(const XtRunnerControlConfig& cfg,
         br.code     = r.code;
         br.realized = r.realized;
         br.fees     = r.fees;
-        br.fills    = r.fills;
+        br.fills    = r.fills;  // fills 也进入日初基准；today_fills 与 realized/fees 一样按当日增量上报。
         base_rows.push_back(std::move(br));
     }
     baseline->rotate_day(base_rows);
@@ -92,7 +98,7 @@ void rotate_baseline_if_needed(const XtRunnerControlConfig& cfg,
     last_baseline_day_id = current_day;
 }
 
-}
+}  // namespace
 
 StrategyPnlEmitResult emit_strategy_pnl_metrics(
     const XtRunnerControlConfig& cfg,
@@ -113,25 +119,27 @@ StrategyPnlEmitResult emit_strategy_pnl_metrics(
         if (result.baseline_ready) {
             bool is_new = false;
             const auto base = baseline->get(sid, r.code, &is_new);
-
+            // D9：缺 baseline 的 row 每帧 is_new=true（get 为 const 不写 baseline_），改为
+            // 每 (sid,code) 每 epoch 计一次（mark_new_reported 去重，rotate/load 清空）。
             if (is_new && baseline->mark_new_reported(sid, r.code)) {
                 ct::metrics::XtMetricRegistry::instance().inc_strategy_baseline_new_total(
                     sid, cfg.venue_label);
             }
             const double today_pnl = cumulative_pnl - (base.realized - base.fees);
             ct::metrics::XtMetricRegistry::instance().set_today_pnl_net_v2(
-                 sid,  sid, cfg.venue_label,  r.code, today_pnl);
+                /*strategy=*/sid, /*book=*/sid, cfg.venue_label, /*symbol=*/r.code, today_pnl);
 
+            // strategy ledger gauge 复用同一 baseline，避免 PnL 与 fills 的 today 口径漂移。
             const int64_t today_realized_fp =
                 static_cast<int64_t>((r.realized - base.realized) * 1'000'000.0);
             const int64_t today_fees_fp =
                 static_cast<int64_t>((r.fees - base.fees) * 1'000'000.0);
             const uint64_t today_fills = r.fills >= base.fills ? (r.fills - base.fills) : 0;
             ct::metrics::XtMetricRegistry::instance().set_strategy_ledger_today(
-                 sid,  sid, cfg.venue_label,  r.code,
+                /*strategy=*/sid, /*book=*/sid, cfg.venue_label, /*symbol=*/r.code,
                 today_realized_fp, today_fees_fp, today_fills);
             ct::metrics::XtMetricRegistry::instance().set_today_fills_total_v2(
-                 sid, cfg.venue_label,  r.code, today_fills);
+                /*strategy=*/sid, cfg.venue_label, /*symbol=*/r.code, today_fills);
         }
     }
 
@@ -140,14 +148,14 @@ StrategyPnlEmitResult emit_strategy_pnl_metrics(
         result.zero_target_count = targets.size();
         for (const auto& target : targets) {
             ct::metrics::XtMetricRegistry::instance().set_today_pnl_net_v2(
-                 target.sid,  target.sid,
-                cfg.venue_label,  target.code, 0.0);
+                /*strategy=*/target.sid, /*book=*/target.sid,
+                cfg.venue_label, /*symbol=*/target.code, 0.0);
             ct::metrics::XtMetricRegistry::instance().set_today_fills_total_v2(
-                 target.sid, cfg.venue_label,  target.code, 0);
+                /*strategy=*/target.sid, cfg.venue_label, /*symbol=*/target.code, 0);
         }
     }
 
     return result;
 }
 
-}
+}  // namespace xt_live::control

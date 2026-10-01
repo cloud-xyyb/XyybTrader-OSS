@@ -11,7 +11,7 @@
 
 #include "api/IHftEngineObserver.h"
 #include "api/IRejectSink.h"
-#include "api/XtRiskTypes.h"
+#include "api/XtRiskTypes.h"                              // XtRiskResult.reason_text
 #include "xt_backtest/reporter/XtBacktestDailyBreakdown.h"
 
 namespace xt_core {
@@ -27,13 +27,13 @@ namespace xt_backtest {
 /// eod 的日轴口径一致。故意**不用** on_order_submit 携带的 ts —— 那是 action 轴，夜盘
 /// 会与交易日分叉；fill / eod / tick 全部按交易日 key，提交也必须同轴。
 struct DailyBreakdownSubmitProbe final : xt_runtime::IHftEngineObserver {
-    XtBacktestDailyBreakdown* bd = nullptr;
-    const uint32_t* cur_trading_date = nullptr;
+    XtBacktestDailyBreakdown* bd = nullptr;       ///< 目标 breakdown（非拥有）。
+    const uint32_t* cur_trading_date = nullptr;   ///< runner 维护的当前交易日（非拥有）。
 
-    void on_order_submit(int64_t  , uint64_t  , const char*  ,
-                         bool  , int64_t  , int64_t  ,
-                         std::string_view  , bool  ,
-                         bool  ) override {
+    void on_order_submit(int64_t /*ts*/, uint64_t /*id*/, const char* /*code*/,
+                         bool /*is_buy*/, int64_t /*price_fp*/, int64_t /*qty_fp*/,
+                         std::string_view /*user_tag*/, bool /*is_close*/,
+                         bool /*is_today*/) override {
         if (bd && cur_trading_date && *cur_trading_date != 0)
             bd->on_submit(*cur_trading_date);
     }
@@ -50,16 +50,16 @@ struct DailyBreakdownRejectProbe final : IRejectSink {
     XtBacktestDailyBreakdown* bd = nullptr;
     const uint32_t* cur_trading_date = nullptr;
 
-    void on_margin_reject(const xt_core::XtOrder&  , const XtRiskResult& decision,
-                          int64_t  , std::string_view  ) override {
+    void on_margin_reject(const xt_core::XtOrder& /*req*/, const XtRiskResult& decision,
+                          int64_t /*now_ms*/, std::string_view /*strategy_id*/) override {
         if (bd && cur_trading_date && *cur_trading_date != 0)
             bd->on_risk_reject(*cur_trading_date, decision.reason_text);
     }
-    void on_reject(const xt_core::XtOrder&  , const XtRiskResult& decision,
-                   std::string_view  ) override {
+    void on_reject(const xt_core::XtOrder& /*req*/, const XtRiskResult& decision,
+                   std::string_view /*strategy_id*/) override {
         if (bd && cur_trading_date && *cur_trading_date != 0)
             bd->on_risk_reject(*cur_trading_date, decision.reason_text);
     }
 };
 
-}
+}  // namespace xt_backtest

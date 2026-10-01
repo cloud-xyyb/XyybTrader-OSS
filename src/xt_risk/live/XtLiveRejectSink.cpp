@@ -8,17 +8,19 @@
 
 namespace {
 
+// reject 慢路径专用时钟；evaluate 放行热路径不触达本文件。
 uint64_t steady_now_us() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// 抑制状态 process-global：sink 是 submit() 的 per-call 栈对象，承载不了跨调用窗口。
 XtLiveRejectLogThrottle& reject_log_throttle() {
     static XtLiveRejectLogThrottle throttle;
     return throttle;
 }
 
-}
+}  // namespace
 
 bool XtLiveRejectLogThrottle::should_log(std::string_view strategy_id,
                                          int reason_code,
@@ -52,7 +54,8 @@ void XtLiveRejectSink::on_margin_reject(const xt_core::XtOrder& req,
                          req.is_buy ? "buy" : "sell",
                          req.price_fp, req.qty_fp,
                          decision.available_cash_fp, decision.required_margin_fp,
-                         risk_reason_text(decision.reason_code),
+                         decision.reason_text.empty() ? risk_reason_text(decision.reason_code)
+                                                      : decision.reason_text.c_str(),
                          risk_stage_text(decision.stage),
                          strategy_id,
                          suppressed);
@@ -73,7 +76,8 @@ void XtLiveRejectSink::on_reject(const xt_core::XtOrder& req,
                          req.code,
                          req.is_buy ? "buy" : "sell",
                          req.qty_fp,
-                         risk_reason_text(decision.reason_code),
+                         decision.reason_text.empty() ? risk_reason_text(decision.reason_code)
+                                                      : decision.reason_text.c_str(),
                          risk_stage_text(decision.stage),
                          strategy_id,
                          suppressed);

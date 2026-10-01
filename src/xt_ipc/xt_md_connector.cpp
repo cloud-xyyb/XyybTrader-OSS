@@ -26,10 +26,10 @@
 #include <vector>
 
 #include "api/IMdGateway.h"
-#include "GatewayFactory.h"
+#include "GatewayFactory.h"       // per-venue connector target 将 src/xt_live/gateway 放入 include path
 #include "ctp/md/CTPMdCfg.h"
-#include "ctp/md/CtpMdSessionGate.h"
-#include "binance/md/BinanceMdCfg.h"
+#include "ctp/md/CtpMdSessionGate.h"  // expected-tick 窗解析/eval（gauge + CTPMdCfg 共用）
+#include "binance/md/BinanceMdCfg.h"  // POD（仅 WS/REST URL）；GatewayFactory.h 已无条件引入，显式列出供 binance 分支
 #include "xt_backtest/data/reader/XtBinTickReader.h"
 #include "xt_core/market/XtRawTick.h"
 #include "xt_ipc/XtMdSidecarPath.h"
@@ -41,33 +41,39 @@ namespace {
 
 using Ring = xt_ipc::XtShmRing<xt_ipc::XtMdWireSlot>;
 
+// capture 时戳：CLOCK_MONOTONIC steady ns。**必须与 reader 进程 XtSteadyClock 同时钟域**
+// —— XtSteadyClock 基于 std::chrono::steady_clock（Linux == CLOCK_MONOTONIC），故本
+// connector 直用 std::chrono::steady_clock（与 connector_epoch 同源）→ 跨进程可比。
+// 前提：writer/reader 同一 monotonic time namespace（bare-proc 同 host 部署天然成立；
+// 容器化分离 time namespace 会引入不可检测的 capture 偏移）。
 int64_t capture_now_ns() {
-
+    // duration_cast：标准不保证 steady_clock period 为 ns，显式转换消除实现依赖。
     return static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 std::atomic<bool> g_stop{false};
-std::string g_shm_name;
-int g_lock_fd = -1;
+std::string g_shm_name;  // 供信号处理器与 die() unlink
+int g_lock_fd = -1;      // 单实例 flock fd；进程生命周期内持有（退出由 OS 释放）
 
 struct ConnectorOptions {
     std::string ring_name = "/xt_md_shadow";
-    uint64_t capacity = 4096;
+    uint64_t capacity = 4096;  // 默认容量覆盖 live fan-out 的短时 reader 抖动
     std::string source = "synthetic";
     std::string provider = "ctp";
     std::vector<std::string> bin_paths;
     std::string dump_source;
     int64_t count = 10000;
-    int64_t interval_us = 0;
-    int64_t start_delay_ms = 0;
-    int64_t hold_sec = 5;
+    int64_t interval_us = 0;     // 0 = 全速
+    int64_t start_delay_ms = 0;  // 建段后延迟发布，给 reader attach 到 head=0
+    int64_t hold_sec = 5;        // replay publish 完后保段存活，给 reader 读完
 
+    // live 通用：MD 静默超时自愈阈值，0 表示禁用 gateway 内部 stale reconnect。
     uint32_t stale_reconnect_ms = 30000;
-    uint16_t metrics_port = 0;
-    std::string metrics_addr = "127.0.0.1";
-    std::string lock_dir;
+    uint16_t metrics_port = 0;               // 0 = 禁用 Prometheus exporter
+    std::string metrics_addr = "127.0.0.1";  // prom-agent 本机 scrape 地址
+    std::string lock_dir;  ///< 单实例 flock 目录 override；空 = /run/xyybtrader（回退 /tmp）
 
     std::string ctp_md_front;
     std::string broker;
@@ -76,10 +82,12 @@ struct ConnectorOptions {
     std::string ctp_user;
     std::string ctp_password;
 
-    std::string trading_windows_raw;
+    // expected-tick window gate（provider=ctp 生效）。默认（未传参）用内置 CTP 窗；
+    // --trading-windows 显式覆盖；--disable-trading-window-gate 回退现行行为。
+    std::string trading_windows_raw;      // 显式 CLI 值（空 = 用内置默认）
     bool trading_windows_explicit = false;
     bool disable_trading_window_gate = false;
-    ctp_md_session::TradingWindowGate window_gate;
+    ctp_md_session::TradingWindowGate window_gate;  // resolve 后填入
 
     std::string base_ws_url = "wss://fstream.binance.com";
     std::string base_rest_url = "https://fapi.binance.com";
@@ -104,12 +112,13 @@ int64_t arg_i64(const char* s) { return std::strtoll(s, nullptr, 10); }
     std::exit(1);
 }
 
+// 逗号分隔的合约列表解析（"ag2606,ag2612"）；空白与空项忽略。
 std::vector<std::string> split_csv(const std::string& s) {
     std::vector<std::string> out;
     std::stringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
-
+        // 去首尾空白
         size_t b = tok.find_first_not_of(" \t");
         size_t e = tok.find_last_not_of(" \t");
         if (b == std::string::npos) continue;
@@ -118,6 +127,12 @@ std::vector<std::string> split_csv(const std::string& s) {
     return out;
 }
 
+// 解析 sidecar 目录（.lock 单实例锁 + .subs 订阅集共用）。
+//
+// 默认 /run/xyybtrader 而非 /tmp：systemd-tmpfiles 会按龄清 /tmp（默认 10d），清掉打开中的
+// 锁文件后新 connector 开新 inode → flock 假成功 → 同 ring 双写者；/run 为 boot-scoped tmpfs
+// 不被 age-clean，且保持全局命名空间（per-ring 互斥跨 unit 仍成立）。--lock-dir 可覆盖
+// （dev/测试）；/run 不可写（非 root dev 运行）时回退 /tmp 并 warn。
 std::string resolve_sidecar_dir(const std::string& lock_dir_opt) {
     if (!lock_dir_opt.empty()) return lock_dir_opt;
     std::string dir = "/run/xyybtrader";
@@ -131,6 +146,9 @@ std::string resolve_sidecar_dir(const std::string& lock_dir_opt) {
     return dir;
 }
 
+// 抢占单实例锁：<sidecar_dir>/<规整名>.lock 上 flock(LOCK_EX|LOCK_NB)。抢到返 true（fd 存
+// g_lock_fd，进程退出由 OS 释放）；抢不到（另一 connector 持有）返 false。规整名与 reader
+// 侧同源（xt_ipc::md_sidecar_path，'/'→'_'）。
 bool acquire_single_instance_lock(const std::string& ring_name, const std::string& sidecar_dir) {
     const std::string lock_path = xt_ipc::md_sidecar_path(sidecar_dir, ring_name, ".lock");
     int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
@@ -147,10 +165,13 @@ bool acquire_single_instance_lock(const std::string& ring_name, const std::strin
         close(fd);
         return false;
     }
-    g_lock_fd = fd;
+    g_lock_fd = fd;  // 进程生命周期内持有，不显式 close
     return true;
 }
 
+// 把本 connector 的订阅集写到 <sidecar_dir>/<规整名>.subs（每行一合约，原子 tmp+rename）。
+// reader（XtShmMdGateway）attach 后据此做 declared⊆subs 诊断（缺失合约的 tick 永不到达）。
+// 非致命：写失败仅 warn，reader 侧降级为 warn（不阻塞行情）。live 用 opt.symbols；replay 为空。
 void write_subs_sidecar(const std::string& sidecar_dir, const std::string& ring_name,
                         const std::vector<std::string>& symbols) {
     const std::string path = xt_ipc::md_sidecar_path(sidecar_dir, ring_name, ".subs");
@@ -205,7 +226,8 @@ bool parse_options(int argc, char** argv, ConnectorOptions& opt) {
         else if (a == "--metrics-port") opt.metrics_port = static_cast<uint16_t>(arg_i64(next()));
         else if (a == "--metrics-addr") opt.metrics_addr = next();
         else if (a == "--trading-windows") {
-
+            // 缺值 = fatal parse error（非零退出），与「显式空/非法业务值 → loud warn disable」
+            // 显式分开：回滚有独立 --disable-trading-window-gate flag。
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "--trading-windows 需一个值 \"HHMM-HHMM[,...]\"\n");
                 return false;
@@ -234,7 +256,8 @@ void normalize_provider(ConnectorOptions& opt) {
 }
 
 void apply_binance_testnet_defaults(ConnectorOptions& opt) {
-
+    // --testnet 且用户未显式覆盖 URL → 自动切 binance futures testnet 端点；
+    // 显式 --base-ws-url / --base-rest-url 始终优先。
     if (opt.binance_testnet) {
         if (!opt.ws_url_explicit) opt.base_ws_url = "wss://stream.binancefuture.com";
         if (!opt.rest_url_explicit) opt.base_rest_url = "https://testnet.binancefuture.com";
@@ -260,7 +283,7 @@ bool validate_options(ConnectorOptions& opt) {
         return false;
     }
     if (opt.source == "live") {
-
+        // provider 由 per-venue build 决定可用集；选了本 target 没编进的 venue 要 fail-fast。
         bool provider_ok = false;
 #ifndef XT_NO_CTP
         if (opt.provider == "ctp") {
@@ -269,14 +292,15 @@ bool validate_options(ConnectorOptions& opt) {
                 std::fprintf(stderr, "--source live ctp 需 --ctp-md-front <tcp://...>\n");
                 return false;
             }
-
+            // CTP MD 是鉴权会话（ReqUserLogin），不同 binance public 匿名 MD。CLI 未给则回退
+            // env（部署侧走 systemd EnvironmentFile，避免 password 进 ps/unit 明文）。
             if (opt.ctp_user.empty()) {
                 if (const char* e = std::getenv("XT_CTP_MD_USER")) opt.ctp_user = e;
             }
             if (opt.ctp_password.empty()) {
                 if (const char* e = std::getenv("XT_CTP_MD_PASSWORD")) opt.ctp_password = e;
             }
-
+            // 提前到 connector 层 fail-fast，避免 create_md_gateway 只给出 opaque init failure。
             if (opt.ctp_user.empty() || opt.ctp_password.empty()) {
                 std::fprintf(stderr, "--source live ctp 需 --ctp-user/--ctp-password"
                              "（或 env XT_CTP_MD_USER/XT_CTP_MD_PASSWORD）；CTP MD 需登录\n");
@@ -292,7 +316,7 @@ bool validate_options(ConnectorOptions& opt) {
                 return false;
             }
             if (opt.base_rest_url.empty()) {
-
+                // depth snapshot 是 Binance MD 初始化的必要输入，空 URL 直接拒绝。
                 std::fprintf(stderr, "--source live binance_u 需 --base-rest-url <https://...>（depth snapshot）\n");
                 return false;
             }
@@ -313,7 +337,7 @@ bool validate_options(ConnectorOptions& opt) {
 
 OwnerRingMapping create_owner_ring_segment(const ConnectorOptions& opt) {
     const uint64_t bytes = xt_ipc::segment_bytes(opt.capacity, Ring::kSlotStride);
-
+    // owner-create：O_EXCL 独占创建；只有在已持单实例锁后才把残留旧段视为 stale 并重建。
     g_shm_name = opt.ring_name;
     int fd = shm_open(opt.ring_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0 && errno == EEXIST) {
@@ -326,11 +350,13 @@ OwnerRingMapping create_owner_ring_segment(const ConnectorOptions& opt) {
     if (ftruncate(fd, static_cast<off_t>(bytes)) != 0) die("ftruncate");
 
     void* base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
+    close(fd);  // mmap 后 fd 可关
     if (base == MAP_FAILED) die("mmap");
 
     Ring::init_ctrl(base, opt.capacity);
 
+    // connector epoch 写 RingControlBlock._pad1 前 8 字节：每次 create 单调递增，
+    // 供 reader re-attach 检测换代。已映射页的 magic 可能仍合法，不能只靠 magic。
     const uint64_t connector_epoch = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
     auto* ctrl = reinterpret_cast<xt_ipc::RingControlBlock*>(base);
@@ -343,9 +369,13 @@ void cleanup_owner_segment(void* base, uint64_t bytes, const std::string& ring_n
     shm_unlink(ring_name.c_str());
 }
 
+// expected-tick window gate 解析（仅 provider=ctp）。两态 {gate_enabled, sections}：
+//   --disable-trading-window-gate → gate_enabled=false（回滚现行行为）
+//   --trading-windows <csv>      → 解析；任一非法 token all-or-nothing fail-open disabled + loud warn
+//   未传参                        → 内置默认 CTP 窗（gate_enabled=true）
 void resolve_trading_window_gate(ConnectorOptions& opt) {
     if (opt.provider != "ctp") {
-        opt.window_gate.gate_enabled = false;
+        opt.window_gate.gate_enabled = false;  // binance 等 24/7 provider 不门控
         return;
     }
     if (opt.disable_trading_window_gate) {
@@ -357,7 +387,7 @@ void resolve_trading_window_gate(ConnectorOptions& opt) {
     if (opt.trading_windows_explicit) {
         const auto r = ctp_md_session::parse_trading_windows(opt.trading_windows_raw);
         if (!r.ok) {
-
+            // fail-open：非法业务配置 → 不门控 + loud warn（绝不部分生效/空窗喂 in_session）
             opt.window_gate.gate_enabled = false;
             std::fprintf(stderr,
                          "xt_md_connector: --trading-windows 非法（%s）→ fail-open：gate disabled、"
@@ -379,30 +409,30 @@ void build_live_gateway_config(const ConnectorOptions& opt,
                                IMdGateway::Config& common,
                                gateway_factory::MdProviderCfg& cfg) {
     (void)cfg;
-    common.subs = opt.symbols;
+    common.subs = opt.symbols;  // venue MD 登录后订阅集
     common.stale_reconnect_ms = opt.stale_reconnect_ms;
 
 #ifndef XT_NO_CTP
     if (opt.provider == "ctp") {
         common.front = opt.ctp_md_front;
-        common.user = opt.ctp_user;
-        common.password = opt.ctp_password;
+        common.user = opt.ctp_user;          // ParserCTP::init 读 cfg.user/password
+        common.password = opt.ctp_password;  // CTPMdCfg 只承载 broker/flow_dir
         CTPMdCfg ctp;
         ctp.broker = opt.broker;
         ctp.flow_dir = opt.flow_dir;
-        ctp.window_gate = opt.window_gate;
+        ctp.window_gate = opt.window_gate;  // ParserCTP::check_health 窗门控用
         cfg.extra = ctp;
     }
 #endif
 #ifndef XT_NO_BINANCE
     if (opt.provider == "binance_u") {
-        common.front = opt.base_ws_url;
+        common.front = opt.base_ws_url;  // BinanceMdCfg：front 同 base_ws_url
         BinanceMdCfg bn;
         bn.base_ws_url = opt.base_ws_url;
         bn.base_rest_url = opt.base_rest_url;
         bn.testnet = opt.binance_testnet;
         cfg.extra = bn;
-
+        // 打实际端点便于部署核对：真正决定连哪的是 URL，而不是 testnet flag。
         std::printf("xt_md_connector: binance_u ws=%s rest=%s testnet=%d\n",
                     opt.base_ws_url.c_str(), opt.base_rest_url.c_str(),
                     opt.binance_testnet ? 1 : 0);
@@ -415,6 +445,7 @@ uint32_t steady_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// wall-clock epoch ms（system_clock, UTC）；expected-tick 窗按固定 UTC+8 折算，不依赖 host TZ。
 int64_t wall_epoch_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -440,8 +471,10 @@ int run_live_source(const ConnectorOptions& opt,
     }
 
     IMdGateway::Callbacks cbs;
-
-    cbs.on_tick = [&ring](const XtRawTick& tk, uint64_t  ) {
+    // live capture stamp：venue provider 无 capture 传 0，connector 是 SHM 真值必经
+    // 通道，在 publish 前 stamp 自己的 CLOCK_MONOTONIC steady 时刻（跨进程可比）→ reader 端
+    // 上溯 md_ingress→submit 起点。捕获进程 provider 拿不到发布时刻，故忽略入参 0 自行 stamp。
+    cbs.on_tick = [&ring](const XtRawTick& tk, uint64_t /*provider_capture_ns=0*/) {
         xt_ipc::XtMdWireSlot slot;
         slot.capture_ns = capture_now_ns();
         slot.tick = tk;
@@ -463,6 +496,9 @@ int run_live_source(const ConnectorOptions& opt,
                 opt.provider.c_str(), opt.stale_reconnect_ms);
     std::fflush(stdout);
 
+    // 等信号；行情在 gateway provider-owned 线程回调 on_tick → publish。
+    // connector 自身必须 ~1Hz 驱动 check_health：某些 venue 会保持连接但停止推送，
+    // 自愈逻辑在 gateway 内部，connector 负责触发并在 false 时打 warn。
     ct::metrics::XtMdConnectorExporter exporter;
     if (opt.metrics_port > 0) {
         if (exporter.start(opt.metrics_port, opt.ring_name, opt.metrics_addr)) {
@@ -478,18 +514,19 @@ int run_live_source(const ConnectorOptions& opt,
 
     const uint32_t start_ms = steady_ms();
     uint32_t last_health_ms = start_ms;
-
+    // stale watchdog armed 状态跟踪：仅在窗内/外切换时打一条 rate-limited transition log。
+    // 初值 = 首帧计算前的补集，保证首帧必打一条基线（-1 = 未知）。
     int prev_watchdog = -1;
     while (!g_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const uint32_t now_ms = steady_ms();
-        if (now_ms - last_health_ms >= 1000u) {
+        if (now_ms - last_health_ms >= 1000u) {  // unsigned 差 → wraparound 安全
             last_health_ms = now_ms;
             const bool healthy = md->check_health(now_ms);
             if (!healthy)
                 std::fprintf(stderr, "xt_md_connector: %s md check_health=false（stale/重连中）\n",
                              opt.provider.c_str());
-
+            // expected-tick 窗 armed 状态（gate 未启用恒 true）；connector 侧独立计算供 gauge。
             const bool watchdog_active =
                 ctp_md_session::watchdog_active(opt.window_gate, wall_epoch_ms());
             if (static_cast<int>(watchdog_active) != prev_watchdog) {
@@ -518,10 +555,12 @@ int run_live_source(const ConnectorOptions& opt,
 }
 
 int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint64_t bytes) {
-
+    // ── Synthetic / bin source：publish 完保段存活给 reader 读完 ──────────────
+    // 建段后延迟发布：给 reader 时间 attach 在 head=0（fast oracle 见全 N）。
     if (opt.start_delay_ms > 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(opt.start_delay_ms));
 
+    // 可选：把 publish 的 tick 落 CSV，用于与 reader --dump-recv 逐字段对账。
     std::FILE* dump = nullptr;
     if (!opt.dump_source.empty()) {
         dump = std::fopen(opt.dump_source.c_str(), "w");
@@ -529,7 +568,9 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
         std::fprintf(dump, "price,action_time,bid0,ask0\n");
     }
     auto emit = [&](const XtRawTick& tk) {
-
+        // replay capture stamp：stamp **读盘/回放时刻**（playback ingress），**非**原始录制时
+        // 的 capture —— synthetic/bin source 无真实采集时戳，此值仅表征本次回放的 SHM 入队
+        // 时刻，供 reader 端起点上溯口径一致（见 F 反证：语义是 playback ingress）。
         xt_ipc::XtMdWireSlot slot;
         slot.capture_ns = capture_now_ns();
         slot.tick = tk;
@@ -542,7 +583,7 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
 
     int64_t n = 0;
     if (opt.source == "synthetic") {
-
+        // price/action_time 编码逻辑 index，reader 可逐笔自校验。
         XtRawTick t{};
         std::memcpy(t.exchg, "SHADOW", 6);
         std::memcpy(t.code, "TEST", 4);
@@ -554,7 +595,7 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
             emit(t);
             ++n;
         }
-    } else {
+    } else {  // bin：复用 IMarketDataReader 读真录制 tick（XtBinTickReader）
         XtBinTickReader rdr(opt.bin_paths);
         if (!rdr.init()) die("XtBinTickReader::init");
         XtRawTick t{};
@@ -571,6 +612,7 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
                 (long long)opt.hold_sec);
     std::fflush(stdout);
 
+    // 保段存活让 reader 读完（或被信号打断）
     for (int64_t s = 0; s < opt.hold_sec && !g_stop.load(std::memory_order_relaxed); ++s)
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -579,23 +621,24 @@ int run_replay_source(const ConnectorOptions& opt, Ring& ring, void* base, uint6
     return 0;
 }
 
-}
+}  // namespace
 
 int main(int argc, char** argv) {
     ConnectorOptions opt;
     if (!parse_options(argc, argv, opt)) return 2;
     if (!validate_options(opt)) return 2;
-
+    // validate_options 已 normalize provider；此后解析 expected-tick 窗 gate（仅 ctp）。
     resolve_trading_window_gate(opt);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
+    // 单实例保护：抢到 flock 才允许碰段；抢不到说明同 ring 已有 writer，直接 fail-fast。
     const std::string sidecar_dir = resolve_sidecar_dir(opt.lock_dir);
     if (!acquire_single_instance_lock(opt.ring_name, sidecar_dir)) return 1;
 
     const OwnerRingMapping mapping = create_owner_ring_segment(opt);
-
+    // 段建好后写订阅集 sidecar，供 reader 做 declared⊆subs 诊断（与 .lock 同目录同源规整名）。
     write_subs_sidecar(sidecar_dir, opt.ring_name, opt.symbols);
     Ring ring(mapping.base);
 

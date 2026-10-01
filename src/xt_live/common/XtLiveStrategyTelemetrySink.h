@@ -17,6 +17,10 @@ public:
     void emit_intent_trace(const xt_strategy_engine::StrategyIntentTrace& t) override;
 };
 
+/// @brief 进程级共享 sink 实例（function-local static，immortal）。
+///
+/// 无状态 + 生命周期到进程退出 → ctx 持有的指针永不悬空，runner 状态结构
+/// 无需关心声明/析构顺序。
 XtLiveStrategyTelemetrySink& live_strategy_telemetry_sink();
 
-}
+}  // namespace xt_live::common

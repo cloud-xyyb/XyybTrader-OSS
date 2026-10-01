@@ -16,20 +16,20 @@
  * 及委托总笔数（order_items）。用于回测中估算排队量（queue_ahead 模型输入）。
  */
 struct XtOrderQueue {
-    char exchg[10] = {};
-    char code[32] = {};
+    char exchg[10] = {};          ///< 交易所代码（exchange code）
+    char code[32] = {};           ///< 合约代码（instrument code）
 
-    uint32_t trading_date = 0;
-    uint32_t action_date = 0;
-    uint32_t action_time = 0;
+    uint32_t trading_date = 0;    ///< 交易日（trading date，YYYYMMDD）
+    uint32_t action_date = 0;     ///< 发生日期（action date，YYYYMMDD）
+    uint32_t action_time = 0;     ///< 发生时间（action time，HHMMSSmmm = HHMMSS × 1000 + ms）
 
-    uint8_t side = 0;
-    uint8_t reserved8[3] = {};
+    uint8_t side = 0;             ///< 买卖方向（1=BUY, 2=SELL, 0=UNKNOWN）
+    uint8_t reserved8[3] = {};    ///< 对齐保留字节
 
-    double price = 0.0;
-    uint32_t order_items = 0;
-    uint32_t qsize = 0;
-    double volumes[50] = {};
+    double price = 0.0;           ///< 委托价格（order price）
+    uint32_t order_items = 0;     ///< 该档位委托总笔数（total order count at this level）
+    uint32_t qsize = 0;           ///< volumes 有效元素数（valid entries in volumes[]）
+    double volumes[50] = {};      ///< 前 N 笔委托量数组（top-N order volumes at this level）
 };
 
 /**
@@ -39,19 +39,19 @@ struct XtOrderQueue {
  * 及交易所内部序号（index），用于 L2 订单流回放与高频撮合仿真。
  */
 struct XtOrderDetail {
-    char exchg[10] = {};
-    char code[32] = {};
+    char exchg[10] = {};          ///< 交易所代码（exchange code）
+    char code[32] = {};           ///< 合约代码（instrument code）
 
-    uint32_t trading_date = 0;
-    uint32_t action_date = 0;
-    uint32_t action_time = 0;
+    uint32_t trading_date = 0;    ///< 交易日（trading date，YYYYMMDD）
+    uint32_t action_date = 0;     ///< 发生日期（action date，YYYYMMDD）
+    uint32_t action_time = 0;     ///< 发生时间（action time，HHMMSSmmm = HHMMSS × 1000 + ms）
 
-    uint64_t index = 0;
-    double price = 0.0;
-    double volume = 0.0;
-    uint8_t side = 0;
-    uint8_t order_type = 0;
-    uint8_t reserved8[6] = {};
+    uint64_t index = 0;           ///< 交易所内部委托序号（exchange order sequence）
+    double price = 0.0;           ///< 委托价格（order price）
+    double volume = 0.0;          ///< 委托数量（order volume）
+    uint8_t side = 0;             ///< 买卖方向（1=BUY, 2=SELL, 0=UNKNOWN）
+    uint8_t order_type = 0;       ///< 委托类型（exchange-specific order type）
+    uint8_t reserved8[6] = {};    ///< 对齐保留字节
 };
 
 /**
@@ -61,19 +61,19 @@ struct XtOrderDetail {
  * 及交易所成交序号（index），用于 L2 订单流回放与 OFI 计算。
  */
 struct XtTransaction {
-    char exchg[10] = {};
-    char code[32] = {};
+    char exchg[10] = {};          ///< 交易所代码（exchange code）
+    char code[32] = {};           ///< 合约代码（instrument code）
 
-    uint32_t trading_date = 0;
-    uint32_t action_date = 0;
-    uint32_t action_time = 0;
+    uint32_t trading_date = 0;    ///< 交易日（trading date，YYYYMMDD）
+    uint32_t action_date = 0;     ///< 发生日期（action date，YYYYMMDD）
+    uint32_t action_time = 0;     ///< 发生时间（action time，HHMMSSmmm = HHMMSS × 1000 + ms）
 
-    uint64_t index = 0;
-    double price = 0.0;
-    double volume = 0.0;
-    uint8_t side = 0;
-    uint8_t flags = 0;
-    uint8_t reserved8[6] = {};
+    uint64_t index = 0;           ///< 交易所成交序号（exchange trade sequence）
+    double price = 0.0;           ///< 成交价（trade price）
+    double volume = 0.0;          ///< 成交量（trade volume）
+    uint8_t side = 0;             ///< 主动方向（1=BUY, 2=SELL, 0=UNKNOWN）
+    uint8_t flags = 0;            ///< 成交标志（exchange-specific flags）
+    uint8_t reserved8[6] = {};    ///< 对齐保留字节
 };
 
 static_assert(std::is_trivially_copyable_v<XtOrderQueue>,

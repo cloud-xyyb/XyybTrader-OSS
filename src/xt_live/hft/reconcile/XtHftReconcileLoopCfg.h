@@ -11,14 +11,16 @@ namespace xt_live { namespace control {
 /// 阶梯阈值 `reconnect_after_n` / `kill_after_n` 取 0 = 禁用该级阶梯
 /// （calibrate 借用共享账户场景关 kill 保 resnap+metrics 用）。
 struct XtHftReconcileLoopCfg {
-    uint32_t cycle_ms = 30'000;
-    uint8_t  reconnect_after_n = 2;
-    uint8_t  kill_after_n = 8;
-    uint32_t resync_throttle_ms = 60'000;
-    int64_t  position_epsilon_fp = 1;
-    uint32_t order_min_age_ms = 30'000;
-
+    uint32_t cycle_ms = 30'000;           ///< reconcile 周期
+    uint8_t  reconnect_after_n = 2;       ///< 连续 diverged 达阈值后请求 resnap；0=禁用
+    uint8_t  kill_after_n = 8;            ///< 连续 diverged 达阈值后拉起 kill_switch；0=禁用
+    uint32_t resync_throttle_ms = 60'000; ///< 同一 code 两次 resnap 的最小间隔
+    int64_t  position_epsilon_fp = 1;     ///< position diff 容忍阈值
+    uint32_t order_min_age_ms = 30'000;   ///< ghost order 检出前的最小 age
+    /// false 时不启动线程。连带关掉 divergence gauge / snapshot_age 导出与
+    /// agreement 时的 last_position_snapshot_ms 保鲜（PositionSyncStale guard
+    /// 依赖）——生产盘只想关 kill 用 `kill_after_n: 0`，勿用 enabled: false。
     bool enabled = true;
 };
 
-}}
+}}  // namespace xt_live::control

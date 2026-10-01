@@ -36,7 +36,7 @@ void MdCTPGateway::stop() {
 }
 
 IMdGateway::Capabilities MdCTPGateway::capabilities() const {
-
+    // 标准 CTP MD 不提供 order_queue/order_detail/transaction
     return Capabilities{
         false,
     };

@@ -7,7 +7,7 @@
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
-#include "XtFixedPoint.h"
+#include "XtFixedPoint.h"  // 保证 per_unit_margin_fp 与风控侧 fixed-point 乘法口径一致。
 
 namespace {
 
@@ -42,6 +42,10 @@ std::vector<std::string> normalized_tokens(const std::string& raw) {
     return out;
 }
 
+// 纯 venue 段 token（交易所代码）。venue-prefixed 合约键如 "SHFE.au2406" 会被 normalized_tokens
+// 拆出裸 "SHFE"；若把它存成独立 override key，查同 venue 别的合约（"SHFE.rb2410"）会经 venue token
+// 误命中 au2406 的费率 → 错 margin → 错冻结/accept-reject。
+// 新 venue 前缀进入配置（新交易所/新市场）时必须同步扩充 kVenues，否则该 venue 重新暴露此污染面。
 bool is_pure_venue_token(const std::string& t) {
     static const std::unordered_set<std::string> kVenues = {
         "SHFE", "DCE", "CZCE", "CFFEX", "INE", "GFEX", "SH", "SZ"};
@@ -50,10 +54,10 @@ bool is_pure_venue_token(const std::string& t) {
 
 std::vector<std::string> margin_override_storage_keys(const std::string& raw) {
     std::vector<std::string> keys;
-
+    // 全键始终保留：venue-wide 意图（raw=="SHFE"）经此路径存为 "SHFE"，仍可被同 venue 合约查到。
     append_unique(keys, XtCommodityCatalog::normalize_key(raw));
     for (const auto& token : normalized_tokens(raw)) {
-
+        // 跳过从合约键拆出的裸 venue 段（杜绝跨合约污染）；venue-wide 由上面全键路径覆盖。
         if (is_pure_venue_token(token)) continue;
         append_unique(keys, token);
     }
@@ -67,6 +71,8 @@ std::vector<std::string> margin_lookup_keys(const char* code) {
     const std::string raw(code);
     append_unique(keys, XtCommodityCatalog::normalize_key(raw));
 
+    // overrides 兼容 "SHFE.au2406"、"au2406"、"AU"、"600000.SH" 等配置键写法。
+    // 查询顺序先精确合约，再数字 token，再品种 token，避免品种级覆盖抢在合约级覆盖之前生效。
     const auto tokens = normalized_tokens(raw);
     for (const auto& token : tokens) {
         if (contains_digit(token)) append_unique(keys, token);
@@ -82,6 +88,8 @@ std::vector<std::string> margin_lookup_keys(const char* code) {
     return keys;
 }
 
+// 数值字段转换失败时补上「商品 key path + 原始标量文本」，替换 YAML::Clone
+// 丢 mark 后 yaml-cpp 抛出的 "error at line 1, column 1: bad conversion" 无定位报错。
 template <typename T>
 T as_or_throw(const YAML::Node& node, const std::string& key, const char* field,
               const char* type_name) {
@@ -114,7 +122,8 @@ std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML:
         if (item["slippage"]) {
             info.slippage = as_or_throw<double>(item["slippage"], key, "slippage", "double");
             if (!std::isfinite(info.slippage) || info.slippage < 0.0)
-
+                // fail-fast：负值/NaN/±inf 无物理意义，加载期拒启动（与 offset_policy 非法值同
+                // 口径）。inf 会经 xt_fill_cost::apply 原样传播成无限成交价，故与 NaN 同拦。
                 throw std::runtime_error("commodities." + key + ".slippage 必须是有限非负数，得到 " +
                                          std::to_string(info.slippage));
         }
@@ -135,7 +144,7 @@ std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML:
             if (v == "close_first")       info.offset_policy = XtOffsetPolicy::CloseFirst;
             else if (v == "open_allowed") info.offset_policy = XtOffsetPolicy::OpenAllowed;
             else
-
+                // fail-fast：非法枚举值在加载期拒启动（live/BT 同一单点）。
                 throw std::runtime_error(
                     "commodities." + key + ".offset_policy 非法值 '" + v +
                     "'（合法: close_first | open_allowed）");
@@ -146,7 +155,7 @@ std::unordered_map<std::string, XtCommodityInfo> parse_commodity_map(const YAML:
     return out;
 }
 
-}
+}  // namespace
 
 XtCommodityCatalog::Config parse_commodity_catalog_config(const YAML::Node& node) {
     XtCommodityCatalog::Config cfg;
@@ -218,7 +227,7 @@ const XtCommodityInfo* XtCommodityCatalog::find(const char* code) const {
 }
 
 double XtCommodityCatalog::margin_rate_for(const char* code) const {
-
+    // 空 override 表（多数部署）短路，免在 submit 路径白构造 lookup key 串。
     if (!margin_overrides_.empty()) {
         for (const auto& key : margin_lookup_keys(code)) {
             auto it = margin_overrides_.find(key);
@@ -231,7 +240,7 @@ double XtCommodityCatalog::margin_rate_for(const char* code) const {
 }
 
 double XtCommodityCatalog::margin_rate_for(const XtCommodityInfo* info, const char* code) const {
-
+    // override 查找与单参版逐字一致；info 替代内部 find(code)。
     if (!margin_overrides_.empty()) {
         for (const auto& key : margin_lookup_keys(code)) {
             auto it = margin_overrides_.find(key);

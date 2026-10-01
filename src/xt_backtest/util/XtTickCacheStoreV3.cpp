@@ -1,7 +1,7 @@
 #include "XtTickCacheStoreV3.h"
 
-#include "xt_core/market/XtRawShardCodecV3.h"
-#include "xt_core/sync/XtTransparentStringHash.h"
+#include "xt_core/market/XtRawShardCodecV3.h"      // 空分片落盘
+#include "xt_core/sync/XtTransparentStringHash.h"  // FNV-1a 常量与流式 update
 #include "xt_util/path/PathUtil.h"
 
 #include <nlohmann/json.hpp>
@@ -68,11 +68,12 @@ std::string hex16(uint64_t v) {
     return std::string(buf);
 }
 
+/// @brief 从池内文件名解析交易日：`shard_<8 位日期>_<16 位十六进制>.bin`。
 bool parse_pooled_shard_name(const std::string& name, uint32_t& out_day) {
-
+    // 严格按长度与字符集判：名字是这个池唯一的索引，认错一个就等于凭空多出一天。
     if (name.rfind(kShardPrefix, 0) != 0) return false;
     const std::string body = name.substr(std::string(kShardPrefix).size());
-    if (body.size() != 8 + 1 + 16 + 4) return false;
+    if (body.size() != 8 + 1 + 16 + 4) return false;         // 日期_指纹.bin
     if (body[8] != '_' || body.compare(25, 4, ".bin") != 0) return false;
     uint32_t day = 0;
     for (size_t i = 0; i < 8; ++i) {
@@ -87,7 +88,7 @@ bool parse_pooled_shard_name(const std::string& name, uint32_t& out_day) {
     return true;
 }
 
-}
+}  // namespace
 
 uint64_t compute_family_fingerprint(const XtTickCacheFamilyKey& key) {
     Mixer m;
@@ -119,6 +120,8 @@ bool ensure_family_dir(const std::string& family_dir) {
     if (ec) return false;
     return std::filesystem::is_directory(family_dir, ec);
 }
+
+// ── 分片池（stat 寻址）───────────────────────────────────────────────────
 
 XtTickSourceStamp stat_tick_source(const std::string& path) {
     XtTickSourceStamp st;
@@ -186,7 +189,7 @@ bool adopt_shard_into_pool(const std::string& staged_path, const std::string& fa
     std::error_code ec;
     std::filesystem::create_directories(shard_pool_dir(family_dir), ec);
     if (ec) return false;
-
+    // rename 同目录树内原子：读者要么看到旧同名分片（同指纹 → 视作同内容），要么看到新的。
     std::filesystem::rename(staged_path, dst, ec);
     return !ec;
 }
@@ -216,6 +219,8 @@ bool write_empty_pooled_shard(const std::string& family_dir, uint32_t trading_da
     return true;
 }
 
+// ── generation 清单 ─────────────────────────────────────────────────────
+
 std::string generation_manifest_path(const std::string& generation_dir) {
     return join(generation_dir, kManifestFile);
 }
@@ -238,12 +243,13 @@ std::string serialize_generation_manifest(const XtTickGenerationManifest& manife
         days.push_back(std::move(e));
     }
     j["days"] = std::move(days);
-
+    // dump(2)：清单是人要读的 forensic 产物；nlohmann 的对象键按字典序输出，
+    // 同一清单恒得同一字节串。
     return j.dump(2) + "\n";
 }
 
 bool parse_generation_manifest(const std::string& text, XtTickGenerationManifest& out) {
-    nlohmann::json j = nlohmann::json::parse(text, nullptr,  false);
+    nlohmann::json j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return false;
     if (!j.contains("schema") || !j["schema"].is_number_unsigned()) return false;
     if (j["schema"].get<uint32_t>() != XtTickGenerationManifest::kSchema) return false;
@@ -277,7 +283,7 @@ bool parse_generation_manifest(const std::string& text, XtTickGenerationManifest
         XtTickGenerationDay d;
         d.trading_day = e["day"].get<uint32_t>();
         if (d.trading_day == 0) return false;
-
+        // 严格升序且不重复：清单是引用集的权威，乱序/重复说明它不是本 builder 的产物。
         if (prev_day != 0 && d.trading_day <= prev_day) return false;
         prev_day = d.trading_day;
         if (!parse_hex16(e["shard"].get<std::string>(), d.shard_fingerprint)) return false;
@@ -303,6 +309,8 @@ bool read_generation_manifest(const std::string& path, XtTickGenerationManifest&
     return parse_generation_manifest(oss.str(), out);
 }
 
+// ── family 排他锁 ────────────────────────────────────────────────────────
+
 XtTickCacheFamilyLock::~XtTickCacheFamilyLock() { unlock(); }
 
 XtTickCacheFamilyLock::XtTickCacheFamilyLock(XtTickCacheFamilyLock&& other) noexcept
@@ -326,7 +334,7 @@ bool XtTickCacheFamilyLock::try_lock(const std::string& family_dir) {
     const std::string path = join(family_dir, kLockFile);
     const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return false;
-
+    // flock 绑定 open file description：同进程另开一次也会互斥，跨进程同理。
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
         ::close(fd);
         return false;
@@ -341,6 +349,8 @@ void XtTickCacheFamilyLock::unlock() {
     ::close(fd_);
     fd_ = -1;
 }
+
+// ── generation ──────────────────────────────────────────────────────────
 
 std::string make_generation_name(uint64_t epoch_ms, int pid, uint64_t seq) {
     char buf[80];
@@ -357,7 +367,7 @@ bool create_generation_dir(const std::string& family_dir,
     if (!ensure_family_dir(family_dir)) return false;
     const std::string path = join(family_dir, generation);
     std::error_code ec;
-
+    // create_directory 返回 false 表示已存在：generation 不可复用，避免半份旧内容混入。
     if (!std::filesystem::create_directory(path, ec) || ec) return false;
     out_path = path;
     return true;
@@ -382,6 +392,8 @@ bool read_current(const std::string& family_dir, std::string& out_generation) {
     return true;
 }
 
+// ── GC（dry-run only）───────────────────────────────────────────────────
+
 XtTickCacheGcPlan plan_gc(const std::string& family_dir) {
     XtTickCacheGcPlan plan;
     if (family_dir.empty()) return plan;
@@ -396,6 +408,8 @@ XtTickCacheGcPlan plan_gc(const std::string& family_dir) {
     }
     std::sort(generations.begin(), generations.end());
 
+    // 孤儿分片 = 池里存在但没有任何 generation 清单提到。任一清单读不出来就整个放弃
+    // 报告——读不懂引用集时说「没人引用」等于建议删掉可能还在用的数据。
     bool references_complete = true;
     std::unordered_set<std::string> referenced;
     for (const auto& g : generations) {
@@ -427,7 +441,7 @@ XtTickCacheGcPlan plan_gc(const std::string& family_dir) {
 
     std::string current;
     if (!read_current(family_dir, current)) {
-
+        // 无 CURRENT：无法判断哪一份在用，一律不建议回收 generation。
         return plan;
     }
     plan.current = current;

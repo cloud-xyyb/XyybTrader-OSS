@@ -11,15 +11,16 @@
 /// 构造参数不做 clamp，调用方必须传入非负值以满足 ILatencyModel 契约。
 class ConstantLatencyModel final : public ILatencyModel {
 public:
-
+    /// @param entry_ns submit 到可撮合的延迟 ns，必须 >= 0。
+    /// @param response_ns 成交到可见的延迟 ns，必须 >= 0。
     ConstantLatencyModel(int64_t entry_ns, int64_t response_ns) noexcept
         : entry_ns_(entry_ns), response_ns_(response_ns) {}
 
-    int64_t entry_latency_ns(int64_t  ) const noexcept override {
+    int64_t entry_latency_ns(int64_t /*ts_local_ns*/) const noexcept override {
         return entry_ns_;
     }
 
-    int64_t response_latency_ns(int64_t  ) const noexcept override {
+    int64_t response_latency_ns(int64_t /*ts_local_ns*/) const noexcept override {
         return response_ns_;
     }
 

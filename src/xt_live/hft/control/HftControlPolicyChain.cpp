@@ -1,3 +1,9 @@
+// ── 控制环策略链 stage ──────────────────────────────────────────────────
+//
+// heartbeat / order_strategy sidecar prune / 孤儿回收 sweep 推送 /
+// multi-strategy metric wire / 一致性升级（warn → block → kill）/
+// critical TD drop 停机 / 延迟 SLA 告警。跨 TU 入口：log_control_stats /
+// make_consistency_thresholds / apply_policy_chain。
 
 #include "xt_live/hft/control/HftControlStages.h"
 
@@ -17,6 +23,7 @@
 namespace xt_live::control::detail {
 namespace {
 
+// 找出出现次数最多的拒单原因，用于日志摘要（"reason:count" 格式）
 std::string top_reject_reason(const XtLiveOrderGateway::RiskStatsSnapshot& risk) {
     uint64_t max_count = 0;
     std::string top = "NONE";
@@ -31,6 +38,7 @@ std::string top_reject_reason(const XtLiveOrderGateway::RiskStatsSnapshot& risk)
     return oss.str();
 }
 
+// 按 reason 精确匹配查找拒单计数，线性扫描即可——reason 种类 < 10
 uint64_t reject_count_by_reason(const XtLiveOrderGateway::RiskStatsSnapshot& risk, const char* reason) {
     if (!reason || reason[0] == '\0') return 0;
     for (const auto& kv : risk.reject_by_reason) {
@@ -43,7 +51,7 @@ void maybe_log_heartbeat(const XtRunnerControlConfig& cfg,
                          const ControlSnapshot& s,
                          int64_t now_ms,
                          ControlLoopState& st) {
-    if (cfg.heartbeat_ms <= 0) return;
+    if (cfg.heartbeat_ms <= 0) return;  // heartbeat 关闭
     if (st.last_heartbeat_ms != 0 && now_ms - st.last_heartbeat_ms < cfg.heartbeat_ms) return;
     st.last_heartbeat_ms = now_ms;
     if (cfg.heartbeat_tick_count) {
@@ -70,7 +78,7 @@ void maybe_log_heartbeat(const XtRunnerControlConfig& cfg,
 void maybe_wire_multi_strategy_metrics(XtHftRunnerControlContext& ctx,
                                        int64_t now_ms,
                                        ControlLoopState& st) {
-    constexpr int64_t kWireIntervalMs = 1000;
+    constexpr int64_t kWireIntervalMs = 1000;  // 1Hz
     if (st.last_metric_wire_ms != 0
         && now_ms - st.last_metric_wire_ms < kWireIntervalMs) {
         return;
@@ -101,6 +109,9 @@ void maybe_wire_multi_strategy_metrics(XtHftRunnerControlContext& ctx,
         es.lost_terminal_reconciled, std::memory_order_relaxed);
 }
 
+// unmatched drop 预算：窗口内 drop 增量越限 → trip 全局 kill_switch
+//（source=UnmatchedBudget，冷启 flat 自动释放走 allow-set）。读的是上面
+// 1Hz wire 进 signals 的累计值，判定/置位在 evaluate_unmatched_budget 纯函数。
 void maybe_evaluate_unmatched_budget(const XtRunnerControlConfig& cfg,
                                      XtHftRunnerControlContext& ctx,
                                      int64_t now_ms,
@@ -118,15 +129,18 @@ void maybe_evaluate_unmatched_budget(const XtRunnerControlConfig& cfg,
                       cfg.unmatched_budget_window_sec,
                       cfg.unmatched_budget_max_drops,
                       cfg.unmatched_budget_max_ratio);
-    emit_kill_switch_transition(ctx, cfg,  true, "system:unmatched-budget",
+    emit_kill_switch_transition(ctx, cfg, /*active=*/true, "system:unmatched-budget",
                                 "unmatched_drop_budget_exceeded");
 }
 
 void maybe_prune_strategy_id_sidecar(XtHftRunnerControlContext& ctx,
                                      int64_t now_ms,
                                      ControlLoopState& st) {
-    constexpr int64_t kPruneIntervalMs = 60'000;
+    constexpr int64_t kPruneIntervalMs = 60'000;  // 60s frame loop tick
 
+    // grace window 从 gateway cfg 取 (yaml runtime.gateway.order_strategy_grace_us)
+    // 默认 60s,运维可在 monitoring dropped_fill metric 后调高 (e.g. 5-10 min)
+    // 应对长 binance ws outage + 重连后 stale terminal rtn 反查 sid 场景。
     const int64_t grace_us = ctx.live_order_gateway.order_strategy_grace_us();
 
     if (st.last_strategy_id_prune_ms != 0
@@ -145,6 +159,11 @@ void maybe_prune_strategy_id_sidecar(XtHftRunnerControlContext& ctx,
     }
 }
 
+// 周期把孤儿回收 / lost-terminal 对账 sweep 事件推给 worker（book 单写者，扫描/撤单/合成终态
+// 必须在 worker 线程）。orphan_reap（撤 recovered-unowned 在途单）与 lost_terminal_reconcile
+// （book-open × venue-terminal 的 owned 单合成终态）两个能力各自 enable、互不牵连（HFT-D6 解耦）：
+// 任一开启即按 sweep 节拍推送，worker 侧按事件携带的 flag 分别执行。入队失败（高水位/停机）
+// 不重试，下一节拍再推；sweep 本身无孤儿时是 O(在途单数) 扫描。
 void maybe_push_orphan_reap(XtHftRunnerControlContext& ctx,
                             int64_t now_ms,
                             ControlLoopState& st) {
@@ -164,6 +183,12 @@ void maybe_push_orphan_reap(XtHftRunnerControlContext& ctx,
             gw_cfg->orphan_reap_enabled));
 }
 
+// ---------------------------------------------------------------------------
+// 一致性策略状态机：正常 → warn → block → kill
+// ---------------------------------------------------------------------------
+// 三级升级：连续失败 streak 达到 warn 阈值时开始告警，
+// 达到 block 阈值时禁止下单（trading_ready=false），
+// 达到 kill 阈值时触发停机。恢复后自动降级并重新允许交易。
 void process_consistency_policy(std::atomic<bool>& shutdown,
                                 uint64_t warn_loops,
                                 uint64_t block_loops,
@@ -171,10 +196,10 @@ void process_consistency_policy(std::atomic<bool>& shutdown,
                                 const ControlSnapshot& s,
                                 XtRunnerSignals& shared_state,
                                 ControlLoopState& st) {
-
+    // --- 正常分支：一致性检查通过 ---
     if (s.consistency.ok) {
         if (st.consistency_blocked) {
-
+            // 从 block 状态恢复：重新评估 trading_ready（可能还有其他条件阻止交易）
             st.consistency_blocked = false;
             shared_state.refresh_trading_ready();
             XtLogger::warn_m("RT",
@@ -187,9 +212,10 @@ void process_consistency_policy(std::atomic<bool>& shutdown,
         return;
     }
 
+    // --- 失败分支：streak 递增，按阈值升级 ---
     ++st.consistency_fail_total;
     ++st.consistency_fail_streak;
-
+    // 首次失败立即告警，后续按 warn_loops 周期告警，避免刷屏
     if (st.consistency_fail_streak == 1 || (st.consistency_fail_streak % warn_loops) == 0) {
         XtLogger::error_m("RT",
                           "runtime consistency failed reason={} frozen_cash={} tracked={} "
@@ -205,6 +231,7 @@ void process_consistency_policy(std::atomic<bool>& shutdown,
                           kill_loops);
     }
 
+    // 升级到 block：禁止新订单提交，但不停机，等待自行恢复
     if (st.consistency_fail_streak >= block_loops) {
         shared_state.trading_ready.store(false, std::memory_order_release);
         if (!st.consistency_blocked) {
@@ -217,6 +244,7 @@ void process_consistency_policy(std::atomic<bool>& shutdown,
         }
     }
 
+    // 升级到 kill：一致性长时间不恢复，触发进程停机以防状态持续漂移
     if (st.consistency_fail_streak >= kill_loops) {
         XtLogger::error_m("RT",
                           "runtime consistency kill threshold reached -> request shutdown "
@@ -227,6 +255,8 @@ void process_consistency_policy(std::atomic<bool>& shutdown,
     }
 }
 
+// 检查三个延迟维度是否超过各自的 P99 SLA 阈值。
+// samples > 0 条件防止样本不足时误报（如刚启动尚无订单）。
 uint64_t count_latency_sla_breaches(const XtLiveLatencyTracker::Snapshot& latency,
                                     const LatencySlaConfig& cfg) {
     uint64_t breaches = 0;
@@ -248,6 +278,8 @@ uint64_t count_latency_sla_breaches(const XtLiveLatencyTracker::Snapshot& latenc
     return breaches;
 }
 
+// SLA breach 处理：只告警不停机（延迟超标不等于功能故障）。
+// 节流逻辑：短时间内多次 breach 只输出一条日志。
 void process_latency_sla(const XtLiveLatencyTracker::Snapshot& latency,
                          const LatencySlaConfig& cfg,
                          int64_t now_ms,
@@ -256,7 +288,7 @@ void process_latency_sla(const XtLiveLatencyTracker::Snapshot& latency,
     if (breaches_now == 0) return;
 
     st.latency_sla_breach_total += breaches_now;
-
+    // 节流：同一 warn_throttle_ms 窗口内只输出一次
     if (cfg.warn_throttle_ms != 0 &&
         st.last_latency_sla_warn_ms != 0 &&
         now_ms - st.last_latency_sla_warn_ms < cfg.warn_throttle_ms) {
@@ -274,12 +306,15 @@ void process_latency_sla(const XtLiveLatencyTracker::Snapshot& latency,
                      st.latency_sla_breach_total);
 }
 
+// 关键 TD 事件丢弃 → 立即停机。
+// 理由：TD 事件包含成交回报/撤单确认，丢弃意味着 runtime 状态与 broker 不一致，
+// 继续交易可能导致重复下单或持仓漂移。增量检测避免重复触发。
 void maybe_apply_failure_policy(std::atomic<bool>& shutdown,
                                 const XtRunnerControlConfig& cfg,
                                 const ControlSnapshot& s,
                                 ControlLoopState& st) {
     if (!cfg.fail_on_critical_td_drop) return;
-    if (s.critical_td_event_drop <= st.critical_td_drop_seen) return;
+    if (s.critical_td_event_drop <= st.critical_td_drop_seen) return;  // 无新增丢弃
     const uint64_t delta = s.critical_td_event_drop - st.critical_td_drop_seen;
     st.critical_td_drop_seen = s.critical_td_event_drop;
     XtLogger::error_m("RT",
@@ -289,7 +324,7 @@ void maybe_apply_failure_policy(std::atomic<bool>& shutdown,
     shutdown.store(true, std::memory_order_release);
 }
 
-}
+} // namespace
 
 void log_control_stats(const ControlSnapshot& s, uint64_t latency_sla_breach_total) {
     if (!s.log_stats_enabled) return;
@@ -348,13 +383,15 @@ bool apply_policy_chain(std::atomic<bool>& shutdown,
                         const LoopFrame& frame,
                         ControlLoopState& st) {
     maybe_log_heartbeat(cfg, frame.snapshot, frame.now_ms, st);
-
+    // 60s 节拍 prune order_strategy_ sidecar。冷路径 ~µs 开销，放在 heartbeat
+    // 和 consistency 检查之间。
     maybe_prune_strategy_id_sidecar(ctx, frame.now_ms, st);
-
+    // 30s 节拍推孤儿回收 sweep 给 worker（recovered-unowned 在途单撤单）。
     maybe_push_orphan_reap(ctx, frame.now_ms, st);
-
+    // 1Hz 节拍 wire engine 内 atomic counter 到 shared_state,让 control panel
+    // / Prometheus 可见。冷路径,若干 relaxed atomic store。
     maybe_wire_multi_strategy_metrics(ctx, frame.now_ms, st);
-
+    // unmatched drop 预算判定（读上一行 wire 进 signals 的累计值，每帧评估）。
     maybe_evaluate_unmatched_budget(cfg, ctx, frame.now_ms, st);
     process_consistency_policy(
         shutdown,
@@ -373,4 +410,4 @@ bool apply_policy_chain(std::atomic<bool>& shutdown,
     return !shutdown.load(std::memory_order_acquire);
 }
 
-}
+}  // namespace xt_live::control::detail

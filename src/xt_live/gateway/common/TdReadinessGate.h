@@ -67,10 +67,10 @@ inline const char* td_readiness_status_name(TdReadinessStatus status) noexcept {
 
 /// @brief 单个 TD readiness stage 的状态快照。
 struct TdReadinessStageReport {
-    TdReadinessStage  stage = TdReadinessStage::Settlement;
-    TdReadinessStatus status = TdReadinessStatus::Pending;
-    std::string       reason;
-    uint64_t          updated_ms = 0;
+    TdReadinessStage  stage = TdReadinessStage::Settlement;  ///< stage 标识
+    TdReadinessStatus status = TdReadinessStatus::Pending;   ///< 当前 stage 状态
+    std::string       reason;                                ///< 最近一次状态变更原因
+    uint64_t          updated_ms = 0;                         ///< steady clock ms，0 表示未显式传入
 };
 
 /// @brief TD readiness gate 的完整报告。
@@ -78,11 +78,11 @@ struct TdReadinessStageReport {
 /// `ready=true` 表示所有 required stage 均为 Satisfied/NotRequired。
 /// `blocking_stage/reason` 指向第一个阻塞 stage；`stages` 保留全量状态供诊断。
 struct TdReadinessReport {
-    std::string venue;
-    bool ready = false;
-    std::string blocking_stage;
-    std::string blocking_reason;
-    std::array<TdReadinessStageReport, td_readiness_stage_count()> stages{};
+    std::string venue;  ///< venue label
+    bool ready = false;  ///< 是否满足所有 required stage
+    std::string blocking_stage;   ///< 第一个阻塞 stage 名称；ready=true 时为空
+    std::string blocking_reason;  ///< 阻塞 stage 的 reason；ready=true 时为空
+    std::array<TdReadinessStageReport, td_readiness_stage_count()> stages{};  ///< 全量 stage 状态
 
     const TdReadinessStageReport& stage(TdReadinessStage s) const noexcept {
         return stages[td_readiness_index(s)];
@@ -177,4 +177,4 @@ private:
     std::array<TdReadinessStageReport, td_readiness_stage_count()> stages_{};
 };
 
-}
+}  // namespace xt_live::gateway

@@ -26,10 +26,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 enable_testing()
+option(CLOUDTRADER_BUILD_TESTS "Build unit tests (requires bundled googletest)" OFF)
 option(CLOUDTRADER_BUILD_BENCHMARKS "Build local benchmark/perf binaries" OFF)
 option(CLOUDTRADER_ENABLE_COVERAGE "Enable gcov/llvm coverage flags" OFF)
 
-# xt_data (event store / FlatBuffers codegen) 构建开关。上移到此
+# xt_data (event store / FlatBuffers / control_proto codegen) 构建开关。上移到此
 # options 簇是因为下方 gRPC provider 块的 gating 需要它先定义。
 option(CLOUDTRADER_BUILD_DATA_LAYER "Build xt_data (event store, FlatBuffers)" ON)
 
@@ -258,6 +259,8 @@ add_subdirectory(xt_runtime)
 add_subdirectory(xt_risk)
 add_subdirectory(xt_account)
 
+# concurrency_substrate_bench 在 src/xt_tests/CMakeLists.txt（与 HazardStressTest
+# 同目录，同源 hazard pointer），不跨 src 边界引 tools/bench/。
 
 add_subdirectory(xt_engine)
 add_subdirectory(xt_live/telemetry)
@@ -285,8 +288,13 @@ add_subdirectory(xt_backtest/core)
 add_subdirectory(xt_report)
 add_subdirectory(xt_backtest/reporter)  # Plan v5 从 xt_report/backtest 搬来
 add_subdirectory(xt_backtest/hft)
+add_subdirectory(xt_backtest/cta)
+add_subdirectory(xt_backtest/sel)  # SEL backtest runner
 add_subdirectory(xt_live/hft)
 add_subdirectory(xt_strategy_engine)
+if(CLOUDTRADER_BUILD_TESTS)
+    add_subdirectory(xt_tests)
+endif()
 
 # XtBackTestRunner — HFT 回测可执行（统一走 XtHftEngine）。
 add_executable(XtBackTestRunner ${CMAKE_SOURCE_DIR}/xt_backtest/hft/XtHftBacktestRunner.cpp)
@@ -314,3 +322,34 @@ target_link_libraries(XtBackTestRunner PRIVATE
     dl
 )
 
+add_executable(XtSelBacktestRunner
+    ${CMAKE_SOURCE_DIR}/xt_backtest/sel/XtSelBacktestRunnerMain.cpp
+)
+target_include_directories(XtSelBacktestRunner PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/api
+    ${CMAKE_SOURCE_DIR}/xt_core
+    ${CMAKE_SOURCE_DIR}/xt_config
+    ${CMAKE_SOURCE_DIR}/xt_logger
+    ${CMAKE_SOURCE_DIR}/xt_strategy_engine
+    ${CMAKE_SOURCE_DIR}/xt_strategy_engine/loader
+    ${CMAKE_SOURCE_DIR}/xt_engine/sel
+    ${CMAKE_SOURCE_DIR}/xt_backtest/sel
+    ${CMAKE_SOURCE_DIR}/xt_data/datalake
+)
+target_link_libraries(XtSelBacktestRunner PRIVATE
+    xt_bt_sel
+    xt_engine_sel
+    xt_data_datalake
+    xt_stra
+    xt_runtime         # XtOrderRuntimeBook
+    xt_account         # AccountStateStore symbols (position_*_qty / position_mark_price)
+    xt_config
+    xt_core
+    xt_logger
+    yaml-cpp
+    dl
+)
+
+# 公开回归使用的两个独立策略插件。
+add_subdirectory(oss)

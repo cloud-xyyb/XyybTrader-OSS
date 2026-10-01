@@ -22,6 +22,10 @@
 #include <openssl/evp.h>
 #endif
 
+// Plugin 加载安全边界：canonical path 必须位于 plugin_root 下，basename 必须命中
+// allowlist，sha256 sidecar 在 strict_signing 下强制校验。SecurityConfig 显式注入
+// 优先；未注入时读取 CLOUDTRADER_PLUGIN_* 环境变量，便于 systemd 环境覆盖而不改 YAML。
+
 namespace {
 
 constexpr const char* kEnvPluginRoot = "CLOUDTRADER_PLUGIN_ROOT";
@@ -39,6 +43,7 @@ bool parse_env_bool(const char* value, bool default_value) {
     return true;
 }
 
+/// @brief 把逗号分隔字符串 split 成 basename 列表；空段忽略，前后空白 trim。
 std::vector<std::string> split_csv_allowlist(const char* csv) {
     std::vector<std::string> out;
     if (!csv || !*csv) return out;
@@ -59,6 +64,10 @@ std::vector<std::string> split_csv_allowlist(const char* csv) {
     return out;
 }
 
+/// @brief 判断 canonical path 是否位于 root 之下。
+///
+/// root 与 canonical 必须已 canonicalize；prefix 比较要求目录分隔符边界，避免
+/// `/foo/bar` 误匹配 `/foo/bar2`。
 bool path_under_root(const std::string& canonical, const std::string& root) {
     if (root.empty()) return true;
     std::string root_norm = root;
@@ -67,13 +76,16 @@ bool path_under_root(const std::string& canonical, const std::string& root) {
         root_norm.pop_back();
     }
     if (canonical.size() < root_norm.size()) return false;
-
+    // 字节级比较 = 大小写敏感（有意）：部署目标 Linux 文件系统大小写敏感；
+    // 大小写不敏感文件系统（Windows）上的不匹配方向是 fail-closed（拒载），
+    // 不构成放行面。
     if (canonical.compare(0, root_norm.size(), root_norm) != 0) return false;
-    if (canonical.size() == root_norm.size()) return true;
+    if (canonical.size() == root_norm.size()) return true;  // 等于 root 本身
     const char sep = canonical[root_norm.size()];
     return sep == '/' || sep == '\\';
 }
 
+/// @brief 解析十六进制字符为 0..15；非 hex 返回 -1。
 int hex_value(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -81,6 +93,9 @@ int hex_value(char c) {
     return -1;
 }
 
+/// @brief 解析 sha256sum 输出：`<64-hex>  <basename>\n` → 32-byte 数组。
+///
+/// 兼容双空格和单空格变体；basename 字段只作为 sidecar 人类可读内容，不参与校验。
 bool parse_sha256_sidecar(const std::string& content,
                           std::array<unsigned char, 32>& out_digest) {
     std::size_t i = 0;
@@ -96,7 +111,7 @@ bool parse_sha256_sidecar(const std::string& content,
 }
 
 #ifndef _WIN32
-
+/// @brief 流式计算 .so 文件 sha256；避免一次性读入大 plugin。
 bool compute_sha256_file(const std::string& path,
                          std::array<unsigned char, 32>& out_digest) {
     std::ifstream f(path, std::ios::binary);
@@ -126,9 +141,13 @@ bool compute_sha256_file(const std::string& path,
     EVP_MD_CTX_free(ctx);
     return ok;
 }
-#endif
+#endif  // !_WIN32
 
-}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// XtStraLoader implementation
+// ---------------------------------------------------------------------------
 
 void XtStraLoader::set_security_config(SecurityConfig cfg) {
     cfg.explicit_set = true;
@@ -155,7 +174,7 @@ XtStraLoader::resolve_effective_security_config() const {
 bool XtStraLoader::validate_path_security(const char* path,
                                           const SecurityConfig& sec,
                                           std::string& out_canonical) {
-
+    // 先 canonicalize，再做 root/allowlist 检查；canonicalize 失败即拒绝加载。
 #ifdef _WIN32
     char canon_buf[MAX_PATH] = {};
     const DWORD n = GetFullPathNameA(path, MAX_PATH, canon_buf, nullptr);
@@ -174,6 +193,7 @@ bool XtStraLoader::validate_path_security(const char* path,
     out_canonical = canon_buf;
 #endif
 
+    // plugin_root 自身也 canonicalize，避免符号链接逃逸或文本 prefix 误判。
     if (!sec.plugin_root.empty()) {
         std::string root_canonical;
 #ifdef _WIN32
@@ -201,6 +221,7 @@ bool XtStraLoader::validate_path_security(const char* path,
         }
     }
 
+    // allowlist enforce=true 时 basename 必须在 list；空 list 等同于拒绝所有 plugin。
     if (sec.basename_allowlist_enforce) {
         const std::string basename =
             std::filesystem::path(out_canonical).filename().string();
@@ -218,7 +239,7 @@ bool XtStraLoader::validate_path_security(const char* path,
 bool XtStraLoader::verify_sha256_sidecar(const std::string& canonical_path,
                                          bool strict_signing) {
 #ifdef _WIN32
-
+    // 当前 Windows build 不接 OpenSSL sidecar 校验；strict_signing 必须 fail-closed。
     if (strict_signing) {
         err_ = "strict signing requested but sha256 verification is "
                "POSIX-only in this build: " + canonical_path;
@@ -252,6 +273,7 @@ bool XtStraLoader::verify_sha256_sidecar(const std::string& canonical_path,
         return false;
     }
 
+    // 常时间比较，避免通过响应时间侧信道泄漏 digest 匹配进度。
     if (CRYPTO_memcmp(expected.data(), actual.data(), expected.size()) != 0) {
         err_ = "plugin sha256 mismatch: " + canonical_path +
                " (manifest=" + sidecar_path + ")";
@@ -277,7 +299,7 @@ bool XtStraLoader::load(const char* path) {
     if (!verify_sha256_sidecar(canonical_path, sec.strict_signing)) {
         return false;
     }
-
+    // 后续 dlopen 使用 canonical_path，避免再次按原始 path 解析符号链接。
     const char* const dlopen_path = canonical_path.c_str();
 
 #ifdef _WIN32
@@ -294,7 +316,7 @@ bool XtStraLoader::load(const char* path) {
     order_exec_align_ = reinterpret_cast<LayoutFn>(GetProcAddress(h, "xt_alignof_CtOrderExecUpdate"));
     tick_size_ = reinterpret_cast<LayoutFn>(GetProcAddress(h, "xt_sizeof_XtTick"));
 #else
-
+    // RTLD_LOCAL 避免两个 plugin 之间的静态库符号互相污染。
     void* h = dlopen(dlopen_path, RTLD_NOW | RTLD_LOCAL);
     if (!h) {
         err_ = dlerror();

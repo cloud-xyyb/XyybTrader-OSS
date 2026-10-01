@@ -15,4 +15,4 @@ XtReportCfg parse_report_config(const YAML::Node& node) {
     return cfg;
 }
 
-}
+} // namespace xt_report

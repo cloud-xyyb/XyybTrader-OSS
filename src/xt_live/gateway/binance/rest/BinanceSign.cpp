@@ -36,8 +36,8 @@ std::string hmac_sha256_hex(std::string_view secret, std::string_view payload) {
 
 std::string url_encode(std::string_view s) {
     std::string out;
-
-    out.reserve(s.size() * 3);
+    // RFC 3986 unreserved: A-Z a-z 0-9 - _ . ~；其他字节按 %XX 输出。
+    out.reserve(s.size() * 3);  // 最坏情况：每个输入字节扩展成 3 字节 %XX。
     static constexpr char kHexChars[] = "0123456789ABCDEF";
     for (unsigned char c : s) {
         const bool unreserved =
@@ -58,7 +58,7 @@ std::string url_encode(std::string_view s) {
 
 std::string build_query(const std::map<std::string, std::string>& params) {
     std::string q;
-
+    // 粗略 reserve：key + '=' + value + '&'；URL encode 后超出的部分由 string 自行扩容。
     std::size_t approx = 0;
     for (const auto& [k, v] : params) approx += k.size() + v.size() + 2;
     q.reserve(approx);
@@ -78,7 +78,7 @@ std::string sign_query(std::string_view secret,
     const std::string query = build_query(params);
     const std::string sig = hmac_sha256_hex(secret, query);
     std::string out;
-    out.reserve(query.size() + 11 + sig.size());
+    out.reserve(query.size() + 11 + sig.size());  // "&signature=" 长度为 11。
     out.append(query);
     out.append("&signature=");
     out.append(sig);
@@ -93,7 +93,7 @@ std::string sign_params(std::string_view secret,
 std::string api_key_sha8(std::string_view api_key) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int md_len = 0;
-
+    // EVP_Digest 而非直接 SHA256()：后者 OpenSSL 3.0 起 deprecated。
     if (EVP_Digest(api_key.data(), api_key.size(), md, &md_len,
                    EVP_sha256(), nullptr) != 1 || md_len < 4) {
         throw std::runtime_error("api_key_sha8: SHA256 digest failed");
@@ -101,7 +101,7 @@ std::string api_key_sha8(std::string_view api_key) {
     std::string hex;
     hex.reserve(8);
     static constexpr char kHexChars[] = "0123456789abcdef";
-    for (unsigned int i = 0; i < 4; ++i) {
+    for (unsigned int i = 0; i < 4; ++i) {  // 前 4 字节 → 8 hex 小写
         hex.push_back(kHexChars[(md[i] >> 4) & 0x0F]);
         hex.push_back(kHexChars[md[i] & 0x0F]);
     }
@@ -114,5 +114,5 @@ uint64_t now_ms() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-}
-}
+}  // namespace sign
+}  // namespace binance_u

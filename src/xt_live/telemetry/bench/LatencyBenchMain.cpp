@@ -20,14 +20,14 @@ uint64_t steady_now_us() {
     return XtSteadyClock::steady_now_us();
 }
 
-}
+} // namespace
 
 int main(int argc, char** argv) {
     const uint64_t samples = arg_u64(argc, argv, 1, 200000);
     const uint64_t submit_wire_us = arg_u64(argc, argv, 2, 20);
     const uint64_t ack_after_submit_us = arg_u64(argc, argv, 3, 80);
     const uint64_t fill_after_submit_us = arg_u64(argc, argv, 4, 180);
-    const uint64_t stale_ttl_us = arg_u64(argc, argv, 5, 86400000000ULL);
+    const uint64_t stale_ttl_us = arg_u64(argc, argv, 5, 86400000000ULL); // 24h
     const uint64_t sample_step_us = arg_u64(argc, argv, 6, 10);
 
     XtLiveLatencyTracker tracker(XtLiveLatencyTracker::Config{true, stale_ttl_us});

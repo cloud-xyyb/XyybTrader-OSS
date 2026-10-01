@@ -20,12 +20,12 @@ namespace xt_live::control {
 /// @brief recorder 失败计数帧间 delta tracker（每原因独立限频）。
 class RecorderFailureDelta {
 public:
-
+    /// @brief 观测的失败向原因；顺序即 observe() 入参顺序与 delta 数组下标。
     enum Reason : std::size_t {
-        kDrop = 0,
-        kWriteFailed,
-        kIntentTraceDrop,
-        kIntentTraceWriteFailed,
+        kDrop = 0,                  ///< 队满丢弃（drop_count）
+        kWriteFailed,               ///< 写盘失败（write_failed_count）
+        kIntentTraceDrop,           ///< intent-trace 队满丢弃
+        kIntentTraceWriteFailed,    ///< intent-trace 写盘失败
         kCount
     };
 
@@ -41,14 +41,20 @@ public:
 
     /// @brief 单帧 delta + 告警决策。
     struct Report {
-        bool                          any = false;
-        std::array<uint64_t, kCount>  delta{};
-        std::array<bool, kCount>      warn{};
+        bool                          any = false;  ///< 是否有任一原因触发告警
+        std::array<uint64_t, kCount>  delta{};      ///< 各原因相对上次告警基线的新增量
+        std::array<bool, kCount>      warn{};       ///< 各原因本帧是否应告警（新增且过限频窗）
     };
 
     explicit RecorderFailureDelta(uint64_t throttle_ms = 60'000) noexcept
         : throttle_ms_(throttle_ms) {}
 
+    /// @brief 喂本帧 4 个累计 counter，返回 delta + 限频后的告警决策。
+    /// @param now_ms  steady clock ms，限频窗判定用。
+    /// @note 首帧只吸收基线不告警：把重启前累计的历史失败排除在「本次新增」外。
+    ///       counter 单调递增；出现回退（进程内不应发生）时静默 re-baseline。
+    ///       delta 报告的是「相对上次告警的累计增量」——限频窗内不推进基线，
+    ///       让下一条告警带上窗口内积攒的完整增量。
     Report observe(uint64_t now_ms,
                    uint64_t drop,
                    uint64_t write_failed,
@@ -59,11 +65,11 @@ public:
         Report out;
         for (std::size_t i = 0; i < kCount; ++i) {
             if (!primed_) {
-                baseline_[i] = cur[i];
+                baseline_[i] = cur[i];  // 首帧基线；不算 delta、不告警。
                 continue;
             }
             if (cur[i] < baseline_[i]) {
-                baseline_[i] = cur[i];
+                baseline_[i] = cur[i];  // 回退兜底：silent re-baseline，不告警。
                 continue;
             }
             out.delta[i] = cur[i] - baseline_[i];
@@ -72,7 +78,7 @@ public:
             if (out.delta[i] > 0 && throttle_ok) {
                 out.warn[i] = true;
                 out.any = true;
-                baseline_[i] = cur[i];
+                baseline_[i] = cur[i];      // 告警后推进基线，下条 delta 重新累计。
                 last_warn_ms_[i] = now_ms;
             }
         }
@@ -83,8 +89,8 @@ public:
 private:
     uint64_t throttle_ms_;
     bool     primed_ = false;
-    std::array<uint64_t, kCount> baseline_{};
-    std::array<uint64_t, kCount> last_warn_ms_{};
+    std::array<uint64_t, kCount> baseline_{};      ///< 上次告警（或首帧）时的 counter 快照
+    std::array<uint64_t, kCount> last_warn_ms_{};  ///< 各原因上次告警 steady ms（0=从未）
 };
 
-}
+}  // namespace xt_live::control

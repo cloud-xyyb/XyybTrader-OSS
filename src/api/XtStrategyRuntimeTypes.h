@@ -6,9 +6,9 @@
  * @brief 策略运行态共享类型（shared runtime DTOs）。
  */
 
-struct XtRawTick;
-struct XtTick;
-struct XtBar;
+struct XtRawTick; // forward (core/XtRawTick.h)
+struct XtTick;    // forward (core/XtTick.h)
+struct XtBar;  // forward (xt_core/market/XtBarStruct.h)
 struct XtOrderExecUpdate;
 struct XtOrderQueue;
 struct XtOrderDetail;
@@ -16,6 +16,7 @@ struct XtTransaction;
 
 namespace xt_runtime {
 
+// XtStraContractInfo 与 XtCommodityInfo 字段完全相同，合并为同一类型。
 using XtStraContractInfo = XtCommodityInfo;
 
 /**
@@ -47,8 +48,13 @@ struct XtStraPositionDetail {
     XtStraPosSideDetail short_side;
 };
 
-}
+} // namespace xt_runtime
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SEL Selector Engine 调度周期类型
+// ─────────────────────────────────────────────────────────────────────────────
+// 与 wt `WtSelEngine.h:13-19` 对齐（便于 wt parity bit-exact diff）。
+// 顶级 enum（不在 xt_runtime namespace），让 XtStrategyBase / SEL engine 共用。
 enum class TaskPeriod : uint8_t {
     None    = 0,
     Minute  = 4,

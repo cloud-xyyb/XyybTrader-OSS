@@ -29,4 +29,4 @@ private:
     AccountStateStore& store_;
 };
 
-}
+}  // namespace xt_account

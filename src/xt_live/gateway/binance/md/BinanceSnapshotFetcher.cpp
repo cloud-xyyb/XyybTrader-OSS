@@ -26,10 +26,12 @@ std::string to_upper(std::string_view s) {
     return out;
 }
 
+/// @brief 解析 binance /fapi/v1/depth JSON 响应为 DepthSnapshot。
+/// @return true 成功；false 解析失败（err 已填）。
 bool parse_depth_response(const std::string& body,
                           DepthSnapshot& out,
                           std::string* err) {
-    auto j = nlohmann::json::parse(body, nullptr,  false);
+    auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded()) {
         if (err) *err = "binance depth response: invalid json";
         return false;
@@ -43,7 +45,7 @@ bool parse_depth_response(const std::string& body,
     auto parse_side = [&err](const nlohmann::json& arr,
                              std::vector<std::pair<double, double>>& dst,
                              const char* side) -> bool {
-
+        // Binance depth 每档是 ["price","qty"] 字符串数组；这里保留 double 给 order book 合并。
         dst.reserve(arr.size());
         for (const auto& lv : arr) {
             if (!lv.is_array() || lv.size() < 2) {
@@ -53,7 +55,7 @@ bool parse_depth_response(const std::string& body,
             try {
                 const double price = std::stod(lv[0].get<std::string>());
                 const double qty   = std::stod(lv[1].get<std::string>());
-
+                // P15：非有限档位 = 坏快照，整份按解析失败处理（caller 重拉）。
                 if (!std::isfinite(price) || !std::isfinite(qty)) {
                     if (err) *err = std::string("binance depth response: non-finite ") + side + " level";
                     return false;
@@ -75,7 +77,7 @@ bool parse_depth_response(const std::string& body,
     return true;
 }
 
-}
+}  // namespace
 
 std::optional<DepthSnapshot> BinanceSnapshotFetcher::fetch_sync(std::string_view symbol,
                                                                 int limit,
@@ -87,7 +89,7 @@ std::optional<DepthSnapshot> BinanceSnapshotFetcher::fetch_sync(std::string_view
     std::string body;
     if (!binance_public_http_get(cfg_.host, cfg_.port, path.str(),
                                  static_cast<long>(cfg_.timeout_sec),
-                                 cancel, &body,  nullptr, err)) {
+                                 cancel, &body, /*out_http=*/nullptr, err)) {
         return std::nullopt;
     }
     DepthSnapshot snap;
@@ -97,4 +99,4 @@ std::optional<DepthSnapshot> BinanceSnapshotFetcher::fetch_sync(std::string_view
     return snap;
 }
 
-}
+}  // namespace binance_u

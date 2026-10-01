@@ -21,12 +21,14 @@
 ///       独立 observer 处理，二者互不替代。
 class XtBacktestTradeCapture final {
 public:
-
+    /// @brief Single-bucket 模式；所有成交写入同一个外部 sink。
     explicit XtBacktestTradeCapture(std::vector<BarTradeRow>& sink) noexcept
         : single_bucket_(&sink) {}
 
+    /// @brief Multi-bucket 模式；调用方必须先用 add_bucket 注册策略 sink。
     XtBacktestTradeCapture() = default;
 
+    /// @brief 注册 `strategy_id -> sink`；sink 为 non-owning。
     void add_bucket(const std::string& strategy_id,
                     std::vector<BarTradeRow>& bucket) {
         if (single_bucket_) {
@@ -41,6 +43,8 @@ public:
         }
     }
 
+    /// @brief 路由成交到目标 sink；multi-bucket 模式要求 `tr.strategy_id` 已注册。
+    /// @pre 由引擎在 account apply 之后调用（`XtBtFillSink` 契约）。
     void operator()(const XtBtFillTruth& t) {
         const XtTradeRecord& tr = t.tr;
         std::vector<BarTradeRow>* target = single_bucket_;

@@ -19,7 +19,7 @@
 namespace {
 
 const std::vector<std::string>& external_income_query_types() {
-
+    // 只查询外部资金流类型；交易盈亏/手续费等由订单和账户链路自身归因。
     static const std::vector<std::string> kTypes = {
         "TRANSFER",
         "INTERNAL_TRANSFER",
@@ -34,7 +34,7 @@ const std::vector<std::string>& external_income_query_types() {
     return kTypes;
 }
 
-}
+}  // namespace
 
 namespace binance_u {
 
@@ -48,7 +48,8 @@ BinanceAccountTruthSource::IncomeProvider make_binance_income_provider(const Bin
     rcfg.api_key = cfg.api_key;
     rcfg.api_secret = cfg.api_secret;
     rcfg.recv_window_ms = cfg.recv_window_ms;
-
+    // income provider 在主控制循环里同步刷新；短超时配合下方总预算，保证失败的
+    // REST 调用不会长期占用 watchdog 主帧。
     rcfg.timeout_sec = 3;
     auto rest = std::make_shared<BinanceRestClient>(std::move(rcfg));
     (void)rest->sync_server_time();
@@ -57,7 +58,8 @@ BinanceAccountTruthSource::IncomeProvider make_binance_income_provider(const Bin
         std::vector<BinanceAccountTruthSource::IncomeRecord> out;
         constexpr int kLimit = 1000;
         constexpr int kMaxPagesPerType = 10;
-
+        // 总壁钟预算：预算耗尽时返回已取到的部分结果。income 是外部资金流遥测，
+        // best-effort 即可；下一轮刷新会继续补齐。
         constexpr int64_t kRefreshBudgetMs = 5000;
         const auto t_start = std::chrono::steady_clock::now();
         const auto over_budget = [&t_start, kRefreshBudgetMs]() {
@@ -101,7 +103,7 @@ BinanceAccountTruthSource::IncomeProvider make_binance_income_provider(const Bin
 
                 uint64_t max_seen_ms = 0;
                 for (const auto& row : rows) {
-
+                    // Binance income 金额以字符串返回；解析失败时按 0 记录，保留时间和类型用于排查。
                     BinanceAccountTruthSource::IncomeRecord record;
                     record.income_type = row.value("incomeType", income_type);
                     record.asset = row.value("asset", "USDT");
@@ -119,7 +121,7 @@ BinanceAccountTruthSource::IncomeProvider make_binance_income_provider(const Bin
                 if (rows.size() < static_cast<size_t>(kLimit) || max_seen_ms + 1 <= page_start) {
                     break;
                 }
-
+                // 下一页从已见最大时间 + 1ms 开始，避免重复消费同一批 income row。
                 page_start = max_seen_ms + 1;
             }
         }
@@ -127,4 +129,4 @@ BinanceAccountTruthSource::IncomeProvider make_binance_income_provider(const Bin
     };
 }
 
-}
+}  // namespace binance_u

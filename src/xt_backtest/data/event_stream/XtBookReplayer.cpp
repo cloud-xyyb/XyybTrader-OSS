@@ -8,7 +8,7 @@
 
 XtBookReplayer::XtBookReplayer(std::size_t max_levels, std::size_t warmup_events)
     : warmup_events_(warmup_events) {
-    (void)max_levels;
+    (void)max_levels;  // 保留构造参数以兼容 caller；导出 snapshot 固定为 L5。
 }
 
 void XtBookReplayer::process_event(std::string_view side,
@@ -29,7 +29,7 @@ void XtBookReplayer::process_event(std::string_view side,
     }
 
     if (is_clear) {
-
+        // canonical parquet 当前不保证 prev_final_update_id 连续性；clear event 只重置本地 book。
         clear_book();
         in_warmup_ = true;
         events_seen_ = 0;
@@ -58,6 +58,7 @@ XtBookReplayer::L5Snapshot XtBookReplayer::l5_snapshot() const {
         out.ask_qtys[i] = nan;
     }
 
+    // 单 pass top-5 选择，无 heap 分配；bids 降序，asks 升序。
     std::pair<int64_t, double> top_bids[5];
     std::pair<int64_t, double> top_asks[5];
     int nb = 0;
@@ -132,7 +133,7 @@ void XtBookReplayer::process_snapshot_start(std::optional<int64_t> final_update_
 }
 
 void XtBookReplayer::apply_level(std::string_view side, double price, double qty) {
-
+    // 写入阶段只维护 price_key -> qty；排序成本集中在 snapshot 查询阶段。
     const int64_t key = price_to_key(price);
     if (equals_ignore_case(side, "bid")) {
         if (qty <= 0.0) {

@@ -14,6 +14,7 @@
 
 namespace {
 
+// event store fixed-point scale 为 1e6；fp <= 2^53 时转 double 可精确表达整数值。
 inline double fp_to_d(int64_t fp) { return static_cast<double>(fp) * 1e-6; }
 
 bool validate_md_tick(const ct::data::schema::MdTick& t, std::string& err) {
@@ -23,7 +24,8 @@ bool validate_md_tick(const ct::data::schema::MdTick& t, std::string& err) {
         err = "MdTick.source_kind is UNKNOWN";
         return false;
     }
-
+    // depth 契约 v2：接受 1..kEventStoreMdDepth 变长档数（v1 固定 5 档旧文件
+    // 天然落在区间内），数组长度必须与 depth_levels_real 一致。
     const int depth = t.depth_levels_real();
     if (depth < 1 || depth > ct::data::kEventStoreMdDepth) {
         err = "MdTick.depth_levels_real must be in [1, " +
@@ -51,6 +53,10 @@ bool validate_md_tick(const ct::data::schema::MdTick& t, std::string& err) {
         && check_vec(t.ask_qty_fp(), "ask_qty_fp");
 }
 
+// total_volume_fp 单位判定：带 volume_encoding=FP_1E6 的记录直读；旧文件
+//（UNKNOWN）按 source_kind 查表 —— 这是显式 wire 字段查表而非猜测：
+//   LIVE_BINANCE / MIGRATED_V2 存量为 fp；LIVE_CTP / LIVE_XTP 存量为 raw 手数 ×1e6；
+//   REPLAY（旧 migrate_live_jsonl_to_fbs.py 产物）单位不可判定 → fail-fast。
 bool decode_total_volume_fp(const ct::data::schema::MdTick& t,
                             int64_t& out_fp,
                             std::string& err) {
@@ -82,6 +88,7 @@ bool decode_total_volume_fp(const ct::data::schema::MdTick& t,
     }
 }
 
+// MdTick -> XtRawTick 字段映射；调用前已由 validate_md_tick 保证深度数组存在且长度固定。
 void hydrate(const ct::data::schema::MdTick& t, XtRawTick& out) {
     out = XtRawTick{};
 
@@ -100,6 +107,7 @@ void hydrate(const ct::data::schema::MdTick& t, XtRawTick& out) {
     out.upper_limit    = fp_to_d(t.upper_limit_fp());
     out.lower_limit    = fp_to_d(t.lower_limit_fp());
 
+    // total_volume 由 next_tick 经 decode_total_volume_fp 单点写入（单位判定）。
     out.total_turnover = fp_to_d(t.total_turnover_fp());
     out.open_interest  = fp_to_d(t.open_interest_fp());
 
@@ -107,6 +115,7 @@ void hydrate(const ct::data::schema::MdTick& t, XtRawTick& out) {
     out.pre_settle   = fp_to_d(t.pre_settle_fp());
     out.pre_interest = fp_to_d(t.pre_interest_fp());
 
+    // 按 depth_levels_real 回放真实档数；更深槽位保持 XtRawTick 默认 0。
     const auto* bp = t.bid_price_fp();
     const auto* ap = t.ask_price_fp();
     const auto* bq = t.bid_qty_fp();
@@ -121,7 +130,7 @@ void hydrate(const ct::data::schema::MdTick& t, XtRawTick& out) {
     }
 }
 
-}
+} // namespace
 
 XtFbsTickReader::XtFbsTickReader(Options opts) : opts_(std::move(opts)) {}
 XtFbsTickReader::~XtFbsTickReader() = default;
@@ -170,7 +179,8 @@ bool XtFbsTickReader::next_tick(XtRawTick& out) {
     }
     std::string validation_err;
     if (!view.tick || !validate_md_tick(*view.tick, validation_err)) {
-
+        // fail-fast 必须可见：caller（XtMarketDataSource）把返 false 当 EOF，
+        // 不打印则拒读原因（如要求重迁移）对用户不可达。
         std::fprintf(stderr, "[XtFbsTickReader] invalid MdTick record rejected: %s\n",
                      validation_err.c_str());
         io_error_ = true;
@@ -187,6 +197,8 @@ bool XtFbsTickReader::next_tick(XtRawTick& out) {
     hydrate(*view.tick, out);
     out.total_volume = fp_to_d(total_volume_fp);
 
+    // MdTick 持久化 total_volume；第 1 个 tick、跨 trading_day reset 或累计量倒退时，
+    // incremental volume 保持 0，避免生成负成交量。
     auto it = prev_total_volume_.find(out.code);
     if (it != prev_total_volume_.end() && out.total_volume >= it->second) {
         out.volume = out.total_volume - it->second;

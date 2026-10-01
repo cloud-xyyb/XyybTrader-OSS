@@ -10,8 +10,16 @@
 
 namespace xt_live::common {
 
+/// @brief 停止 Prometheus metrics exposer。
+///
+/// runner shutdown 路径应在 `XtLogger::shutdown()` 之前调用；`XT_HAVE_METRICS`
+/// 未定义时为 no-op。
 void stop_metrics_exposer_();
 
+/// @brief 将 `PositionAggregator` 的仓位跳变 hook 接到 metrics registry。
+///
+/// 该 hook 是进程级回调，HFT/CTA runner 启动期各自调用一次即可；`XT_HAVE_METRICS`
+/// 未定义时为 no-op。
 void register_position_aggregator_jump_reporter_();
 
-}
+}  // namespace xt_live::common

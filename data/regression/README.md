@@ -1,25 +1,10 @@
-# 回归基线（Regression Baselines）
+# 回归样例
 
-byte-identical 回归是本仓的行为不变量锚：6 个 HFT 场景，每个场景产出的 `fills.csv`
-与仓内 golden **逐字节**比对，任何 drift 即失败。
+从仓库根运行 bash scripts/build_dev.sh 和 bash scripts/regression_test.sh。
 
-```bash
-bash scripts/regression_test.sh          # 全部 6 个场景
-bash scripts/run_baselines.sh holiday    # 只跑一个
-```
+- HFT：ag2206_only、ag2212_only、roll_29col、holiday、ag2206_vollimit、ag2206_vollimit_split；逐字节比对 fills.csv。
+- SEL demo：30 个交易日、3 个股票、2 次调仓，比对 trades_baseline.csv。
+- SEL large：合成价格、5 个股票、3 次调仓，比对 expected_trades.csv。
+- SEL CA：手工公司行动样例，同时比对成交和 corporate_action_events.csv。
 
-| 场景 | 描述 | config |
-|---|---|---|
-| `ag2206_only` | ag2206 单合约 5 交易日 | `configs/baselines/ag2206_only.yaml` |
-| `ag2212_only` | ag2212 单合约 5 交易日 | `configs/baselines/ag2212_only.yaml` |
-| `roll_29col`  | ag2206 + ag2212 双合约 5 交易日 | `configs/baselines/roll_29col.yaml` |
-| `holiday`     | ag2206 + ag2212 跨节假日 8 交易日（含周末跳空） | `configs/baselines/holiday.yaml` |
-| `ag2206_vollimit` | 同 `ag2206_only`，但开 `volume_limit`（撮合受每 tick 成交量上限约束） | `configs/baselines/ag2206_vollimit.yaml` |
-| `ag2206_vollimit_split` | `volume_limit` 叠加 `fill.split`（成交拆单，qty=5 → 2/2/1） | `configs/baselines/ag2206_vollimit_split.yaml` |
-
-目录约定：
-
-- `baselines/<场景>/expected_fills.csv` — golden 输出
-- `baselines/<场景>/manifest.yaml` — 自描述清单（config / 输入数据 / golden 的 sha256）
-- `sample_ticks/` — 样例 tick 数据，`<交易所>/<品种>/<合约>/<日期>.csv`；
-  列语义与 volume 口径见 [docs/data_format.md](../../docs/data_format.md)
+数据路径、模式和来源见 [数据说明](../../docs/SEL_BACKTEST.md) 与 [来源清单](../../docs/DATA_PROVENANCE.md)。

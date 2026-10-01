@@ -12,6 +12,8 @@
 #include <chrono>
 #include <thread>
 
+// ── ready 后周期刷新 ──────────────────────────────
+
 void TraderCTP::refresh_once_after_ready() {
     if (account_refresh_ms_ <= 0 && position_refresh_ms_ <= 0) return;
     bool expected = false;
@@ -29,7 +31,7 @@ void TraderCTP::refresh_once_after_ready() {
         if (!can_run_refresh_query()) return;
         if (account_refresh_ms_ > 0) query_once(QueryKind::AccountState);
         if (position_refresh_ms_ > 0) {
-
+            // 200ms 间隔避免两个查询背靠背触发 CTP 流控
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             if (can_run_refresh_query()) query_once(QueryKind::Position);
         }
@@ -54,12 +56,12 @@ void TraderCTP::start_refresh_loop() {
         auto next_pos = pos_ms > 0 ? start + std::chrono::milliseconds(pos_ms)
                                    : clock::time_point::max();
         while (!stopping_.load(std::memory_order_acquire)) {
-
+            // 同轮到期时先资金后持仓，并插入 200ms 间隔降低柜台 burst
             auto next = next_acc < next_pos ? next_acc : next_pos;
             if (next == clock::time_point::max()) break;
             auto now = clock::now();
             if (now < next) {
-
+                // 可中断等待到下一个到期点；stop() notify 后即时唤醒，避免 join 阻塞整段 interval。
                 std::unique_lock<std::mutex> wl(wait_mu_);
                 wait_cv_.wait_until(wl, next, [this]() {
                     return stopping_.load(std::memory_order_acquire);
@@ -90,9 +92,11 @@ void TraderCTP::start_refresh_loop() {
     });
 }
 
+// ── Ready 稳态 refresh 查询超时自愈 ──────────────────
+
 void TraderCTP::arm_refresh_query_timeout(QueryKind kind) {
-    if (refresh_query_timeout_ms_ <= 0) return;
-    if (recovery_.is_recovering()) return;
+    if (refresh_query_timeout_ms_ <= 0) return;                        // 关闭自愈（回滚开关）
+    if (recovery_.is_recovering()) return;                            // recovery 有独立超时守卫，不重复挂
     if (session_phase_.load(std::memory_order_acquire) != SessionPhase::Ready) return;
 
     auto&          q          = qry_[qry_idx(kind)];
@@ -101,18 +105,21 @@ void TraderCTP::arm_refresh_query_timeout(QueryKind kind) {
 
     schedule_after_ms(timeout_ms, [this, kind, token, timeout_ms]() {
         if (!is_session_alive()) return;
-        if (recovery_.is_recovering()) return;
+        if (recovery_.is_recovering()) return;                        // 已回到 recovery，交给 recovery 守卫
         if (session_phase_.load(std::memory_order_acquire) != SessionPhase::Ready) return;
         auto& q = qry_[qry_idx(kind)];
-        if (q.refresh_timeout_token.load(std::memory_order_acquire) != token) return;
-        if (!q.inflight.load(std::memory_order_acquire)) return;
+        if (q.refresh_timeout_token.load(std::memory_order_acquire) != token) return;  // 已被新查询 supersede
+        if (!q.inflight.load(std::memory_order_acquire)) return;                        // 已正常回包完成
 
+        // 稳态 refresh 查询发出后超阈仍无 bIsLast 回包 → 视为该 kind 查询失败（丢包/柜台无回）。
+        // query_once 的 inflight CAS 在 stuck 状态下恒失败 → 后续周期 refresh 全 no-op（永久 wedge）。
+        // 解开 stuck inflight 后重发，并按连续超时轮数升级 refresh wedged 观测状态（page-then-continue）。
         const int consecutive =
             q.refresh_timeout_count.fetch_add(1, std::memory_order_acq_rel) + 1;
         refresh_query_timeout_total_.fetch_add(1, std::memory_order_acq_rel);
         const auto d = ctp_refresh::refresh_timeout_decision(consecutive, refresh_query_wedge_rounds_);
         const QueryMeta meta = query_meta(kind);
-
+        // 每 kind 每 timeout_ms 至多触发一次 → 日志天然限频。
         if (d.raise_wedge) {
             XtLogger::error_m("TD",
                 "event=refresh_query_wedged stage={} timeout_ms={} consecutive={}/{} re-issuing",
@@ -123,7 +130,9 @@ void TraderCTP::arm_refresh_query_timeout(QueryKind kind) {
                 meta.name, timeout_ms, consecutive);
         }
         if (!d.reissue) return;
-
+        // 解 stuck inflight（qry_ 全 atomic，从 timer 线程触碰安全；不碰 state_）。
+        // query_once 重发若 ret==0 会再挂一次 refresh timeout；若被 throttle 跳过则
+        // 走 retry worker 兜底，且 inflight 已被 query_once 释放，不再永久 wedge。
         q.inflight.store(false, std::memory_order_release);
         q.dirty.store(false, std::memory_order_release);
         q.next_allowed_ms.store(0, std::memory_order_release);

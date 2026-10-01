@@ -16,16 +16,22 @@
 
 namespace {
 
+// 文件内日志辅助：保持 session/recovery reason 输出一致。
 const char* rc(XtLiveRecoveryError code) { return live_recovery_error_str(code); }
 
-}
+// login retry 退避分级见 CtpLoginBackoff.h（凭证类固定 1h / NOT_INITED cap 30s /
+// 其它瞬态 cap 5min）。consecutive_login_failures_ 登录失败递增、成功清零。
+}  // namespace
+
+// ── Login request 与 retry ──────────────────────────────────────────────
 
 bool TraderCTP::login() {
-
+    // SDK 回调线程与 login retry timer 都可能进入；发送前持 shared 锁，
+    // 与 stop()/check_health 的 Release/rebuild 互斥。
     std::shared_lock<std::shared_mutex> api_lk(api_mu_);
     if (!api_) return false;
     CThostFtdcReqUserLoginField req;
-    std::memset(&req, 0, sizeof(req));
+    std::memset(&req, 0, sizeof(req));  // CTP 要求所有未用字段为零。
     XtCStringUtil::copy(req.BrokerID, broker_.c_str());
     XtCStringUtil::copy(req.UserID, user_.c_str());
     XtCStringUtil::copy(req.Password, pass_.c_str());
@@ -40,10 +46,11 @@ bool TraderCTP::login() {
 void TraderCTP::schedule_login_retry() {
     if (!reconnect_enabled_) return;
     if (!is_session_alive()) return;
-
+    // 只在 front 已连上但 login 未成功时重试；断线由 CTP SDK 自动重连 + check_health 重建兜底。
     if (session_phase_.load(std::memory_order_acquire) != SessionPhase::FrontConnected) return;
     if (login_retry_pending_.exchange(true, std::memory_order_acq_rel)) return;
 
+    // retry_ms 由最近 ErrorID 与连续失败次数决定；无错误时使用配置下限。
     const int err_id = last_login_error_id_.load(std::memory_order_acquire);
     const int fails  = consecutive_login_failures_.load(std::memory_order_acquire);
     const int retry_ms = ctp_login::compute_login_backoff_ms(login_retry_ms_, err_id, fails);
@@ -54,14 +61,17 @@ void TraderCTP::schedule_login_retry() {
         if (session_phase_.load(std::memory_order_acquire) != SessionPhase::FrontConnected) return;
         XtLogger::warn_m("TD", "event=td_login_retry retry_ms={}", retry_ms);
         if (!login()) {
-
+            // ReqUserLogin 同步失败极少见；继续保留 retry 链。
             schedule_login_retry();
         }
     });
 }
 
-bool TraderCTP::confirm_settlement() {
+// ── 结算确认 gate ──────────────────────────────────────────────
 
+bool TraderCTP::confirm_settlement() {
+    // settlement retry timer 与 SDK 回调路径都可能进入；发送前持 shared 锁，
+    // 与 stop()/check_health 的 Release/rebuild 互斥。
     std::shared_lock<std::shared_mutex> api_lk(api_mu_);
     if (!api_) return false;
     CThostFtdcSettlementInfoConfirmField req;
@@ -107,7 +117,7 @@ void TraderCTP::schedule_settlement_confirm_retry(XtLiveRecoveryError reason) {
 
 void TraderCTP::arm_settlement_timeout() {
     if (settlement_confirm_timeout_ms_ <= 0) return;
-
+    // token 递增使上一轮 timeout 定时器失效，保证同时只有一个活跃 timeout。
     const uint64_t token      = settlement_confirm_token_.fetch_add(1, std::memory_order_acq_rel) + 1;
     const int      timeout_ms = settlement_confirm_timeout_ms_;
     schedule_after_ms(timeout_ms, [this, token, timeout_ms]() {

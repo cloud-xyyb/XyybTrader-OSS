@@ -23,7 +23,7 @@
 
 namespace {
 
-constexpr uint32_t kShmMagic      = 0x4354504d;
+constexpr uint32_t kShmMagic      = 0x4354504d; // "CTPM"
 constexpr uint32_t kShmAbi        = 1;
 constexpr mode_t   kShmObjectPerm = 0600;
 
@@ -48,6 +48,8 @@ std::string stable_hex(uint64_t v) {
     return buf;
 }
 
+// POSIX shm/sem 名称要求 ≤ NAME_MAX 且不含特殊字符，
+// 哈希方案保证固定 16 字符 hex，无需转义
 std::string make_name_token(const std::string& domain) {
     const std::hash<std::string> hfn;
     const uint64_t hv = static_cast<uint64_t>(hfn(domain.empty() ? "xyybtrader_live" : domain));
@@ -62,7 +64,7 @@ std::string make_sem_name(const std::string& domain) {
     return std::string("/xt_param_ev_") + make_name_token(domain);
 }
 
-}
+} // namespace
 
 struct XtLiveParamDomain::ShmEntry {
     uint8_t used = 0;
@@ -89,6 +91,7 @@ struct XtLiveParamDomain::BackendShm {
     ShmState*   state      = nullptr;
     sem_t*      notify_sem = SEM_FAILED;
 
+    // 按 mmap → sem → fd 逆序释放，与初始化顺序严格相反
     ~BackendShm() {
         if (state && state != MAP_FAILED) {
             ::munmap(static_cast<void*>(state), map_bytes);
@@ -125,7 +128,8 @@ void XtLiveParamDomain::close_shm_backend_locked() {
 
 bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::string* err) {
     close_shm_backend_locked();
-
+    // (1) 先退回 memory 安全态，防止后续任意步骤失败时
+    //     backend_type_=Shm、shm_=null 的不一致状态
     backend_type_ = BackendType::Memory;
     backend_name_ = "memory";
 
@@ -134,12 +138,13 @@ bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::s
     backend->shm_name  = make_shm_name(backend->domain);
     backend->sem_name  = make_sem_name(backend->domain);
 
+    // (2) 打开 / 创建 POSIX 共享内存对象
     backend->shm_fd = ::shm_open(backend->shm_name.c_str(), O_RDWR | O_CREAT, kShmObjectPerm);
     if (backend->shm_fd < 0) {
         if (err) *err = std::string("shm_open failed: ") + ::strerror(errno);
         return false;
     }
-
+    // fchmod 补偿 umask 对 shm_open mode 的截断
     if (::fchmod(backend->shm_fd, kShmObjectPerm) != 0) {
         if (err) *err = std::string("fchmod failed: ") + ::strerror(errno);
         return false;
@@ -149,6 +154,7 @@ bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::s
         return false;
     }
 
+    // (3) 映射到进程地址空间
     void* mapped = ::mmap(nullptr, backend->map_bytes,
                           PROT_READ | PROT_WRITE, MAP_SHARED, backend->shm_fd, 0);
     if (mapped == MAP_FAILED) {
@@ -157,19 +163,22 @@ bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::s
     }
     backend->state = static_cast<ShmState*>(mapped);
 
+    // (4) 打开通知信号量
     backend->notify_sem = ::sem_open(backend->sem_name.c_str(), O_CREAT, kShmObjectPerm, 0);
     if (backend->notify_sem == SEM_FAILED) {
         if (err) *err = std::string("sem_open failed: ") + ::strerror(errno);
         return false;
     }
 
+    // (5) 首次创建时初始化 ShmState（加独占锁防多进程竞态）
     if (::flock(backend->shm_fd, LOCK_EX) != 0) {
         if (err) *err = std::string("flock(LOCK_EX) failed: ") + ::strerror(errno);
         return false;
     }
     ShmState* st = backend->state;
     if (st->magic != kShmMagic || st->abi != kShmAbi) {
-
+        // entries 仅含 POD（uint8_t + char[]），memset 安全；
+        // 原子字段通过 store 显式初始化，避免对含 std::atomic 的结构体整体 memset 产生 UB
         std::memset(st->entries, 0, sizeof(st->entries));
         st->magic       = kShmMagic;
         st->abi         = kShmAbi;
@@ -180,10 +189,12 @@ bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::s
     }
     (void)::flock(backend->shm_fd, LOCK_UN);
 
+    // (6) 所有资源就绪，提交状态
+    // 必须先设置 backend_type_：refresh_from_shm_locked 开头检查 backend_type_ == Shm
     shm_ = std::move(backend);
     backend_name_ = "shm";
     backend_type_ = BackendType::Shm;
-    if (!refresh_from_shm_locked( true)) {
+    if (!refresh_from_shm_locked(/*force=*/true)) {
         values_.clear();
         version_.store(0, std::memory_order_relaxed);
     }
@@ -194,7 +205,8 @@ bool XtLiveParamDomain::init_shm_backend_locked(const BackendConfig& cfg, std::s
 bool XtLiveParamDomain::refresh_from_shm_locked(bool force) const {
     if (backend_type_ != BackendType::Shm || !shm_ || !shm_->state) return false;
     const uint64_t cur = version_.load(std::memory_order_relaxed);
-
+    // 投机版本检查：在取 LOCK_SH 前先对比 shm 原子版本号（acquire 配对写端 release）。
+    // 即便读到旧值也只是多取一次 flock，不影响正确性，仅损失 < 1µs
     const uint64_t shared = shm_->state->version.load(std::memory_order_acquire);
     if (!force && shared == cur) return false;
     if (!lock_shm_file_locked(LOCK_SH)) return false;
@@ -206,7 +218,7 @@ bool XtLiveParamDomain::refresh_from_shm_locked(bool force) const {
         for (size_t i = 0; i < kShmEntryCap; ++i) {
             const ShmEntry& e = st->entries[i];
             if (!e.used) continue;
-            if (e.key[0] == '\0') continue;
+            if (e.key[0] == '\0') continue; // 防御 used=1 但 key 未写入的脏槽位
             snap[e.key] = e.value;
         }
     }
@@ -232,7 +244,7 @@ bool XtLiveParamDomain::apply_set_shm_locked(const std::string& key,
         if (err) *err = "param key is empty";
         return false;
     }
-
+    // >= 而非 >：保留 NUL 终止符空间
     if (key.size() >= kShmKeyCap) {
         if (err) *err = "param key too long";
         return false;
@@ -247,6 +259,7 @@ bool XtLiveParamDomain::apply_set_shm_locked(const std::string& key,
         return false;
     }
 
+    // (1) 单次扫描：同时查找已有条目和首个空闲槽位
     ShmState* st        = shm_->state;
     ShmEntry* existing  = nullptr;
     ShmEntry* free_slot = nullptr;
@@ -262,6 +275,7 @@ bool XtLiveParamDomain::apply_set_shm_locked(const std::string& key,
         }
     }
 
+    // (2) 写入已有条目 / 插入新条目 / 容量满报错
     bool changed = false;
     if (existing) {
         if (std::strncmp(existing->value, value.c_str(), kShmValueCap) != 0) {
@@ -280,6 +294,7 @@ bool XtLiveParamDomain::apply_set_shm_locked(const std::string& key,
         return false;
     }
 
+    // (3) 递增版本号 + 通知序列号
     if (changed) {
         st->version.store(st->version.load(std::memory_order_relaxed) + 1,
                           std::memory_order_release);
@@ -288,7 +303,7 @@ bool XtLiveParamDomain::apply_set_shm_locked(const std::string& key,
     (void)unlock_shm_file_locked();
 
     if (changed) {
-        (void)refresh_from_shm_locked( true);
+        (void)refresh_from_shm_locked(/*force=*/true);
     }
     notify_param_changed_locked(changed);
     if (out_changed) *out_changed = changed;
@@ -321,7 +336,7 @@ bool XtLiveParamDomain::apply_erase_shm_locked(const std::string& key,
         e.used     = 0;
         e.key[0]   = '\0';
         e.value[0] = '\0';
-
+        // 防御性下溢保护
         if (st->entry_count > 0) --st->entry_count;
         changed = true;
         break;
@@ -334,7 +349,7 @@ bool XtLiveParamDomain::apply_erase_shm_locked(const std::string& key,
     (void)unlock_shm_file_locked();
 
     if (changed) {
-        (void)refresh_from_shm_locked( true);
+        (void)refresh_from_shm_locked(/*force=*/true);
     }
     notify_param_changed_locked(changed);
     if (out_changed) *out_changed = changed;
@@ -342,6 +357,8 @@ bool XtLiveParamDomain::apply_erase_shm_locked(const std::string& key,
     return true;
 }
 
+// 批量写入：所有条目共享一次 flock，处理完毕后统一递增一次版本号。
+// 容量满时静默跳过当前条目（partial write 语义），不回滚已写入条目
 bool XtLiveParamDomain::apply_bulk_set_shm_locked(const std::vector<std::pair<std::string, std::string>>& flat) {
     if (!shm_ || !shm_->state || flat.empty()) return false;
     if (!lock_shm_file_locked(LOCK_EX)) return false;
@@ -377,7 +394,7 @@ bool XtLiveParamDomain::apply_bulk_set_shm_locked(const std::vector<std::pair<st
             ++st->entry_count;
             changed = true;
         }
-
+        // 容量满时静默跳过
     }
 
     if (changed) {
@@ -388,7 +405,7 @@ bool XtLiveParamDomain::apply_bulk_set_shm_locked(const std::vector<std::pair<st
     (void)unlock_shm_file_locked();
 
     if (changed) {
-        (void)refresh_from_shm_locked( true);
+        (void)refresh_from_shm_locked(/*force=*/true);
     }
     notify_param_changed_locked(changed);
     return changed;
@@ -396,7 +413,8 @@ bool XtLiveParamDomain::apply_bulk_set_shm_locked(const std::vector<std::pair<st
 
 void XtLiveParamDomain::notify_param_changed_locked(bool changed) {
     if (!changed) return;
-
+    // cv_.notify_all() 必须无条件调用：wait_for_version_change 可能在 cv 上睡眠，
+    // 而 backend 此后被切换为 Shm，sem_post 无法唤醒仍在 cv 上的线程
     cv_.notify_all();
     if (backend_type_ == BackendType::Shm && shm_ && shm_->notify_sem != SEM_FAILED) {
         (void)::sem_post(shm_->notify_sem);
@@ -449,7 +467,7 @@ bool XtLiveParamDomain::set_checked(const std::string& key,
     if (backend_type_ == BackendType::Shm) {
         return apply_set_shm_locked(key, value, out_changed, err);
     }
-
+    // memory 后端：值相同时 no-op
     auto it = values_.find(key);
     if (it != values_.end() && it->second == value) {
         if (err) err->clear();
@@ -528,7 +546,7 @@ int64_t XtLiveParamDomain::get_int_or(const std::string& key, int64_t fallback) 
     if (!get(key, v)) return fallback;
     char* end = nullptr;
     const long long parsed = std::strtoll(v.c_str(), &end, 10);
-
+    // 拒绝空字符串和含余项（如 "123abc"）的输入
     if (end == v.c_str() || (end && *end != '\0')) return fallback;
     return static_cast<int64_t>(parsed);
 }
@@ -569,6 +587,8 @@ XtLiveParamDomain::Snapshot XtLiveParamDomain::snapshot() const {
     return snap;
 }
 
+// timeout_ms == 0 表示无限等待。EINTR 被透明重试。
+// macOS 不支持 sem_timedwait，退化为 sem_trywait + 1ms 睡眠轮询
 bool XtLiveParamDomain::sem_wait_timeout(sem_t* sem, uint32_t timeout_ms) {
     if (!sem) return false;
     if (timeout_ms == 0) {
@@ -584,7 +604,7 @@ bool XtLiveParamDomain::sem_wait_timeout(sem_t* sem, uint32_t timeout_ms) {
     while (true) {
         if (::sem_trywait(sem) == 0) return true;
         if (errno == EINTR) continue;
-        if (errno != EAGAIN) return false;
+        if (errno != EAGAIN) return false; // 非"暂不可用"的真错误
         if (std::chrono::steady_clock::now() >= deadline) {
             errno = ETIMEDOUT;
             return false;
@@ -592,14 +612,14 @@ bool XtLiveParamDomain::sem_wait_timeout(sem_t* sem, uint32_t timeout_ms) {
         ::usleep(1000);
     }
 #else
-
+    // Linux：使用 CLOCK_REALTIME 绝对截止时间
     timespec ts{};
     if (::clock_gettime(CLOCK_REALTIME, &ts) != 0) {
         return false;
     }
     ts.tv_sec  += static_cast<time_t>(timeout_ms / 1000);
     ts.tv_nsec += static_cast<long>((timeout_ms % 1000) * 1000000UL);
-
+    // 纳秒进位
     if (ts.tv_nsec >= 1000000000L) {
         ts.tv_sec  += 1;
         ts.tv_nsec -= 1000000000L;
@@ -634,6 +654,7 @@ bool XtLiveParamDomain::wait_for_version_change(uint64_t seen_version,
         return cur > seen_version;
     }
 
+    // shm 路径：先检查是否已有新版本，避免不必要的 sem_wait
     (void)refresh_from_shm_locked(false);
     const uint64_t cur = version_.load(std::memory_order_relaxed);
     if (cur > seen_version) {
@@ -645,11 +666,13 @@ bool XtLiveParamDomain::wait_for_version_change(uint64_t seen_version,
         return false;
     }
 
+    // 在释放锁前持有 shared_ptr 引用，防止 configure_backend 在 sem_wait 期间
+    // 析构 BackendShm 导致 notify_sem 变悬空指针（UAF）
     std::shared_ptr<BackendShm> shm_ref = shm_;
     lock.unlock();
 
     (void)sem_wait_timeout(shm_ref->notify_sem, timeout_ms);
-    shm_ref.reset();
+    shm_ref.reset(); // 先释放引用再重持锁，避免析构在锁内发生
 
     lock.lock();
     (void)refresh_from_shm_locked(false);

@@ -15,11 +15,11 @@
 template <typename ProbFunc>
 class ProbQueueModel final : public IQueueModel {
 public:
-
+    /// @brief 构造并持有概率函数对象。
     explicit ProbQueueModel(ProbFunc func) noexcept(std::is_nothrow_move_constructible_v<ProbFunc>)
         : func_(std::move(func)) {}
 
-    double estimate_queue_ahead(double level_qty, bool  ) const override {
+    double estimate_queue_ahead(double level_qty, bool /*is_resubmit*/) const override {
         if (level_qty <= 0.0) return 0.0;
         const double f = std::clamp(func_(level_qty), 0.0, 1.0);
         return level_qty * (1.0 - f);
